@@ -1,6 +1,6 @@
 {
   "name": "outcometick",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Strategy SDK and CLI for outcometick prediction-market backtests",
   "type": "module",
   "license": "MIT",
@@ -31,11 +31,12 @@
   },
   "files": [
     "api",
-    "runner",
-    "cli",
     "bin",
-    "index.mjs",
+    "cli",
+    "client",
     "index.d.ts",
+    "index.mjs",
+    "runner",
     "!**/*.test.mjs",
     "!**/*.test-d.ts"
   ],
