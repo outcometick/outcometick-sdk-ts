@@ -1,0 +1,57 @@
+name: publish
+
+# Publishing is always a deliberate act: a tag, or a button. NOT on push to
+# main — the mirror is regenerated and force-pushed on every sync, and a
+# publish-on-push would fire on syncs that changed no version at all.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      # Required for npm provenance, and for trusted publishing once the
+      # package exists and NPM_TOKEN can be deleted.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - run: npm install
+      # Never publish a tree whose own tests do not pass. The validator in this
+      # package is the same one the submission queue runs.
+      - run: npm test
+
+      # Skip rather than fail when the version is already on the registry, so a
+      # re-run of a partially-failed release is harmless.
+      - name: Check whether this version is already published
+        id: check
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$NAME@$VERSION is already on the registry — nothing to do"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.check.outputs.published == 'false'
+        # --provenance ties the tarball to this workflow run and this commit.
+        # --access public is required for a scoped name and harmless otherwise.
+        run: npm publish --provenance --access public
+        env:
+          # Delete this secret once trusted publishing is configured on the
+          # package page; npm picks up the OIDC token by itself.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
