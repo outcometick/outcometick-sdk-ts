@@ -1,6 +1,6 @@
 {
   "name": "outcometick",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Strategy SDK and CLI for outcometick prediction-market backtests",
   "type": "module",
   "license": "MIT",
@@ -20,6 +20,10 @@
     ".": {
       "types": "./index.d.ts",
       "default": "./index.mjs"
+    },
+    "./data": {
+      "types": "./client/data.d.ts",
+      "default": "./client/data.mjs"
     }
   },
   "engines": {
@@ -36,7 +40,7 @@
     "!**/*.test-d.ts"
   ],
   "scripts": {
-    "test": "node --test runner/analyze/*.test.mjs runner/engine/*.test.mjs runner/harness/node/*.test.mjs cli/*.test.mjs"
+    "test": "node --test runner/analyze/*.test.mjs runner/engine/*.test.mjs runner/harness/node/*.test.mjs cli/*.test.mjs client/*.test.mjs"
   },
   "dependencies": {
     "acorn": "^8.18.0"

@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 0ad1fd0cb6d49a6ceca5b70175f0ebeeaa207b6d.
+  Generated from monorepo revision c210f1ac8cbf693e62cc5b3c5580b0f8663e495a.
 -->
 
 # outcometick
@@ -78,6 +78,37 @@ npm install && npm test
 
 Requires `python3` on PATH: one of the two static analysers is written in
 Python, and the CLI drives it the same way the API does.
+
+## Downloading data
+
+The other half of the package: a client for the data subscription, on a
+separate import because it has nothing to do with writing a strategy.
+
+```ts
+import { DataClient, NO_VALUE } from "outcometick/data";
+
+const ot = new DataClient();                    // key from OT_KEY
+
+const meta = await ot.meta();                   // what can this key see?
+
+const { files } = await ot.files({
+  from: "2026-08-01", to: "2026-08-12",         // or date: "2026-08-12"
+  asset: ["BTCUSD", "ETHUSD"],                  // an array means "any of these"
+  dataset: "prices",
+  interval: ["5m", NO_VALUE],                   // "5m" alone EXCLUDES the
+});                                             // period-less settlement streams
+
+await ot.download(files[0], { saveTo: files[0].name });   // checksum verified
+```
+
+`meta()` reports the dimensions this key can actually reach. Note that
+`intervals` holds real durations only — the `none` sentinel is reported
+separately under `filterTokens`, so a caller that builds an enum from it or
+parses the values as durations never meets a token.
+
+Downloads are checksum-verified: `/v1/dl` redirects to storage with the sha256
+in a header, and the client follows that redirect itself so the checksum is not
+thrown away.
 
 ---
 

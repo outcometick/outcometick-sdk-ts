@@ -243,3 +243,31 @@ test('a strategy own private attributes are still fine', async () => {
     + '        return None\n',
   )));
 });
+
+test('outcometick is importable as the SDK, never as a package prefix', async () => {
+  // In the sandbox `outcometick` is one flat module — Strategy and Order. pip
+  // additionally ships `outcometick.data`, the HTTP client for the data
+  // subscription, which resolves to nothing inside a container that has no
+  // network. Allowing it because the ROOT segment matched would mean `ot check`
+  // passing a strategy that dies on import after being queued.
+  //
+  // The JavaScript analyser compares the whole specifier and always refused
+  // `outcometick/data`; this is the Python half of the same rule.
+  const strategy = (imp) => [{
+    name: 'strategy.py',
+    content: `${imp}\n\n\nclass S:\n    def on_tick(self, ctx, t):\n        return None\n`,
+  }];
+
+  for (const imp of ['from outcometick.data import DataClient', 'import outcometick.data']) {
+    const err = await analyzePythonSubmission(strategy(imp), { deps: [] })
+      .then(() => null, (e) => e);
+    assert.ok(err, `${imp} should be rejected`);
+    assert.equal(err.code, 'E_IMPORT');
+    assert.match(err.detail, /only 'outcometick' itself/);
+  }
+
+  // The SDK itself stays importable, both spellings.
+  for (const imp of ['from outcometick import Strategy, Order', 'import outcometick']) {
+    await analyzePythonSubmission(strategy(imp), { deps: [] });
+  }
+});

@@ -145,6 +145,26 @@ def check_import(module, name, line, deps, relative_ok):
             else "E_FORBIDDEN"
         )
         raise Reject(code, f"{name}:{line}: import {root} — {FORBIDDEN_IMPORTS[root]}", name, line)
+    # `outcometick` is allowed as the SDK module and nothing else. In the
+    # sandbox it is a single flat module -- Strategy and Order -- so
+    # `outcometick.data` resolves to nothing there, even though pip installs it
+    # as a real submodule. Allowing it because the ROOT matches would mean
+    # `ot check` passing a strategy that dies on import after being queued,
+    # which is the exact failure the "if it passes locally it will not be
+    # rejected on submit" promise exists to prevent.
+    #
+    # The JavaScript analyser has always compared the whole specifier, so
+    # `outcometick/data` was already refused there. This is the Python half of
+    # the same rule.
+    if root == "outcometick" and module != "outcometick":
+        raise Reject(
+            "E_IMPORT",
+            f"{name}:{line}: import of {module!r} — only 'outcometick' itself is "
+            "available to a strategy; the sandbox has no network and no submodules",
+            name,
+            line,
+            specifier=module,
+        )
     if root in ALWAYS_ALLOWED or root in deps:
         return
     raise Reject(
