@@ -68,8 +68,22 @@ jobs:
         if: steps.check.outputs.published == 'false' && env.NPM_TOKEN != ''
         run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
 
+      # The failure reason is echoed as an ANNOTATION, not just into the log.
+      # Reading a run's log needs repo auth; annotations do not. When the person
+      # debugging a failed release is not the person holding the token, "exit
+      # code 1" is all they get — which is exactly how the first two attempts
+      # here were diagnosed by guesswork.
       - name: Publish
         if: steps.check.outputs.published == 'false'
         # --provenance ties the tarball to this workflow run and this commit.
         # --access public is required for a scoped name and harmless otherwise.
-        run: npm publish --provenance --access public
+        run: |
+          set +e
+          npm publish --provenance --access public > publish.log 2>&1
+          code=$?
+          cat publish.log
+          if [ "$code" -ne 0 ]; then
+            grep -iE 'npm (error|ERR)' publish.log | head -8 | while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          rm -f publish.log
+          exit "$code"
