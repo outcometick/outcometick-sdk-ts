@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.4.0';
+export const SDK_VERSION = '1.4.1';
 
 // ---------------------------------------------------------------------------
 // Languages
