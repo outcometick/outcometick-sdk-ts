@@ -18,6 +18,18 @@
   "engines": {
     "node": ">=22"
   },
+  "files": [
+    "api",
+    "runner",
+    "cli",
+    "bin",
+    "index.mjs",
+    "index.d.ts",
+    "!**/*.test.mjs"
+  ],
+  "scripts": {
+    "test": "node --test runner/analyze/*.test.mjs runner/engine/*.test.mjs runner/harness/node/*.test.mjs cli/*.test.mjs"
+  },
   "dependencies": {
     "acorn": "^8.18.0"
   },

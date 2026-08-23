@@ -1,0 +1,9 @@
+node_modules/
+package-lock.json
+dist/
+build/
+*.tgz
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/

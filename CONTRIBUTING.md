@@ -1,8 +1,10 @@
 # Contributing
 
-This repository is a **generated mirror**. Its contents are built from the
-outcometick monorepo and overwritten on every publish, so a pull request opened
-against these files cannot be merged — the next build would erase it.
+The code here is real source — clone it, `npm install`, `npm test` — but this
+repository is **generated**. Its contents are copied from the outcometick
+monorepo, where they are also what the production API and the backtest workers
+run, and they are overwritten on every publish. A pull request opened against
+these files cannot be merged: the next publish would erase it.
 
 That is not bureaucracy. The validator in this package is the same code the
 submission queue runs, which is what makes this promise true:
