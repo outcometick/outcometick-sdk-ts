@@ -5,6 +5,13 @@
   "type": "module",
   "license": "MIT",
   "homepage": "https://outcometick.com/docs/sdk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/outcometick/outcometick-sdk-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/outcometick/outcometick-sdk-ts/issues"
+  },
   "bin": {
     "ot": "./bin/ot.mjs"
   },
