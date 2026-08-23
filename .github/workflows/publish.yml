@@ -12,6 +12,11 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: npm
+    env:
+      # At JOB level, not step level: a step's own env: block is not visible to
+      # that step's own if: condition, so the bootstrap guard below would have
+      # been permanently false and the token never written.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       # Required for npm provenance, and for trusted publishing once the
       # package exists and NPM_TOKEN can be deleted.
@@ -22,7 +27,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
@@ -46,12 +50,26 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Auth is written ONLY when a token secret exists.
+      #
+      # This is what makes the token a one-time bootstrap rather than a
+      # permanent fixture. npm's trusted publishing requires the package to
+      # already exist, so the very first release needs a token — but every
+      # release after it should use OIDC, which needs NO secret and therefore
+      # never expires.
+      #
+      # The subtlety: actions/setup-node's registry-url option writes an
+      # .npmrc containing _authToken=${NODE_AUTH_TOKEN}. With the secret deleted
+      # that expands to an EMPTY token, and an empty credential is worse than
+      # no credential — npm stops looking for the OIDC one and fails to
+      # authenticate. So registry-url is not used, and .npmrc is written by
+      # hand only when there is something to put in it.
+      - name: Configure npm auth (bootstrap only)
+        if: steps.check.outputs.published == 'false' && env.NPM_TOKEN != ''
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
+
       - name: Publish
         if: steps.check.outputs.published == 'false'
         # --provenance ties the tarball to this workflow run and this commit.
         # --access public is required for a scoped name and harmless otherwise.
         run: npm publish --provenance --access public
-        env:
-          # Delete this secret once trusted publishing is configured on the
-          # package page; npm picks up the OIDC token by itself.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

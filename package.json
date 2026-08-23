@@ -25,13 +25,17 @@
     "bin",
     "index.mjs",
     "index.d.ts",
-    "!**/*.test.mjs"
+    "!**/*.test.mjs",
+    "!**/*.test-d.ts"
   ],
   "scripts": {
     "test": "node --test runner/analyze/*.test.mjs runner/engine/*.test.mjs runner/harness/node/*.test.mjs cli/*.test.mjs"
   },
   "dependencies": {
     "acorn": "^8.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
   },
   "peerDependenciesMeta": {
     "danfojs-node": {
