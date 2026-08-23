@@ -308,7 +308,7 @@ test('the report carries coverage through untouched', () => {
   const r = buildReport({
     runId: 'run_abc123',
     submittedAt: 1,
-    manifest: { schema: 1, language: 'python@3.12', mode: 'market' },
+    manifest: { schema: 1, language: 'python@3.14', mode: 'market' },
     scope: { venue: 'polymarket', assets: ['BTC'], from: '2026-07-01', to: '2026-07-01', archivedDayCount: 1 },
     trades: [settled({ px: 0.5, won: true, d: 1 })],
     fills: [],

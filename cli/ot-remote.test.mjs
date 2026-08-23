@@ -56,7 +56,7 @@ async function stubApi(routes) {
 const DONE_RUN = {
   run_id: 'run_abc',
   status: 'done',
-  language: 'python@3.12',
+  language: 'python@3.14',
   mode: 'market',
   venue: 'polymarket',
   assets: ['BTC'],

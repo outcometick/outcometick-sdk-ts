@@ -34,20 +34,20 @@ export const SDK_VERSION = '1.4.0';
  * the API or the schema has to move.
  */
 export const LANGUAGES = Object.freeze({
-  'python@3.12': Object.freeze({
+  'python@3.14': Object.freeze({
     id: 'python',
     label: 'python',
-    runtime: 'python 3.12 · numpy, pandas, polars, scipy',
+    runtime: 'python 3.14 · numpy, pandas, polars, scipy',
     entrySignature: 'on_tick(ctx, tick) -> Order | None',
     // Names only. Versions are ours and there is no install step inside the
     // sandbox — the image already holds them.
     deps: Object.freeze(['numpy', 'pandas', 'polars', 'scipy']),
     sourceExtensions: Object.freeze(['.py', '.json']),
   }),
-  'nodejs@22': Object.freeze({
+  'nodejs@24': Object.freeze({
     id: 'nodejs',
     label: 'node.js',
-    runtime: 'node 22 · danfo, mathjs, decimal.js',
+    runtime: 'node 24 · danfo, mathjs, decimal.js',
     entrySignature: 'onTick(ctx, tick) => Order | null',
     deps: Object.freeze(['danfojs-node', 'mathjs', 'decimal.js']),
     sourceExtensions: Object.freeze(['.mjs', '.js', '.json']),

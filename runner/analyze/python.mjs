@@ -18,7 +18,7 @@ import { BacktestRejection } from '../../api/lib/backtest-contract.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, 'python_analyze.py');
 
-/** Interpreter to parse with. The sandbox image pins 3.12. */
+/** Interpreter to parse with. The sandbox image pins 3.14. */
 export const PYTHON = process.env.OT_PYTHON || 'python3';
 
 /**

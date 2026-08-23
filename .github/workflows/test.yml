@@ -9,11 +9,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       # The Python analyser shells out to python3, so both runtimes are needed
       # to exercise the validator that gives this package its reason to exist.
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.14'
       - run: npm install
       - run: npm test

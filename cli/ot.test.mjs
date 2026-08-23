@@ -25,7 +25,7 @@ const CLI = fileURLToPath(new URL('./ot.mjs', import.meta.url));
 
 const PY_MANIFEST = {
   schema: 1,
-  language: 'python@3.12',
+  language: 'python@3.14',
   entry: 'strategy.py:S',
   hooks: ['on_market_open', 'on_tick'],
   datasets: ['settlement'],
@@ -83,7 +83,7 @@ test('ot check accepts a valid submission and names the entry point', async () =
   try {
     const { code, stdout } = await ot(['check', dir]);
     assert.equal(code, 0);
-    assert.match(stdout, /ok — python@3\.12/);
+    assert.match(stdout, /ok — python@3\.14/);
     assert.match(stdout, /strategy\.py:S/);
   } finally {
     await rm(dir, { recursive: true, force: true });
