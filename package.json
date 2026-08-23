@@ -1,0 +1,35 @@
+{
+  "name": "outcometick",
+  "version": "1.4.0",
+  "description": "Strategy SDK and CLI for outcometick prediction-market backtests",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://outcometick.com/docs/sdk",
+  "bin": {
+    "ot": "./bin/ot.mjs"
+  },
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.mjs"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "acorn": "^8.18.0"
+  },
+  "peerDependenciesMeta": {
+    "danfojs-node": {
+      "optional": true
+    },
+    "mathjs": {
+      "optional": true
+    },
+    "decimal.js": {
+      "optional": true
+    }
+  }
+}

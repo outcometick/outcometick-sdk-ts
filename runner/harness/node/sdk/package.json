@@ -1,0 +1,8 @@
+{
+  "name": "outcometick",
+  "version": "1.4.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": { ".": "./index.mjs" }
+}
