@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 3652fc71edb3360170ce324e623b19d0ff994844.
+  Generated from monorepo revision 6044c75a16de3ee60870d59cb44a25096bcc7258.
 -->
 
 # outcometick
@@ -93,7 +93,7 @@ const meta = await ot.meta();                   // what can this key see?
 
 const { files } = await ot.files({
   from: "2026-08-01", to: "2026-08-12",         // or date: "2026-08-12"
-  asset: ["BTCUSD", "ETHUSD"],                  // an array means "any of these"
+  asset: ["BTC", "ETH"],                        // the BASE symbol, not BTCUSD
   dataset: "prices",
   interval: ["5m", NO_VALUE],                   // "5m" alone EXCLUDES the
 });                                             // period-less settlement streams

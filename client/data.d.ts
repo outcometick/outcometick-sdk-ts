@@ -61,6 +61,11 @@ export interface FilesQuery {
   to?: string;
   venue?: Filter;
   dataset?: Filter;
+  /**
+   * The BASE symbol — `BTC`, `ETH`, `SOL`, … NOT the trading pair. Files are
+   * named `BTCUSD-…`, but the dimension is `BTC`; `"BTCUSD"` matches nothing.
+   * `meta().assets` lists the real values.
+   */
   asset?: Filter;
   /** `"none"` selects the streams that have no period at all. */
   interval?: Filter;

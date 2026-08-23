@@ -140,7 +140,9 @@ export class DataClient {
    * @param q.to        inclusive end; defaults to `from`.
    * @param q.venue     polymarket | predict-fun
    * @param q.dataset   prices | twap60s | book | klines | …  (see meta())
-   * @param q.asset     BTCUSD, ETHUSD, …
+   * @param q.asset     the BASE symbol — BTC, ETH, SOL, … NOT the pair.
+   *                    Files are named BTCUSD-…, but the asset dimension is
+   *                    BTC; asking for "BTCUSD" matches nothing.
    * @param q.interval  5m, 1h, … or "none" for the streams that have no period
    *
    * Every filter accepts a string or an array; an array is joined with commas
