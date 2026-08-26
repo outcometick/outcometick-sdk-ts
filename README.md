@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 99c6912be660e0bebdbf3fc2e14112343a4bf0d1.
+  Generated from monorepo revision 56659396f7f20223103270472ffb16a5b0417bbd.
 -->
 
 # outcometick
@@ -117,3 +117,10 @@ Writing your strategy in Python instead? The SDK for it is
 those too — it is the one CLI for both languages.
 
 Full reference: https://outcometick.com/docs/sdk
+
+## Links
+
+- [outcometick.com](https://outcometick.com) — what this is, and what the data covers
+- [Run a backtest](https://outcometick.com/backtest) — paste a strategy, watch it run
+- [SDK reference](https://outcometick.com/docs/sdk) — manifest, hooks, `ctx`, limits
+- [Data API](https://outcometick.com/docs) — the archive these strategies read

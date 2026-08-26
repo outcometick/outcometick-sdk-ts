@@ -325,11 +325,20 @@ test('the CLI still refuses a file no budget could accept', async () => {
 // they shared the decoder and nothing else.
 //
 // Now there is one pass on both sides, at the delay the manifest asked for.
-test('ot run replays once at the manifest delay, exactly as the worker does', async () => {
+test('ot run replays once at the manifest delay, exactly as the worker does', async (t) => {
   const { readFile } = await import('node:fs/promises');
   const HERE = new URL('.', import.meta.url).pathname;
   const cli = await readFile(`${HERE}commands/run.mjs`, 'utf8');
-  const worker = await readFile(`${HERE}../runner/worker.mjs`, 'utf8');
+  // THE WORKER IS NOT IN THE PUBLISHED PACKAGE, and should not be — it is
+  // server code. This test compares the two halves of a divergence that can
+  // only exist in the monorepo, so outside it there is nothing to compare.
+  // Skipped with a reason rather than failed: a red test in the package
+  // someone just installed says the package is broken, and it is not.
+  const worker = await readFile(`${HERE}../runner/worker.mjs`, 'utf8').catch(() => null);
+  if (worker == null) {
+    t.skip('runner/worker.mjs is not in this tree — server-side only');
+    return;
+  }
 
   for (const [name, src] of [['ot run', cli], ['the worker', worker]]) {
     // No walking a built-in list of delays.
@@ -361,14 +370,18 @@ test('ot run replays once at the manifest delay, exactly as the worker does', as
 //                  `fill_delay_ms: 250` that the queue would reject outright.
 //
 // Neither errors. Both produce a report. It is only wrong.
-test('neither side branches on the delay being zero', async () => {
+test('neither side branches on the delay being zero', async (t) => {
   const { readFile } = await import('node:fs/promises');
   const HERE = new URL('.', import.meta.url).pathname;
+  let checked = 0;
   for (const [name, file] of [
     ['ot run', `${HERE}commands/run.mjs`],
     ['the worker', `${HERE}../runner/worker.mjs`],
   ]) {
-    const src = await readFile(file, 'utf8');
+    // See above: the worker is monorepo-only.
+    const src = await readFile(file, 'utf8').catch(() => null);
+    if (src == null) continue;
+    checked += 1;
     // Comments are allowed to mention it — that is where the lesson lives.
     const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
     for (const pattern of [/step\.ms === 0/, /delayMs === 0/, /isMainPass/]) {
@@ -378,4 +391,8 @@ test('neither side branches on the delay being zero', async () => {
         + ' exactly when a delay is asked for');
     }
   }
+  // A loop that read nothing passes silently, which is the shape of assertion
+  // this repo keeps getting caught by. `ot run` is in every tree this test can
+  // run in; only the worker is optional.
+  assert.ok(checked > 0, 'neither file was readable — this test asserted nothing');
 });

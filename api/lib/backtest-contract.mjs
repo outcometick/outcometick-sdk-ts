@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.6.0';
+export const SDK_VERSION = '1.6.1';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -488,7 +488,7 @@ export const LIMITS = Object.freeze({
   fetchClockMs: 60 * 60 * 1000,
   maxParams: 64,
   maxSweepCells: 256,
-  archiveRetentionDays: 90,
+  archiveRetentionDays: 7,
 });
 
 // ---------------------------------------------------------------------------
