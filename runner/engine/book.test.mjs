@@ -192,3 +192,59 @@ test('a snapshot drops levels with no size', () => {
   b.snapshot(1, { UP: { asks: [[0.50, 0], [0.51, 100]], bids: [] } });
   assert.equal(b.best('UP'), 0.51);
 });
+
+// A huge but finite order reports what it actually took.
+//
+// `filled` used to be `size - remaining`, and `remaining` is the requested
+// size with each level's depth subtracted from it. At IEEE-754 precision
+// `1e308 - 1000` is still `1e308`, so the subtraction did nothing: the ladder
+// was consumed and `filled` came out 0. No position, no cash, no trade row —
+// and an empty book for every order after it in that market. The report said
+// nothing happened; the book said otherwise.
+//
+// Summing the levels actually taken cannot drift from what was removed,
+// because it IS what was removed.
+test('an order far larger than the book reports the depth it consumed', () => {
+  for (const size of [1e308, 1e300, 5000]) {
+    const book = new Book();
+    book.snapshot(1000, { UP: { asks: [[0.51, 400], [0.52, 600]], bids: [[0.49, 1000]] } });
+    const res = matchOrder(book, { side: 'UP', size });
+
+    assert.equal(res.filled, 1000, `size ${size} reported ${res.filled} filled from a 1000-deep book`);
+    // And the numbers derived from it are consistent with the fill rather than
+    // with the request: an avgPx computed off a zero fill is null, which reads
+    // as "no information" when the truth is "walked the whole book".
+    assert.ok(res.notional > 0, `size ${size} took depth but reported no notional`);
+    assert.equal(res.avgPx, res.notional / res.filled);
+    assert.equal(book.ladders.UP.asks.best(), null, 'the ladder was not actually consumed');
+  }
+});
+
+test('a normal order is unaffected by the change', () => {
+  const book = new Book();
+  book.snapshot(1000, { UP: { asks: [[0.51, 400], [0.52, 600]], bids: [[0.49, 1000]] } });
+  const res = matchOrder(book, { side: 'UP', size: 500 });
+  assert.equal(res.filled, 500);
+  assert.equal(res.unfilled, 0);
+  // 400 @ 0.51 + 100 @ 0.52
+  assert.equal(Number(res.notional.toFixed(4)), Number((400 * 0.51 + 100 * 0.52).toFixed(4)));
+});
+
+// filled + unfilled is what was asked for, at every magnitude.
+//
+// `filled` is now summed from the levels taken while `unfilled` is still the
+// requested size with each level subtracted from it. Two different derivations
+// of the same event, so it is worth stating that they still agree: if a later
+// change makes one of them measure something else, the shortfall reported to
+// the customer stops adding up to the order they wrote.
+test('filled and unfilled still account for the whole request', () => {
+  for (const size of [500, 5000, 1e18, 1e308]) {
+    const book = new Book();
+    book.snapshot(1000, { UP: { asks: [[0.51, 400], [0.52, 600]], bids: [[0.49, 1000]] } });
+    const r = matchOrder(book, { side: 'UP', size });
+    // At 1e308 the addition is absorbed by float precision — which is the
+    // honest answer, not a defect: 1e308 + 1000 IS 1e308.
+    assert.equal(r.filled + r.unfilled, size,
+      `size ${size}: filled ${r.filled} + unfilled ${r.unfilled} is not the order`);
+  }
+});

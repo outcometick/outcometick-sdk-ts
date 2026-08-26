@@ -100,6 +100,18 @@ const MUST_NOT_COMPILE = [
     import { Order } from './sdk/index.js';
     export function onTick(ctx: Ctx, t: Tick): Order | null { return 'buy'; }
   `],
+  // Sizing in money: the two ways of stating a size are mutually exclusive,
+  // and the money one has no meaning without a price ceiling. Both are
+  // rejected at run time too — this is the version you find out about while
+  // typing rather than after paying for a run.
+  ['a size and a notional at once', `
+    import { Order } from './sdk/index.js';
+    export const o = new Order({ side: 'UP', size: 1, notional: 80, limit: 0.5 });
+  `],
+  ['a notional without a limit to convert it at', `
+    import { Order } from './sdk/index.js';
+    export const o = new Order({ side: 'UP', notional: 80 });
+  `],
 ];
 
 for (const [what, src] of MUST_NOT_COMPILE) {

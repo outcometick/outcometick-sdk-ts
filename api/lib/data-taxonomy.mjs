@@ -114,6 +114,20 @@ export function classifyPath(filePath) {
  * No real dimension value is 'none' (intervals are 1s…1mo, assets are BTC…ZEC),
  * so the token cannot collide with data.
  */
+/**
+ * In the archive, never offered publicly.
+ *
+ * ZEC markets were collected but never went live on the venue, so counting it
+ * makes every public figure one too high — "Polymarket 8 assets" printed beside
+ * a venue that shows seven. Excluded from what we ADVERTISE, not from what we
+ * serve: a subscriber querying the archive still gets what the archive holds.
+ */
+export const UNLISTED_ASSETS = Object.freeze(['ZEC']);
+
+/** The assets a public-facing figure should count. */
+export const publicAssets = (assets) =>
+  [...assets].filter((a) => !UNLISTED_ASSETS.includes(a)).sort();
+
 export const NO_VALUE = 'none';
 
 /**

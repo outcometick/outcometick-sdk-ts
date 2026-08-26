@@ -8,16 +8,6 @@
 // Nothing in this module can see the strategy. It reads the trade and fill logs
 // the engine produced, so a report cannot be tuned by the thing it is judging.
 
-/** Delays the latency panel re-prices every fill at. */
-export const LATENCY_STEPS = Object.freeze([
-  { label: 'as captured (0 ms)', ms: 0 },
-  { label: '+100 ms', ms: 100 },
-  { label: '+250 ms', ms: 250 },
-  { label: '+500 ms', ms: 500 },
-  { label: '+1 s', ms: 1000 },
-  { label: '+2 s', ms: 2000 },
-]);
-
 /** Entry-price buckets for the calibration panel. */
 export const CALIBRATION_BUCKETS = Object.freeze([
   [0.0, 0.1], [0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5],
@@ -96,6 +86,11 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
     max_drawdown_abs: r2(dd.abs),
     sharpe: sharpe == null ? null : r2(sharpe),
     trades: closed.length,
+    // Distinct markets the strategy actually took a position in. The engine
+    // does not stop a strategy trading a market twice, so `trades / markets`
+    // is only an entry rate for strategies that enter once — this one is an
+    // entry rate for all of them, and equals `trades` in the common case.
+    markets_traded: new Set(closed.map((t) => t.market_id)).size,
     return_on_collateral: collateral > 0 ? r4(netPnl / collateral) : null,
     // Cents of edge per contract: what the outcome was worth minus what was
     // paid, averaged. This is the number that says whether there was an edge
@@ -202,7 +197,7 @@ export function calibration(trades) {
     const implied = mean(inBucket.map((t) => t.entry_px));
     const realized = mean(inBucket.map((t) => (t.outcome === t.side ? 1 : 0)));
     return {
-      bucket: `${lo.toFixed(2)} – ${hi.toFixed(2)}`,
+      bucket: `${lo.toFixed(2)}-${hi.toFixed(2)}`,
       lo,
       hi,
       implied: r4(implied),
@@ -308,26 +303,6 @@ export function splitByMarket(trades, marketMeta = new Map()) {
   return rows;
 }
 
-/**
- * The latency panel: net PnL if every fill had landed later.
- *
- * The rows come from re-running the replay at each delay, which the caller
- * does — this only shapes the result. We keep event time, upstream server time
- * and our receive time separate on every row, which is what makes re-pricing at
- * an arbitrary delay meaningful rather than a guess.
- */
-export function latencyPanel(resultsByDelay) {
-  const base = resultsByDelay.find((r) => r.delayMs === 0)?.netPnl ?? 0;
-  return resultsByDelay.map((r) => ({
-    label: LATENCY_STEPS.find((s) => s.ms === r.delayMs)?.label ?? `+${r.delayMs} ms`,
-    delay_ms: r.delayMs,
-    net_pnl: r2(r.netPnl),
-    // Relative to the as-captured run, so the shape of the decay is readable
-    // without dividing in your head.
-    ratio: base === 0 ? null : r4(r.netPnl / base),
-    unprofitable: r.netPnl < 0,
-  }));
-}
 
 /**
  * The parameter sweep grid.
@@ -365,9 +340,9 @@ export function sweepPanel(cells, { xParam, yParam, metric = 'sharpe' }) {
  * makes the rest of it checkable, so it is never summarised away.
  */
 export function buildReport({
-  runId, submittedAt, manifest, scope,
+  runId, submittedAt, manifest, scope, sourceSha256 = null,
   trades, fills, marketSummaries, marketMeta,
-  feesPaid = 0, latency = [], sweep = null, coverage = null,
+  feesPaid = 0, fillDelayMs = 0, sweep = null, coverage = null,
   crosschecks = [], budget = null, seed = null, scanned = {},
 }) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
@@ -376,6 +351,10 @@ export function buildReport({
 
   return {
     run_id: runId,
+    // WHICH CODE PRODUCED THIS. The source itself is no longer in the archive
+    // — a report is a thing you forward to someone and the strategy is not —
+    // so this is what answers "which version of my strategy was this?".
+    source_sha256: sourceSha256,
     generated_ms: submittedAt,
     sdk_schema: manifest?.schema ?? null,
     language: manifest?.language ?? null,
@@ -409,7 +388,17 @@ export function buildReport({
     }),
     split: splitByMarket(closed, marketMeta ?? new Map()),
     slippage: slippage(fills ?? []),
-    latency: latencyPanel(latency),
+    // THE DELAY THIS RUN WAS PRICED AT, not a comparison table.
+    //
+    // There used to be five extra replays at 100ms..2s, then one, and the
+    // panel that compared them. It is gone: a run now replays ONCE, at
+    // whatever delay the submitter asked for, which is both the fastest answer
+    // and the only one that is a measurement rather than an extrapolation.
+    //
+    // It has to be IN the report, because it changes every number in it and
+    // nothing else in here would tell a reader whether they are looking at a
+    // zero-latency run or a 250ms one.
+    fill_delay_ms: fillDelayMs,
     sweep,
     coverage,
     budget,

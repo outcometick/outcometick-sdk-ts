@@ -11,6 +11,7 @@
 import { classifyPath } from './data-taxonomy.mjs';
 import {
   CAPTURE_WINDOWS, DERIVED_DATASETS, KNOWN_DATASETS, BacktestRejection,
+  MARKET_INTERVALS, DEFAULT_INTERVALS, MAX_LATENCY_MS,
 } from './backtest-contract.mjs';
 
 /**
@@ -191,6 +192,56 @@ export function archiveDatasetsFor({ datasets, venue, from, to }) {
 }
 
 /**
+ * The settlement files a day's markets need, beyond what the strategy asked for.
+ *
+ * ALWAYS FED, like `markets`, and for the same reason: which stream a market
+ * settled on is a property of that market, so it cannot be known before the
+ * markets are read — and a run without it has no ticks at all. A strategy
+ * declaring `datasets: ["prices"]` was handed the 1 Hz feed while every market
+ * settled on twap60s, so nothing reached the engine and the day came back
+ * empty.
+ *
+ * SHARED, because the worker and `ot run` must select the same files. They
+ * already share the decoder; a feed list computed twice is the same drift in a
+ * different place, and it shows up as "it works locally but not in the queue"
+ * — or worse, the reverse.
+ *
+ * @param {Iterable} markets  normalised records, from indexMarkets
+ * @param {string[]} paths    every archive path available for the day
+ * @param {object} opts       venue, the assets in scope, and the paths already chosen
+ */
+export function settlementPathsFor(markets, paths, { venue, assets, already = [] }) {
+  const need = new Set();
+  for (const m of markets) if (m?.stream) need.add(m.stream);
+  if (need.size === 0) return [];
+  const have = new Set(already);
+  const inScope = new Set((assets ?? []).map((a) => String(a).toUpperCase()));
+  const out = [];
+  for (const p of paths) {
+    if (have.has(p)) continue;
+    const c = classifyPath(p);
+    if (c.venue !== venue || !need.has(c.dataset)) continue;
+    if (c.asset && inScope.size && !inScope.has(String(c.asset).toUpperCase())) continue;
+    out.push(p);
+  }
+  return out.sort();
+}
+
+/**
+ * The order a day's archive files are read in, fixed by path.
+ *
+ * NOT cosmetic. Events stamped the same millisecond are ordered by kind, and
+ * ties beyond that fall back to the order they were read — which was the
+ * catalog's order for the queue and the directory walk's for `ot run`. Two
+ * readers, two orders, one archive, two different reports. Sorting by path
+ * makes the input order a property of the archive rather than of whoever is
+ * reading it.
+ */
+export function orderedFeed(paths) {
+  return [...paths].sort();
+}
+
+/**
  * Does an archived file belong to this run's scope?
  *
  * Runs on top of the entitlement gate, never instead of it: this decides what a
@@ -198,13 +249,70 @@ export function archiveDatasetsFor({ datasets, venue, from, to }) {
  * A backtest reads files the submitter has not bought, which is the product —
  * so this filter must never be mistaken for an authorisation check.
  */
-export function fileMatchesRun(filePath, { venue, assets, archiveDatasets }) {
+export function fileMatchesRun(filePath, { venue, assets, archiveDatasets, intervals }) {
   const meta = classifyPath(filePath);
   if (meta.venue !== venue) return false;
   if (!archiveDatasets.includes(meta.dataset)) return false;
   // Venue-wide datasets (markets) carry no asset and are always in scope.
   if (meta.asset && assets?.length && !assets.includes(meta.asset)) return false;
+  // The interval narrowing applies ONLY to files that have an interval.
+  //
+  // The settlement streams -- prices, twap30s, twap60s -- are interval:null,
+  // and they are not a choice: without one, every market in the day fails to
+  // settle, every market is unusable, and the whole run is dropped and
+  // refunded. Silently, because "no usable market" is indistinguishable from
+  // "the archive had nothing". So a null interval is always in scope, and only
+  // a file that actually declares one has to match.
+  if (meta.interval && intervals?.length && !intervals.includes(meta.interval)) return false;
   return true;
+}
+
+/**
+ * Validate the declared latency comparison, returning it normalised.
+ *
+ * ONE delay in milliseconds, or null for none — which is the default. Each
+ * delay replays the whole range again, so this is deliberately not a list:
+ * see MAX_LATENCY_MS.
+ */
+export function normalizeLatency(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) {
+    // Said plainly rather than by silently taking the first: a manifest that
+    // asked for three delays and got one would be a run priced and timed for
+    // something the submitter did not write.
+    throw new BacktestRejection('E_MANIFEST',
+      'latency is a single delay in milliseconds, not a list — each delay replays the whole range again');
+  }
+  const ms = Number(value);
+  if (!Number.isInteger(ms) || ms <= 0 || ms > MAX_LATENCY_MS) {
+    throw new BacktestRejection('E_MANIFEST',
+      `latency must be a whole number of milliseconds between 1 and ${MAX_LATENCY_MS}, got ${JSON.stringify(value)}`);
+  }
+  return ms;
+}
+
+/**
+ * Validate a declared interval list, returning it normalised.
+ *
+ * Absent means the default (5m), not "everything": see MARKET_INTERVALS.
+ */
+export function normalizeIntervals(list) {
+  if (list == null) return [...DEFAULT_INTERVALS];
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new BacktestRejection('E_MANIFEST',
+      `intervals must be a non-empty array; known: ${MARKET_INTERVALS.join(', ')}`);
+  }
+  const out = [];
+  for (const raw of list) {
+    const iv = String(raw ?? '').trim();
+    if (!MARKET_INTERVALS.includes(iv)) {
+      throw new BacktestRejection('E_MANIFEST',
+        `unknown interval ${JSON.stringify(iv)}; known: ${MARKET_INTERVALS.join(', ')}`);
+    }
+    if (!out.includes(iv)) out.push(iv);
+  }
+  // Sorted so the same request always produces the same decoded-cache identity.
+  return out.sort();
 }
 
 /** Validate a declared dataset list, returning it normalised. */
@@ -223,3 +331,19 @@ export function normalizeDatasets(list) {
   }
   return out;
 }
+
+/**
+ * The dataset list the prewarm decodes for.
+ *
+ * A decoded day is cached per dataset SHAPE, so warming a shape nobody submits
+ * warms nothing at all — the paid run still pays the full decode. This is the
+ * shape the editor submits: every dataset it offers as a chip, which is what
+ * almost every run declares.
+ *
+ * Derived from the contract, not written out, so a dataset added to the
+ * product is warmed without anyone remembering to come here.
+ */
+const SETTLEMENT_STREAMS = new Set(['prices', 'twap30s', 'twap60s']);
+export const PREWARM_DATASETS = Object.freeze(
+  KNOWN_DATASETS.filter((d) => !SETTLEMENT_STREAMS.has(d)),
+);

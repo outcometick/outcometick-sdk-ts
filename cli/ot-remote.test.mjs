@@ -192,3 +192,142 @@ test('ot fetch distinguishes "not finished" from "no such run"', async () => {
     await api.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// `ot submit` with a series
+//
+// The CLI stages series in R2 exactly as the web editor does. Not for the CLI's
+// benefit: it is what makes "a series never passes through the API box" true
+// rather than true-for-browsers, and one client still inlining would keep the
+// whole cost while the claim said it was gone.
+
+const PY_STRATEGY = 'class S:\n    def on_tick(self, ctx, tick):\n        pass\n';
+
+async function submissionDir(manifest, extra = {}) {
+  const dir = await mkdtemp(path.join(tmpdir(), 'ot-sub-'));
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(path.join(dir, 'outcometick.json'), JSON.stringify(manifest));
+  await writeFile(path.join(dir, 'strategy.py'), PY_STRATEGY);
+  for (const [name, content] of Object.entries(extra)) {
+    await writeFile(path.join(dir, name), content);
+  }
+  return dir;
+}
+
+const BASE_MANIFEST = {
+  schema: 1,
+  language: 'python@3.14',
+  mode: 'market',
+  entry: 'strategy.py:S',
+  datasets: ['prices'],
+  hooks: ['on_tick'],
+  params: {},
+};
+
+test('ot submit stages a series in R2 and sends it by reference', async () => {
+  const puts = [];
+  const dir = await submissionDir(
+    { ...BASE_MANIFEST, series: [{ name: 'px', file: 'px.csv' }] },
+    { 'px.csv': 'ts_ms,value\n1750000000000,1.5\n1750000001000,1.6\n' },
+  );
+  let submitBody = null;
+  const r2 = await stubApi({
+    'PUT /staged.csv': (req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        // Mirrors R2: the url is write-once, so the client must send exactly
+        // what the server signed.
+        puts.push({ body, ifNoneMatch: req.headers['if-none-match'] });
+        res.writeHead(200).end();
+      });
+    },
+  });
+  const api = await stubApi({
+    'POST /v1/backtest/upload': (req, res) =>
+      json(res, 200, {
+        url: `${r2.url}/staged.csv`,
+        key: 'uploads/2026-08-24/abc/1.csv',
+        bytes: 62,
+        headers: { 'content-type': 'text/plain', 'if-none-match': '*' },
+      }),
+    'POST /v1/backtest/submit': (req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        submitBody = JSON.parse(body);
+        json(res, 202, { run_id: 'run_new', quote: { venue: 'polymarket', assets: ['BTC'], marketDays: 30, credits: 30 } });
+      });
+    },
+  });
+  try {
+    const { code, stdout } = await ot([
+      'submit', dir, '--assets', 'btc', '--range', '30 days', '--api', api.url,
+    ]);
+    assert.equal(code, 0, stdout);
+
+    // The bytes went to R2, once.
+    assert.equal(puts.length, 1);
+    assert.match(puts[0].body, /1750000000000/);
+    assert.equal(puts[0].ifNoneMatch, '*', 'must send what the signature covered, or R2 returns 403');
+
+    // And NOT to the API.
+    const sent = JSON.stringify(submitBody);
+    assert.ok(!sent.includes('1750000000000'), 'the csv content reached the API after all');
+    assert.deepEqual(submitBody.files.map((f) => f.name).sort(), ['outcometick.json', 'strategy.py']);
+    assert.deepEqual(submitBody.uploads, { 'px.csv': 'uploads/2026-08-24/abc/1.csv' });
+  } finally {
+    await api.close();
+    await r2.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('ot submit without a series is unchanged', async () => {
+  const dir = await submissionDir(BASE_MANIFEST);
+  let submitBody = null;
+  const api = await stubApi({
+    'POST /v1/backtest/upload': (req, res) => json(res, 500, { error: 'must not be called' }),
+    'POST /v1/backtest/submit': (req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        submitBody = JSON.parse(body);
+        json(res, 202, { run_id: 'run_new', quote: { marketDays: 30 } });
+      });
+    },
+  });
+  try {
+    const { code } = await ot(['submit', dir, '--assets', 'btc', '--range', '30 days', '--api', api.url]);
+    assert.equal(code, 0);
+    assert.equal(submitBody.uploads, undefined, 'no series means no uploads field');
+    assert.ok(!api.seen.some((s) => s.url === '/v1/backtest/upload'), 'staged nothing needlessly');
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('ot submit fails loudly when a series cannot be staged', async () => {
+  // Silently submitting without the series would queue a run whose strategy
+  // reads an empty feed — a report that cost credits and means nothing.
+  const dir = await submissionDir(
+    { ...BASE_MANIFEST, series: [{ name: 'px', file: 'px.csv' }] },
+    { 'px.csv': 'ts_ms,value\n1750000000000,1.5\n' },
+  );
+  const api = await stubApi({
+    'POST /v1/backtest/upload': (req, res) => json(res, 429, { error: 'at most 60 uploads an hour' }),
+    'POST /v1/backtest/submit': (req, res) => json(res, 202, { run_id: 'should_not_happen' }),
+  });
+  try {
+    const { code, stderr, stdout } = await ot([
+      'submit', dir, '--assets', 'btc', '--range', '30 days', '--api', api.url,
+    ]);
+    assert.notEqual(code, 0, stdout);
+    assert.match(stderr + stdout, /px\.csv|60 uploads/);
+    assert.ok(!api.seen.some((s) => s.url === '/v1/backtest/submit'), 'submitted anyway');
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

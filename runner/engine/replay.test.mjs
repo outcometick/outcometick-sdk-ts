@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { replayMarket, BudgetMonitor, RunAbort, makeRng } from './replay.mjs';
+import { replayMarket, makeLogBudget, BudgetMonitor, RunAbort, makeRng } from './replay.mjs';
 import { Portfolio } from './portfolio.mjs';
 
 const near = (a, b, eps = 1e-9) => assert.ok(Math.abs(a - b) < eps, `${a} != ${b}`);
@@ -247,16 +247,106 @@ test('reading another market cross-market is refused, not silently answered', ()
   });
 });
 
-test('logs are capped and the truncation is reported', () => {
+test('logs are capped by BYTES and the truncation is reported', () => {
+  const budget = makeLogBudget({ bytes: 100, lineChars: 512 });
   const res = replayMarket({
     market: MARKET,
     events: Array.from({ length: 50 }, (_, i) => tick(i + 1, 1)),
     strategy: { on_tick(ctx) { ctx.log('noise'); } },
     hooks: { on_tick: 'on_tick' },
-    logLimit: 10,
+    logBudget: budget,
   });
-  assert.equal(res.logs.length, 10);
+  assert.ok(res.logs.length > 0 && res.logs.length < 50, 'the cap did nothing');
+  assert.ok(budget.spent >= 100, 'the budget was not spent');
   assert.equal(res.logTruncated, true);
+});
+
+// A long line cannot buy more of the budget than a short one — the "one line
+// per event" shape is exactly how a strategy would dump the archive it just
+// paid for into a file it then downloads.
+test('a single line cannot exceed the line cap', () => {
+  const budget = makeLogBudget({ bytes: 1_000_000, lineChars: 32 });
+  const res = replayMarket({
+    market: MARKET,
+    events: [tick(1, 1)],
+    strategy: { on_tick(ctx) { ctx.log('x'.repeat(5000)); } },
+    hooks: { on_tick: 'on_tick' },
+    logBudget: budget,
+  });
+  assert.equal(res.logs.length, 1);
+  assert.ok(res.logs[0].length <= 32, `a ${res.logs[0].length}-character line got through a 32-character cap`);
+});
+
+// The budget is advertised as 2 MB and logs.txt is UTF-8, so it has to be
+// counted in UTF-8 bytes. Counting `.length` counts UTF-16 units, and a run
+// logging Chinese would spend one unit for every three bytes it actually
+// wrote — an archive up to three times the size the contract states.
+test('the log budget counts UTF-8 bytes, not string length', () => {
+  const line = '数据数据数据数据数据';        // 10 chars, 30 UTF-8 bytes
+  const budget = makeLogBudget({ bytes: 1_000_000, lineChars: 512 });
+  replayMarket({
+    market: MARKET,
+    events: [tick(1, 1)],
+    strategy: { on_tick(ctx) { ctx.log(line); } },
+    hooks: { on_tick: 'on_tick' },
+    logBudget: budget,
+  });
+  // The timestamp prefix is ASCII, so the multi-byte part is what separates
+  // the two units: counting characters would undercount it by 20.
+  const written = Buffer.byteLength(`0 ${line}`, 'utf8') + 1;
+  assert.equal(budget.spent, written,
+    `spent ${budget.spent} for a line that occupies ${written} bytes in logs.txt`);
+});
+
+// crosschecks ride the same authenticated result line as everything else, and
+// ctx.assert_outcome can be called on every event with any payload. Unbounded,
+// that is an output channel with no budget — the exact shape of the ctx.log
+// hole, under a different name.
+test('cross-checks are bounded in count and in payload size', () => {
+  const res = replayMarket({
+    market: MARKET,
+    events: Array.from({ length: 200 }, (_, i) => tick(i + 1, 1)),
+    strategy: {
+      on_tick(ctx) { ctx.assert_outcome(null, 'U'.repeat(10_000)); },
+    },
+    hooks: { on_tick: 'on_tick' },
+  });
+  assert.ok(res.crosschecks.length > 0, 'nothing was recorded at all');
+  assert.ok(res.crosschecks.length <= 16,
+    `${res.crosschecks.length} cross-checks from 200 events — the count is unbounded`);
+  for (const c of res.crosschecks) {
+    assert.ok(c.claimed.length <= 32,
+      `a ${c.claimed.length}-character claim got onto the result line`);
+  }
+  // Truncating what is RECORDED must not change the verdict: the panel's value
+  // is that it reports the archive's answer against what the strategy said.
+  assert.equal(res.crosschecks[0].match, false);
+});
+
+// THE HOLE THIS REPLACED. The allowance used to be per MARKET, and polymarket
+// has ~386 markets a day — so a run's real allowance was the stated one
+// multiplied by the number of markets, which turned ctx.log into a bulk export
+// priced at nothing. One budget object, shared, is the whole fix.
+test('the log allowance is spent across markets, not renewed per market', () => {
+  const budget = makeLogBudget({ bytes: 300, lineChars: 512 });
+  const run = () => replayMarket({
+    market: MARKET,
+    events: Array.from({ length: 20 }, (_, i) => tick(i + 1, 1)),
+    strategy: { on_tick(ctx) { ctx.log('some line of output'); } },
+    hooks: { on_tick: 'on_tick' },
+    logBudget: budget,
+  });
+
+  const first = run();
+  assert.ok(first.logs.length > 0, 'the first market logged nothing at all');
+  const spentAfterFirst = budget.spent;
+
+  // A second market on the SAME run gets what is left, not a fresh allowance.
+  const second = run();
+  assert.ok(budget.spent >= spentAfterFirst, 'the budget went backwards');
+  assert.ok(budget.spent <= 300 + 512, 'the second market was given a fresh allowance');
+  assert.ok(second.logs.length < first.logs.length,
+    'the second market logged as much as the first — the allowance is being renewed per market');
 });
 
 test('an undeclared reference feed is a rejection, not undefined', () => {
@@ -317,24 +407,98 @@ test('a strategy cannot book itself a cross-check match', () => {
 // ---------------------------------------------------------------------------
 
 test('a single slow event is not a breach', () => {
-  const m = new BudgetMonitor({ limitMicros: 400, sampleFloor: 10, tolerance: 0.01 });
-  for (let i = 0; i < 100; i += 1) m.record(10);
-  m.record(5000);
+  // AT THE REAL WINDOW SIZE, because this property depends on it: a spike of S
+  // microseconds moves a window of W events by S/W, so absorbing the 18ms worst
+  // case measured in production needs W > 45. At the shipped 2,000 a single
+  // event would have to cost 800ms to trip this on its own.
+  const m = new BudgetMonitor({ limitMicros: 400 });
+  for (let i = 0; i < 4000; i += 1) m.record(10);
+  m.record(18_000);
   assert.equal(m.breached, false, 'one GC pause must not kill a shard');
+
+  // And the window is genuinely local: the same spike in a tiny window IS the
+  // whole window. This is why the size is not a free parameter.
+  const narrow = new BudgetMonitor({ limitMicros: 400, sampleFloor: 10 });
+  for (let i = 0; i < 100; i += 1) narrow.record(10);
+  narrow.record(18_000);
+  assert.equal(narrow.breached, true, 'a ten-event window cannot absorb anything');
 });
 
-test('sustained breach past the tolerance trips', () => {
-  const m = new BudgetMonitor({ limitMicros: 400, sampleFloor: 10, tolerance: 0.01 });
+test('sustained cost over the limit trips', () => {
+  const m = new BudgetMonitor({ limitMicros: 400, sampleFloor: 10 });
   for (let i = 0; i < 100; i += 1) m.record(5000);
   assert.equal(m.breached, true);
   assert.equal(m.summary().breach_rate, 1);
 });
 
 test('a breach below the sample floor never trips', () => {
-  // Too few events to say anything about a p99.
+  // Too few events to say anything about a mean.
   const m = new BudgetMonitor({ limitMicros: 400, sampleFloor: 200 });
   for (let i = 0; i < 5; i += 1) m.record(9999);
   assert.equal(m.breached, false);
+});
+
+// The rule this replaced looked reasonable and shipped twice. A run is judged
+// on a machine that takes the CPU away mid-hook, so a RATE of slow events
+// measures the machine; the MEAN measures the strategy.
+test('a fast strategy on a contended machine is not rejected', () => {
+  // The production numbers, verbatim: the page's own sample was rejected at
+  // avg 72us against a 400us budget because 1.1% of its events had been
+  // interrupted. Under the old rule this trips.
+  const m = new BudgetMonitor({ limitMicros: 400 });
+  let killedAt = null;
+  for (let i = 0; i < 10_000; i += 1) {
+    m.record(i % 91 === 0 ? 5800 : 8);
+    if (m.breached && killedAt == null) killedAt = m.summary().events;
+  }
+  const s = m.summary();
+  assert.ok(s.breach_rate > 0.01, `setup wrong: breach rate ${s.breach_rate} does not trip the old 1% rule`);
+  assert.ok(s.avg_micros < 400, `setup wrong: mean ${s.avg_micros} is not inside budget`);
+  assert.equal(killedAt, null,
+    `a strategy averaging ${s.avg_micros.toFixed(0)}us of its 400us budget was killed at event ${killedAt}`);
+});
+
+test('a strategy that is genuinely slow is still rejected', () => {
+  // No tail at all — every event is simply over budget. This is what the limit
+  // exists to catch, and the mean catches it the moment it may speak.
+  const m = new BudgetMonitor({ limitMicros: 400 });
+  let killedAt = null;
+  for (let i = 0; i < 10_000; i += 1) {
+    m.record(600);
+    if (m.breached && killedAt == null) killedAt = m.summary().events;
+  }
+  assert.equal(killedAt, 2000, 'a uniformly slow strategy must be caught at the sample floor');
+});
+
+// The failure the lifetime mean allowed, and the reason the statistic is
+// windowed. One monitor covers a whole run, so "average" over millions of
+// events is not a statement about now.
+test('a cheap prefix cannot pay for a sustained slow phase', () => {
+  const m = new BudgetMonitor({ limitMicros: 400 });
+  let killedAt = null;
+  for (let i = 0; i < 18_000; i += 1) {
+    m.record(8);
+    if (m.breached && killedAt == null) killedAt = m.summary().events;
+  }
+  assert.equal(killedAt, null, 'the cheap prefix must not be rejected');
+  for (let i = 0; i < 2_000; i += 1) {
+    m.record(2_000);
+    if (m.breached && killedAt == null) killedAt = m.summary().events;
+  }
+  const s = m.summary();
+  assert.ok(s.avg_micros < 400,
+    `setup wrong: the lifetime mean is ${s.avg_micros.toFixed(0)}us, so this passes for the wrong reason`);
+  assert.ok(killedAt != null && killedAt < 20_000,
+    'two thousand consecutive events at 5x budget were hidden by the lifetime average');
+});
+
+test('a rare but catastrophic event still raises the mean', () => {
+  // The one thing a tail rule was good for: 1% of events taking a full second
+  // is 10ms per event amortised, which would blow the wall clock. The mean sees
+  // it without a second knob.
+  const m = new BudgetMonitor({ limitMicros: 400 });
+  for (let i = 0; i < 10_000; i += 1) m.record(i % 100 === 0 ? 1_000_000 : 10);
+  assert.equal(m.breached, true, 'a 1% tail of one-second events must not pass');
 });
 
 test('a strategy that throws surfaces as a run abort naming the hook', () => {
@@ -656,4 +820,32 @@ test('an unsupported time-in-force is refused, not silently downgraded', () => {
     strategy: { on_tick() { return { side: 'UP', size: 100, limit: 1, tif: 'ioc' }; } },
     hooks: { on_tick: 'on_tick' },
   }));
+});
+
+test('the budget floor outlasts a strategy warming up', async () => {
+  // Warm-up was the first diagnosis and it was WRONG — measured inside the real
+  // image the breaches are scattered (events 171, 2368, 3201), not front-loaded
+  // — but the floor still has to exist, so that neither a handful of events nor
+  // a warm-up is ever a verdict.
+  const { BudgetMonitor } = await import('./replay.mjs');
+  // CHECKED AFTER EVERY EVENT, the way the engine checks it. Reading `breached`
+  // only at the end hides this whole class of bug.
+  const m = new BudgetMonitor({ limitMicros: 400 });
+  let killedAt = null;
+  for (let i = 0; i < 3; i += 1) {
+    m.record(2500);                                       // the warm-up
+    if (m.breached && killedAt == null) killedAt = m.summary().events;
+  }
+  for (let i = 0; i < 4500; i += 1) {
+    m.record(25);                                         // the actual strategy
+    if (m.breached && killedAt == null) killedAt = m.summary().events;
+  }
+  assert.equal(killedAt, null,
+    `three slow first calls killed the run at event ${killedAt}`);
+
+  // The floor still holds: a short market cannot be judged on a handful of
+  // events, however slow they were.
+  const tiny = new BudgetMonitor({ limitMicros: 400 });
+  for (let i = 0; i < 50; i += 1) tiny.record(9000);
+  assert.equal(tiny.breached, false, 'fifty events is not a verdict');
 });

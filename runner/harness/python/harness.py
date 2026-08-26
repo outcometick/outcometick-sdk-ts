@@ -7,11 +7,12 @@ same exit codes. The worker does not know or care which language produced a
 run's logs, which is what stops the report shape depending on the customer's
 choice of language.
 
-    python3 harness.py <job-dir>      job on stdin, results on fd 3
+    python3 harness.py <job-dir>      job on stdin, results on stdout
 """
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import hmac
 import importlib.util
@@ -21,18 +22,61 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from otengine import BudgetMonitor, Portfolio, RunAbort  # noqa: E402
-from otreplay import replay_market  # noqa: E402
+from otengine import Book as _Book, BudgetMonitor, Portfolio, RunAbort  # noqa: E402
+from otreplay import (  # noqa: E402
+    write_all,
+    replay_market, make_log_budget, LOG_BYTES_PER_RUN, LOG_LINE_CHARS,
+)
+from otfeed import build_feeds  # noqa: E402
 
-# Results go out over FD 3, authenticated — see the long note in protocol.mjs.
+# Results go out over stdout, authenticated — see the long note in protocol.mjs.
 # /out used to be a writable bind mount, and a strategy declaring the allowed
 # `pandas` could rewrite trades.jsonl from on_settle, after being told the
 # official outcome.
-RESULT_FD = 3
+# The authenticated result channel.
+#
+# Docker hands a container stdin/stdout/stderr and nothing else. The worker
+# spawns `docker run` with a fourth pipe, but that fd belongs to the docker
+# CLIENT — inside the container fd 3 is closed, and every write to it failed
+# with EBADF. That is why no containerised run had ever produced a result.
+#
+# So the real stdout is duplicated to a private fd and fd 1 is pointed at
+# /dev/null, HERE, before any strategy code is imported: results leave over the
+# container's stdout, and a strategy's print() goes nowhere. Which was already
+# the intent — the worker used to discard stdout for exactly that reason.
+#
+# /proc/self/fd/<n> stays addressable. The MAC is what makes forgery
+# impossible, and always was.
+RESULT_FD = os.dup(1)
+_devnull = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_devnull, 1)
+os.close(_devnull)
+
+
+def _print_is_gone(*_args, **_kwargs):
+    """print() writes to /dev/null now; say so once, on stderr.
+
+    Not silent: a strategy author whose print() vanishes without a word will
+    spend an afternoon on it. `ot run` shows stderr.
+    """
+    if not _print_is_gone.warned:
+        _print_is_gone.warned = True
+        try:
+            sys.stderr.write("harness: print() output is discarded -- use ctx.log() instead\n")
+        except Exception:
+            pass  # stderr is not worth crashing a run over
+
+
+_print_is_gone.warned = False
+builtins.print = _print_is_gone
 CHANNEL_TRADE = "t"
 CHANNEL_FILL = "f"
 CHANNEL_LOG = "l"
 CHANNEL_RESULT = "r"
+# "I have finished replaying market-day N." Display only, and the mirror of
+# CHANNEL.progress in protocol.mjs -- see the long note there. Both engines or
+# neither: runner/conformance compares them line by line.
+CHANNEL_PROGRESS = "p"
 
 EXIT_OK = 0
 EXIT_REJECTED = 10
@@ -184,7 +228,7 @@ def read_line(stream):
 
 def main() -> int:
     if len(sys.argv) < 2:
-        sys.stderr.write("usage: harness.py <job-dir>   (job on stdin, results on fd 3)\n")
+        sys.stderr.write("usage: harness.py <job-dir>   (job on stdin, results on stdout)\n")
         return 2
     job_dir = sys.argv[1]
 
@@ -198,6 +242,10 @@ def main() -> int:
 
     limits = job.get("limits") or {}
     monitor = BudgetMonitor(limit_micros=limits.get("perEventBudgetMicros", 400))
+    log_budget = make_log_budget(
+        limits.get("logBytesPerRun", LOG_BYTES_PER_RUN),
+        limits.get("logLineChars", LOG_LINE_CHARS),
+    )
 
     result = {
         "markets_run": 0,
@@ -220,7 +268,7 @@ def main() -> int:
         mac = hmac.new(
             key_bytes, f"{channel} {payload}".encode("utf-8"), hashlib.sha256
         ).hexdigest()[:32]
-        os.write(RESULT_FD, f"{mac} {channel} {payload}\n".encode("utf-8"))
+        write_all(RESULT_FD, f"{mac} {channel} {payload}\n".encode("utf-8"))
 
     class _Logs:
         @staticmethod
@@ -268,7 +316,29 @@ def main() -> int:
         # Pulled one at a time as replay asks. Nothing here holds more than the
         # current row — that is what makes "future rows are not in the process"
         # literally true rather than approximately true.
-        counters = {"n": int(entry.get("n") or 0), "seen": 0, "last_book": None}
+        # The book as the ENGINE sees it, advanced by the same class. A
+        # Polymarket snapshot carries one side, its ladder is published
+        # descending while Predict's is ascending, and a price_change after the
+        # last snapshot moves the price for the engine — reading the last event
+        # got all three wrong, and was a second implementation besides.
+        counters = {"n": int(entry.get("n") or 0), "seen": 0,
+                    "book": _Book(entry["market"]["market_id"]),
+                    # The first book state that quotes BOTH sides — the same
+                    # rule the worker applies. Locking each side as it appears
+                    # would mix prices from two instants, and the favourite is
+                    # the dearer of the pair.
+                    "open_quotes": None}
+
+        # Reference feeds and user series arrive INTERLEAVED in this same
+        # stream, in event time, and are appended to growing arrays as they
+        # pass. Not shipped as a block on the market header: a Binance price is
+        # very nearly the underlying that decides the outcome, so holding the
+        # whole window in the process would reopen exactly the hole the event
+        # stream was hardened against. Streaming keeps it structural.
+        feed_rows: dict = {}
+
+        def rows_for(name):
+            return feed_rows.setdefault(name, [])
 
         def event_stream():
             while counters["n"] > 0:
@@ -281,9 +351,24 @@ def main() -> int:
                 except json.JSONDecodeError:
                     # Corruption in OUR data, not the strategy's problem.
                     continue
+                kind = ev.get("kind")
+                if kind in ("ref", "ext"):
+                    # Consumed here, never handed to a hook: not market events.
+                    row = {k: v for k, v in ev.items() if k not in ("kind", "name")}
+                    rows_for(ev.get("name")).append(row)
+                    continue
                 counters["seen"] += 1
-                if ev.get("kind") == "book" and ev.get("snapshot"):
-                    counters["last_book"] = ev
+                if kind == "book" and ev.get("snapshot"):
+                    counters["book"].snapshot(ev.get("ts_ms") or 0, ev.get("levels") or {})
+                elif kind == "book" and ev.get("side") and ev.get("ladder"):
+                    counters["book"].delta(
+                        ev.get("ts_ms") or 0, ev["side"], ev["ladder"],
+                        ev.get("px"), ev.get("size"))
+                if kind == "book" and counters["open_quotes"] is None:
+                    _up = counters["book"].best("UP")
+                    _down = counters["book"].best("DOWN")
+                    if _up is not None and _down is not None:
+                        counters["open_quotes"] = (_up, _down)
                 yield ev
 
         def drain_rest():
@@ -313,10 +398,24 @@ def main() -> int:
                 hooks=job.get("hooks") or {},
                 portfolio=pf,
                 fill_delay_ms=job.get("fillDelayMs", 0),
-                log_limit=limits.get("logLinesPerMarketDay", 10_000),
+                # ONE allowance for the whole run, handed to every market.
+                # Per-market was the old shape and the reason ctx.log was an
+                # export channel: polymarket has ~386 markets a day, so a
+                # per-market budget is a per-run budget multiplied by 386.
+                log_budget=log_budget,
                 budget=monitor,
                 seed=job.get("seed", 1),
                 fee_bps=job.get("feeBps", 0),
+                references=build_feeds(
+                    entry.get("references") or [],
+                    {n: rows_for(n) for n in (entry.get("references") or [])},
+                    entry.get("lags") or {},
+                ),
+                series=build_feeds(
+                    entry.get("series") or [],
+                    {n: rows_for(n) for n in (entry.get("series") or [])},
+                    entry.get("lags") or {},
+                ),
             )
         except RunAbort as err:
             drain_rest()
@@ -336,19 +435,25 @@ def main() -> int:
         drain_rest()
         result["markets_run"] += 1
         result["events_seen"] += counters["seen"]
-        if out["log_truncated"]:
+        # Acknowledged AFTER the replay, so the panel a customer is watching
+        # counts finished work rather than queued bytes.
+        emit(CHANNEL_PROGRESS, _DUMPS({"n": result["markets_run"]}))
+        if out["log_truncated"] and not result["log_truncated"]:
             result["log_truncated"] = True
+            # Said in the log itself, once. A log that just stops reads as a
+            # strategy that stopped calling ctx.log, and the reader goes
+            # hunting for a bug in their own code.
+            emit(CHANNEL_LOG, "[runner] log budget spent -- the rest of this"
+                 " run's ctx.log output was dropped. ctx.log is for reading,"
+                 " not for exporting; see the SDK docs for the limit.")
         for line in out["logs"]:
             logs_fh.write(f'{entry["market"]["market_id"]} {line}\n')
         result["crosschecks"].extend(out["crosschecks"])
 
         # Tracked as the stream went past; there is no array left to scan.
-        lb = counters["last_book"] or {}
-        levels = lb.get("levels") or {}
-        up_asks = (levels.get("UP") or {}).get("asks") or []
-        down_asks = (levels.get("DOWN") or {}).get("asks") or []
-        up_px = up_asks[0][0] if up_asks else None
-        down_px = down_asks[0][0] if down_asks else None
+        _oq = counters["open_quotes"]
+        up_px = _oq[0] if _oq else None
+        down_px = _oq[1] if _oq else None
         result["market_summaries"].append({
             "market_id": entry["market"]["market_id"],
             "asset": entry["market"].get("asset"),

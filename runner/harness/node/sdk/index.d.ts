@@ -132,10 +132,37 @@ export interface Ctx<P = Record<string, unknown>> {
   assert_outcome(market: unknown, outcome: Side): void;
 }
 
-export interface OrderInit {
+/**
+ * Size an order in contracts, or in money.
+ *
+ * A union rather than two optional fields, so `{ size, notional }` together is
+ * a compile error rather than a run-time rejection: they answer the same
+ * question two ways and there is no sensible reading of both.
+ */
+export type OrderSizing =
+  | {
+    /** Contracts. Must be positive. */
+    size: number;
+    notional?: never;
+  }
+  | {
+    size?: never;
+    /**
+     * Spend at most this much, converted to contracts as
+     * `floor(notional / limit)`.
+     *
+     * REQUIRES `limit`, which is why this arm makes it non-optional: a
+     * contract costs whatever it fills at and a marketable order walks the
+     * book, so dividing by the current best price overspends the moment there
+     * is any slippage. The limit is the price you have already said you will
+     * not exceed, which is what makes "at most" true.
+     */
+    notional: number;
+    limit: number;
+  };
+
+export type OrderInit = OrderSizing & {
   side: Side;
-  /** Contracts. Must be positive. */
-  size: number;
   /**
    * A bound in whichever direction protects you: a ceiling when opening, a
    * floor when reducing. Must be within [0, 1] — a binary outcome token
@@ -149,7 +176,7 @@ export interface OrderInit {
   /** Only 'ioc' is modelled; anything else is rejected at construction. */
   tif?: 'ioc';
   tag?: string | null;
-}
+};
 
 /**
  * An order a hook returns.

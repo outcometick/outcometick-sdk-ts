@@ -123,10 +123,26 @@ function csvField(v) {
 }
 
 /** Rows to CSV with a fixed column order, so a diff between runs is meaningful. */
+/**
+ * A UTF-8 byte-order mark.
+ *
+ * Excel opens a .csv as the system ANSI code page unless the file says
+ * otherwise, and the only thing it accepts as saying otherwise is this. The
+ * symptom was a calibration bucket reading `0.30 釴?0.40` — an en dash, three
+ * UTF-8 bytes, read as GBK. That is not a Chinese-locale problem: it is every
+ * non-ASCII byte in every one of these files, including the `tag` a strategy
+ * puts on its own fills, which we do not control at all.
+ *
+ * Parsers that do not expect it see one stray character on the first header;
+ * `encoding='utf-8-sig'` is the standard remedy. A spreadsheet that mangles
+ * the whole file is the worse failure, and it is the one that was happening.
+ */
+const BOM = '\uFEFF';
+
 export function toCsv(rows, columns) {
   const out = [columns.join(',')];
   for (const row of rows) out.push(columns.map((c) => csvField(row[c])).join(','));
-  return `${out.join('\n')}\n`;
+  return `${BOM}${out.join('\n')}\n`;
 }
 
 const TRADE_COLUMNS = [
@@ -141,14 +157,17 @@ const FILL_COLUMNS = [
 /**
  * Assemble the archive a customer downloads.
  *
- * The submitted source goes IN, deliberately: a report that cannot be tied back
- * to the exact code that produced it is not reproducible, and "which version of
- * my strategy was this?" is the first question anyone asks a week later.
+ * THE SOURCE IS NOT IN IT. It used to be, so that a report could be tied back
+ * to the exact code that produced it — "which version of my strategy was
+ * this?" is the first question anyone asks a week later. That question is now
+ * answered by `source_sha256` in report.json instead: the same identification,
+ * without handing back a copy of the code. Shipping the strategy inside the
+ * deliverable made a report something you cannot forward to anyone.
  *
  * sha256sums.txt covers every other entry, so the whole thing is verifiable
  * without trusting the transport.
  */
-export async function buildArchive({ runId, report, trades, fills, logs, source }) {
+export async function buildArchive({ runId, report, trades, fills, logs }) {
   const entries = [
     { name: 'report.json', data: `${JSON.stringify(report, null, 2)}\n` },
     { name: 'trades.csv', data: toCsv(trades, TRADE_COLUMNS) },
@@ -158,17 +177,9 @@ export async function buildArchive({ runId, report, trades, fills, logs, source 
       name: 'calibration.csv',
       data: toCsv(report.calibration ?? [], ['bucket', 'implied', 'realized', 'edge_cents', 'trades']),
     },
-    {
-      name: 'latency.csv',
-      data: toCsv(report.latency ?? [], ['label', 'delay_ms', 'net_pnl', 'ratio', 'unprofitable']),
-    },
     { name: 'coverage.json', data: `${JSON.stringify(report.coverage ?? {}, null, 2)}\n` },
     { name: 'logs.txt', data: logs ?? '' },
   ];
-
-  for (const f of source ?? []) {
-    entries.push({ name: `strategy/${f.name}`, data: f.content });
-  }
 
   // Checksums last, over everything above.
   const sums = entries

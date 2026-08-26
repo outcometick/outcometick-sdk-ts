@@ -129,8 +129,74 @@ export class Portfolio {
     if (!isSide(order?.side)) { this.rejected += 1; return null; }
 
     const leg = this.#legs(marketId)[order.side];
-    let size = Number(order.size);
-    if (!(size > 0)) { this.rejected += 1; return null; }
+
+    // ONE PLACE THAT DECIDES WHETHER AN ORDER IS USABLE.
+    //
+    // This was three separate checks bolted on one at a time, and each time a
+    // new shape of bad input walked past the ones already there — an infinite
+    // notional, then a size and a notional together, then a bad `limit` on a
+    // plain size order. Whack-a-mole on a consumption point is how you end up
+    // with an engine that rejects what it happens to have been asked about.
+    //
+    // Every unusable order is COUNTED AND RETURNS NULL. Never thrown: a bad
+    // order is one order, and otengine.py raising ValueError/OverflowError on
+    // the same input turned "reject one order" into "fail the whole run" —
+    // same input, two different outcomes, in a product whose whole promise is
+    // that the two engines are the same engine. That mirror is held to this
+    // table by runner/conformance.
+    // A NUMBER, not something Number() is willing to turn into one.
+    //
+    // Coercion is not validation: `Number('10')` is 10, `Number([10])` is 10,
+    // `Number(true)` is 1. Python's `float()` agrees about the string and the
+    // bool and RAISES on the list — so `{ size: [10] }` filled ten contracts
+    // in JS and was rejected in Python, from one strategy, on one input.
+    //
+    // The SDK's Order requires a number and the docs say a number. Anything
+    // else is a mistake in the strategy, and a mistake that fills is worse
+    // than one that is counted.
+    const finite = (v) => (
+      typeof v === 'number' && Number.isFinite(v) ? v : null
+    );
+
+    const hasSize = order.size != null;
+    const hasNotional = order.notional != null;
+    // Contradictory instructions. Choosing one silently would trade a contract
+    // count while the author believed they had set a spending cap.
+    if (hasSize === hasNotional) { this.rejected += 1; return null; }
+
+    // A limit is optional, but a limit that is PRESENT must be a price: an
+    // outcome token trades in [0, 1], and `limit: 2` or `limit: Infinity`
+    // means "pay anything" — which is what it silently did.
+    let limit = null;
+    if (order.limit != null) {
+      limit = finite(order.limit);
+      if (limit == null || limit < 0 || limit > 1) { this.rejected += 1; return null; }
+    }
+
+    let size;
+    if (hasNotional) {
+      // MONEY -> CONTRACTS, here rather than in the SDK's Order constructor:
+      // a hook may return a plain object literal — most of the JS examples do
+      // — and one that never passed through `new Order()` would carry a
+      // `notional` nobody converted.
+      //
+      // The divisor is the limit, never the current best price: a contract
+      // costs whatever it fills at and a marketable order walks the book, so
+      // dividing by the touch overspends the moment there is any slippage.
+      const budget = finite(order.notional);
+      if (budget == null || budget <= 0 || limit == null || limit <= 0) {
+        this.rejected += 1; return null;
+      }
+      // The QUOTIENT can overflow from two finite inputs: 1e308 / 0.01 is
+      // Infinity. Checked before the floor, because that is where Python
+      // raises.
+      const q = budget / limit;
+      if (!Number.isFinite(q)) { this.rejected += 1; return null; }
+      size = Math.floor(q);
+    } else {
+      size = finite(order.size);
+    }
+    if (size == null || !(size > 0)) { this.rejected += 1; return null; }
 
     // reduce_only is clamped to what is open. A strategy asking to close more
     // than it holds must not accidentally open the other way.
@@ -139,9 +205,15 @@ export class Portfolio {
       if (!(size > EPS)) { this.rejected += 1; return null; }
     }
 
-    const res = matchOrder(book, { ...order, size });
+    // ONE effective order from here on: the derived size has to reach the fill
+    // row as well as the match. It did not, and the row's `requested` came out
+    // as NaN for a notional-only order — the fill was executed (the fee was
+    // identical) but the ROW was rejected by the parser and never emitted, so
+    // the run silently lost its fill log. otengine.py does the same.
+    const eff = { ...order, size, limit };
+    const res = matchOrder(book, eff);
     if (res.filled <= 0) {
-      this.fills.push(this.#fillRow({ ts, marketId, order, res, tag, realised: 0, fee: 0 }));
+      this.fills.push(this.#fillRow({ ts, marketId, order: eff, res, tag, realised: 0, fee: 0 }));
       return res;
     }
 
@@ -177,7 +249,7 @@ export class Portfolio {
       this.cash -= res.notional + fee;
     }
 
-    this.fills.push(this.#fillRow({ ts, marketId, order, res, tag, realised, fee }));
+    this.fills.push(this.#fillRow({ ts, marketId, order: eff, res, tag, realised, fee }));
     return res;
   }
 

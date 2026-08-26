@@ -13,7 +13,13 @@ import {
   LANGUAGES, KNOWN_LANGUAGES, HOOKS, KNOWN_HOOKS, HOOK_NAMES, LIMITS, MODES,
   KNOWN_MODES, SCHEMA_VERSION, BacktestRejection, parseReferenceFeed,
 } from './backtest-contract.mjs';
-import { normalizeDatasets, assertCoverage } from './backtest-datasets.mjs';
+import {
+  normalizeDatasets, normalizeIntervals, normalizeLatency, assertCoverage,
+} from './backtest-datasets.mjs';
+// The series parser, so the FREE check rejects a malformed CSV instead of the
+// worker rejecting it after credits are held. One implementation, shared: the
+// docs promise a local pass is not rejected on submit.
+import { parseSeries } from '../../runner/series-data.mjs';
 
 /** The one file name that is not the submitter's to choose. */
 export const MANIFEST_NAME = 'outcometick.json';
@@ -115,6 +121,15 @@ export function validateManifest(doc) {
   }
 
   const datasets = normalizeDatasets(doc.datasets);
+
+  // Which market lengths to replay. Absent means 5m — see MARKET_INTERVALS for
+  // why the set is closed and why the default is not "both".
+  const intervals = normalizeIntervals(doc.intervals);
+
+  // Which fill delays to re-price at, for the latency panel. Empty by default:
+  // every delay is another replay of the range, and it used to be five of them
+  // whether or not anyone wanted the table.
+  const latency = normalizeLatency(doc.latency);
 
   // A hook that needs a dataset it was not given would simply never fire, and
   // a strategy that silently never trades looks like a bad strategy rather
@@ -231,6 +246,8 @@ export function validateManifest(doc) {
     entry: { file: entryFile, className: entryClass },
     hooks,
     datasets,
+    intervals,
+    latency,
     mode,
     deps,
     reference,
@@ -272,13 +289,45 @@ export function validateFiles(files, manifest) {
         `file ${name} contains a NUL byte — submissions are text only, no archives`);
     }
     const bytes = Buffer.byteLength(content, 'utf8');
-    total += bytes;
     seen.set(name, { name, bytes, content });
   }
 
+  // SOURCE and DATA have separate budgets.
+  //
+  // One shared 256KB cap meant a declared series ate the code's allowance, and
+  // the advertised 32MB series could never be sent at all — the two limits
+  // contradicted each other and the smaller one won silently. Code is small and
+  // is read by a human during an abuse review; a series is bulk and is read by
+  // nothing.
+  const seriesFiles = new Set(manifest.series.map((s) => s.file));
+  for (const f of seen.values()) {
+    if (seriesFiles.has(f.name)) continue;
+    total += f.bytes;
+  }
   if (total > LIMITS.maxTotalSourceBytes) {
     throw new BacktestRejection('E_LIMIT',
-      `total source is ${total} bytes, over the ${LIMITS.maxTotalSourceBytes} byte limit`);
+      `total source is ${total} bytes, over the ${LIMITS.maxTotalSourceBytes} byte limit`
+      + ' (series files have their own budget and are not counted here)');
+  }
+  for (const s of manifest.series) {
+    const f = seen.get(s.file);
+    if (f && f.bytes > LIMITS.maxSeriesBytes) {
+      throw new BacktestRejection('E_LIMIT',
+        `series ${s.name} is ${f.bytes} bytes, over the ${LIMITS.maxSeriesBytes} byte limit`);
+    }
+    // PARSED HERE, in the free check — not later, in the worker.
+    //
+    // The docs promise that a local pass is not rejected on submit, and this is
+    // the same validator `ot check` runs. Leaving it to the worker meant a CSV
+    // with no readable timestamp got as far as holding credits and queueing,
+    // then failed and refunded: technically correct, and a terrible way to
+    // learn your header was wrong.
+    if (f) {
+      const out = parseSeries(f.content);
+      if (out.rows.length === 0) {
+        throw new BacktestRejection('E_MANIFEST', `series ${s.name} (${s.file}): ${out.problem}`);
+      }
+    }
   }
   if (!seen.has(MANIFEST_NAME)) {
     throw new BacktestRejection('E_MANIFEST', `${MANIFEST_NAME} is required`);
@@ -340,6 +389,5 @@ export function checkSubmission({ manifestText, manifest: manifestDoc, files, sc
     // so neither the runner nor the CLI re-implements the parity table.
     hookNames: Object.fromEntries(manifest.hooks.map((h) => [h, HOOK_NAMES[manifest.languageId][h]])),
     shardable: MODES[manifest.mode].shardable,
-    rateMultiplier: MODES[manifest.mode].rateMultiplier,
   };
 }

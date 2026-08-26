@@ -322,3 +322,38 @@ test('malformed orders are counted, not thrown', () => {
   assert.equal(p.rejected, 5);
   assert.equal(p.fills.length, 0);
 });
+
+// Bad sizing is COUNTED, never thrown, and never allowed through.
+//
+// `Infinity > 0` is true, so a positivity test is not a finiteness test: an
+// infinite notional derived `size = Infinity`, walked the whole book and
+// produced `filled: NaN`, which poisons the position, the equity curve and
+// every number computed from them — with nothing anywhere reporting a problem.
+// The Python engine raised OverflowError on the same input, turning "reject
+// one order" into "fail the whole run". Same input, two different disasters.
+//
+// otengine.py is held to the identical table by runner/conformance.
+test('every shape of unusable sizing is rejected and counted', () => {
+  const book = new Book();
+  book.snapshot(1000, { UP: { asks: [[0.51, 1000]], bids: [[0.49, 1000]] } });
+
+  const cases = [
+    ['an infinite notional', { side: 'UP', notional: Infinity, limit: 0.5 }],
+    ['a NaN notional', { side: 'UP', notional: NaN, limit: 0.5 }],
+    ['a non-numeric notional', { side: 'UP', notional: 'lots', limit: 0.5 }],
+    ['a zero notional', { side: 'UP', notional: 0, limit: 0.5 }],
+    ['a negative notional', { side: 'UP', notional: -5, limit: 0.5 }],
+    ['an infinite limit', { side: 'UP', notional: 80, limit: Infinity }],
+    ['a notional with no limit', { side: 'UP', notional: 80 }],
+    ['an infinite size', { side: 'UP', size: Infinity }],
+    ['a size and a notional at once', { side: 'UP', size: 10, notional: 80, limit: 0.5 }],
+  ];
+
+  for (const [what, order] of cases) {
+    const pf = new Portfolio({ feeBps: 0 });
+    const res = pf.execute({ book, order, ts: 1001, marketId: 'm', how: 'exit' });
+    assert.equal(res, null, `${what} was executed instead of rejected`);
+    assert.equal(pf.rejected, 1, `${what} was not counted as a rejection`);
+    assert.equal(pf.fills.length, 0, `${what} produced a fill row`);
+  }
+});

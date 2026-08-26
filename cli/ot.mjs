@@ -35,6 +35,9 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
   ot run <dir> --data <archive> [--date <YYYY-MM-DD>] [--out <file>]
       Replay locally against a cloned sample archive, using the same engine
       the queue uses. Writes a report archive.
+      Refused if the manifest declares a reference feed: those come from an
+      archive held on the worker, so a local replay would hand your strategy
+      empty ones. Your own CSV series work locally.
 
   ot submit <dir> --assets btc,eth --from <day> --to <day> [--venue polymarket]
       Send it to the queue. Needs OT_BACKTEST_KEY.
@@ -96,8 +99,15 @@ export async function readSubmission(dir) {
       if (!/\.(py|mjs|js|json|csv)$/.test(e.name)) continue;
       const full = path.join(dir, name);
       const s = await stat(full);
-      if (s.size > LIMITS.maxTotalSourceBytes) {
-        throw new Error(`${name} is ${s.size} bytes, over the ${LIMITS.maxTotalSourceBytes} byte submission limit`);
+      // The ceiling for ANY one file is the series limit, not the source limit:
+      // a CSV series is allowed to be much larger than the code, and the shared
+      // validator is what enforces which budget a given file falls under.
+      // Refusing a 1MB CSV here meant `ot check` rejected a submission the API
+      // accepts — and "a local pass is not rejected on submit" is a promise the
+      // docs make.
+      const ceiling = Math.max(LIMITS.maxTotalSourceBytes, LIMITS.maxSeriesBytes);
+      if (s.size > ceiling) {
+        throw new Error(`${name} is ${s.size} bytes, over the ${ceiling} byte limit for a single file`);
       }
       out.push({ name, content: await readFile(full, 'utf8') });
     }
@@ -153,10 +163,19 @@ async function cmdCheck({ dir, flags }) {
   process.stdout.write(`\n  ok — ${manifest.language}, entry ${manifest.entry.file}:${manifest.entry.className}\n`);
   process.stdout.write(`  hooks     ${Object.entries(res.hookNames).map(([k, v]) => `${k} → ${v}`).join(', ')}\n`);
   process.stdout.write(`  datasets  ${manifest.datasets.join(', ')}\n`);
+  // Both of these change what comes back, so `ot check` has to show them:
+  // this command exists to say what the queue will do with this submission,
+  // and a run narrowed to 5m at a 250ms fill delay is a different answer to
+  // the same strategy.
+  process.stdout.write(`  intervals ${manifest.intervals.join(', ')}\n`);
+  process.stdout.write(`  delay     ${manifest.latency ? `${manifest.latency} ms` : 'none'}\n`);
   if (manifest.reference.length) process.stdout.write(`  reference ${manifest.reference.join(', ')}\n`);
   process.stdout.write(`  files     ${res.files.length} / ${LIMITS.maxFiles} · ${(res.totalBytes / 1024).toFixed(1)} / ${LIMITS.maxTotalSourceBytes / 1024} KB\n`);
   if (manifest.mode === 'session') {
-    process.stdout.write('  mode      session — bills at 3× the market-day rate\n');
+    // NOT "3x the market-day rate". That multiplier was deleted, and this was
+    // its third hiding place after both i18n dictionaries — the guard that
+    // caught the other two only scans lib/backtest-i18n.ts.
+    process.stdout.write('  mode      session — same price as market mode\n');
   }
   process.stdout.write('\n');
   return 0;

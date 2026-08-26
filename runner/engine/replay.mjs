@@ -15,25 +15,50 @@
 import { Book } from './book.mjs';
 import { Portfolio } from './portfolio.mjs';
 
+
+// Mirrors LIMITS.logLineChars / LIMITS.logBytesPerRun, and does NOT import
+// them. This file is baked into the sandbox image, which contains runner/ and
+// nothing else — an import of api/ resolves fine on a developer's machine and
+// on the worker, and then fails inside every container with
+// ERR_MODULE_NOT_FOUND. otreplay.py mirrors the same two numbers for the same
+// reason. replay-limits.test.mjs asserts both copies still equal the contract.
+const LOG_LINE_CHARS = 512;
+const LOG_BYTES_PER_RUN = 2 * 1024 * 1024;
+
+// A settlement recompute is a once-per-market claim, so these are generous.
+// They exist because `crosschecks` rides the same result line as everything
+// else: unbounded, it is an output channel with no budget. Mirrored in
+// otreplay.py.
+const MAX_CROSSCHECKS_PER_MARKET = 16;
+const CROSSCHECK_CLAIMED_CHARS = 32;
+
+
 /** Event kinds the loop understands, in the order they dispatch. */
 export const EVENT_KINDS = Object.freeze(['tick', 'book', 'trade']);
 
 /**
  * Per-event budget.
  *
- * Measured over the strategy's own hook, not the loop around it. A p99 breach
- * kills the shard rather than the run: one pathological market must not cost
- * the customer the other 719.
+ * Measured over the strategy's own hook, not the loop around it. Sustained cost
+ * over budget kills the shard rather than the run: one pathological market must
+ * not cost the customer the other 719.
  */
 export class BudgetMonitor {
-  constructor({ limitMicros = 400, sampleFloor = 200, tolerance = 0.01 } = {}) {
+  constructor({ limitMicros = 400, sampleFloor = 2000 } = {}) {
     this.limitMicros = limitMicros;
     this.sampleFloor = sampleFloor;
-    this.tolerance = tolerance;
     this.count = 0;
     this.breaches = 0;
     this.maxMicros = 0;
     this.totalMicros = 0;
+    // The most recent `sampleFloor` events, as a ring. One monitor covers the
+    // WHOLE run, so a lifetime mean is diluted by however much came before: a
+    // strategy that runs 18,000 events at 8us and then 2,000 at 2,000us has a
+    // lifetime mean of 207us and passes, while its last 2,000 events are
+    // continuously 5x over budget. The window is what makes "sustained" local.
+    this.window = new Float64Array(sampleFloor);
+    this.windowSum = 0;
+    this.windowAt = 0;
   }
 
   record(micros) {
@@ -41,14 +66,64 @@ export class BudgetMonitor {
     this.totalMicros += micros;
     if (micros > this.maxMicros) this.maxMicros = micros;
     if (micros > this.limitMicros) this.breaches += 1;
+    this.windowSum += micros - this.window[this.windowAt];
+    this.window[this.windowAt] = micros;
+    this.windowAt = (this.windowAt + 1) % this.window.length;
+  }
+
+  /** Mean of the most recent `sampleFloor` events. Zero until the window fills. */
+  get windowMicros() {
+    return this.count >= this.sampleFloor ? this.windowSum / this.window.length : 0;
   }
 
   /**
-   * A single slow event is not a breach — a JIT warm-up or a GC pause is not
-   * the strategy's fault. Sustained breach past the p99 tolerance is.
+   * SUSTAINED cost, which is what the limit is for and what customers are told
+   * it means ("sustained breach kills the shard"): the mean of the most recent
+   * `sampleFloor` events, not the tail and not the lifetime.
+   *
+   * This judged the breach RATE against a 1% tolerance, and it was measuring
+   * the wrong machine. The budget brackets each hook with two wall-clock reads,
+   * on a 2-core box where the worker is decompressing and feeding stdin the
+   * whole time and the sandbox holds one vCPU — so an event that gets
+   * descheduled is recorded as an event the strategy spent 4ms in. Measured
+   * inside the real image: the same strategy on an idle host averages 7.8us
+   * with a 766us worst case, and under contention averages 20.9us with a 4090us
+   * worst case. Nothing about the strategy changed.
+   *
+   * The page's own sample was rejected in production at avg 72us — a fifth of
+   * its 400us budget — because 1.1% of its events had been interrupted. The
+   * breaches were not even front-loaded, so a longer warm-up floor could never
+   * have fixed it: measured in-image they land at events 171, 2368, 3201 and so
+   * on, which is the shape of GC and scheduling, not of a slow strategy.
+   *
+   * The mean is what actually predicts the thing this protects — the 20-minute
+   * wall clock is mean times event count — and it is not fooled by a machine
+   * that takes the CPU away. A strategy that really is slow raises the mean; an
+   * interrupted one does not. A single hook that never returns is still caught,
+   * by the run deadline, which is where that belongs.
+   *
+   * WINDOWED, NOT LIFETIME. One monitor covers the whole run, so a lifetime
+   * mean lets a cheap prefix pay for an expensive phase: 18,000 events at 8us
+   * followed by 2,000 at 2,000us averages 207us and passes, while the strategy
+   * has been 5x over budget for its last two thousand events. The window is
+   * what makes "sustained" mean sustained rather than "on average, eventually".
+   *
+   * `breaches` and `max_micros` stay in the summary. They are good diagnostics.
+   * They are not a verdict.
+   *
+   * KNOWN AND DELIBERATE GAP: a low-frequency, very heavy event slips through.
+   * One 500ms hook among 2,000 events at 8us is a window mean of 258us, inside
+   * budget; it would take 800ms to trip on its own. A per-hook hard cap would
+   * close it, and it is not being added, because this limit has now been wrong
+   * twice and BOTH times the same way — a one-off cost judged as a sustained
+   * one, killing a strategy that was fine. Building an index on the first tick
+   * is a legitimate 300ms hook. The wall clock already bounds total resource
+   * use, so the cap would buy protection against a failure nobody has seen at
+   * the cost of the exact mistake already made twice. Add it when a real run
+   * demonstrates the need, not before.
    */
   get breached() {
-    return this.count >= this.sampleFloor && this.breaches / this.count > this.tolerance;
+    return this.count >= this.sampleFloor && this.windowMicros > this.limitMicros;
   }
 
   get avgMicros() { return this.count ? this.totalMicros / this.count : 0; }
@@ -59,6 +134,10 @@ export class BudgetMonitor {
       breaches: this.breaches,
       breach_rate: this.count ? this.breaches / this.count : 0,
       avg_micros: this.avgMicros,
+      // The number the verdict is actually made on. Without it a rejection
+      // shows a lifetime average comfortably inside budget and reads as a lie.
+      window_micros: this.windowMicros,
+      window_events: this.sampleFloor,
       max_micros: this.maxMicros,
       limit_micros: this.limitMicros,
     };
@@ -124,7 +203,7 @@ function bookView(book) {
   });
 }
 
-function createCtx({ params, portfolio, marketId, market, logLimit, references, series, rng }) {
+function createCtx({ params, portfolio, marketId, market, logBudget, references, series, rng }) {
   const history = [];
   const logs = [];
   const crosschecks = [];
@@ -171,8 +250,20 @@ function createCtx({ params, portfolio, marketId, market, logLimit, references, 
     },
 
     log(msg) {
-      if (logs.length >= logLimit) { logTruncated = true; return; }
-      logs.push(`${now} ${String(msg)}`);
+      // BYTES FOR THE WHOLE RUN, not lines per market. The old shape — 10,000
+      // lines per market, no length cap — let a run emit the archive it had
+      // just paid a market-day for into a file the customer downloads. See
+      // LIMITS.logBytesPerRun for the arithmetic that picks these numbers.
+      if (logBudget.spent >= logBudget.bytes) { logTruncated = true; return; }
+      const line = `${now} ${String(msg)}`.slice(0, logBudget.lineChars);
+      // BYTES, not string length. logs.txt is UTF-8, and `.length` counts
+      // UTF-16 units — so a run logging Chinese spent a third of what it
+      // wrote, and the archive could reach three times the 2 MB this budget
+      // advertises. The line cap stays in characters because it is about
+      // being readable; the run cap is about how much data leaves with the
+      // customer, and that is measured in bytes.
+      logBudget.spent += Buffer.byteLength(line, 'utf8') + 1;
+      logs.push(line);
     },
 
     /** Seeded generator — the only randomness available, and it is recorded. */
@@ -240,9 +331,19 @@ function createCtx({ params, portfolio, marketId, market, logLimit, references, 
       // recompute match that never happened. The cross-check panel's whole
       // value is that it is the ARCHIVE's answer, not the strategy's.
       const official = market?.outcome ?? null;
+      // BOUNDED, for the same reason ctx.log is. `outcome` is whatever the
+      // strategy passed and this can be called on every event, so an unbounded
+      // push here is an unmetered output channel wearing a different name: the
+      // whole array is serialised onto the authenticated result line, sent,
+      // and parsed by the worker before anything downstream gets to ignore it.
+      // The panel only ever shows an aggregate, so nothing of value is lost by
+      // capping — a settlement recompute is a once-per-market claim.
+      if (crosschecks.length >= MAX_CROSSCHECKS_PER_MARKET) return;
       crosschecks.push({
         market_id: marketId,
-        claimed: outcome,
+        claimed: typeof outcome === 'string'
+          ? outcome.slice(0, CROSSCHECK_CLAIMED_CHARS)
+          : String(outcome).slice(0, CROSSCHECK_CLAIMED_CHARS),
         official,
         match: official === outcome,
       });
@@ -293,11 +394,32 @@ const HOOK_FOR = { tick: 'on_tick', book: 'on_book', trade: 'on_trade' };
  *   decision. Zero is "as captured"; the latency panel is this same replay at
  *   100ms, 250ms, 500ms, 1s and 2s.
  */
+/**
+ * A log allowance for one run.
+ *
+ * Bytes, not lines, and shared by every market in the run — see
+ * LIMITS.logBytesPerRun for why those two choices are the whole fix.
+ */
+export function makeLogBudget({
+  bytes = LOG_BYTES_PER_RUN,
+  lineChars = LOG_LINE_CHARS,
+} = {}) {
+  return { bytes, lineChars, spent: 0 };
+}
+
 export function replayMarket({
   market, events, strategy, hooks,
   portfolio = null,
   fillDelayMs = 0,
-  logLimit = 10_000,
+  /**
+   * The run's remaining log allowance, SHARED ACROSS MARKETS.
+   *
+   * Passed in rather than created here, because a per-market allowance is what
+   * the old limit was and what made the log channel an export route: 386
+   * markets a day each got their own budget. One object for the whole run is
+   * the fix — the harness makes it once and hands the same one to every market.
+   */
+  logBudget = null,
   budget = null,
   references = null,
   series = null,
@@ -338,7 +460,7 @@ export function replayMarket({
     portfolio: pf,
     marketId,
     market: engineMarket,
-    logLimit,
+    logBudget: logBudget ?? makeLogBudget(),
     references,
     series,
     rng: makeRng(seed),

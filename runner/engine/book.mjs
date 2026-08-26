@@ -209,7 +209,18 @@ export function matchOrder(book, order) {
   const quotedPx = ladder.best();
 
   const { fills, remaining, notional } = ladder.take(size, order.limit ?? null);
-  const filled = size - remaining;
+  // SUMMED FROM WHAT WAS TAKEN, not derived as `size - remaining`.
+  //
+  // `remaining` is the requested size with each level's depth subtracted from
+  // it, and at IEEE-754 precision `1e308 - 1000` is still `1e308`. So a huge
+  // but finite order consumed the whole ladder while reporting `filled: 0` —
+  // no position, no cash, no trade row, and an empty book for every order
+  // after it in that market. The report said nothing happened; the book said
+  // otherwise.
+  //
+  // Adding up the levels actually taken cannot drift from what was removed,
+  // because it IS what was removed. otengine.py mirrors this.
+  const filled = fills.reduce((a, f) => a + f.size, 0);
 
   return {
     fills,

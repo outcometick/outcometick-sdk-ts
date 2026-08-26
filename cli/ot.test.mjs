@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -282,5 +283,99 @@ test('a local archive walk does not follow symlinks out of the archive', async (
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(secretDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// a CSV series is not source
+// ---------------------------------------------------------------------------
+
+test('the per-file ceiling admits a series, not just source', async () => {
+  // `ot check` refused any file over maxTotalSourceBytes before the shared
+  // validator ever saw it, so a 1MB CSV — well inside the advertised 8MB series
+  // limit — failed locally and passed on the API. That breaks the one promise
+  // this CLI exists to keep: a local pass is not rejected on submit.
+  const { LIMITS } = await import('../api/lib/backtest-contract.mjs');
+  const ceiling = Math.max(LIMITS.maxTotalSourceBytes, LIMITS.maxSeriesBytes);
+  assert.ok(
+    ceiling >= LIMITS.maxSeriesBytes,
+    `a ${LIMITS.maxSeriesBytes} byte series cannot get past a ${ceiling} byte ceiling`,
+  );
+  // And the source limit is still the smaller of the two, so this is a real
+  // widening rather than the two numbers having quietly converged.
+  assert.ok(LIMITS.maxTotalSourceBytes < LIMITS.maxSeriesBytes);
+});
+
+test('the CLI still refuses a file no budget could accept', async () => {
+  // The ceiling is a backstop against reading something enormous into memory,
+  // not a replacement for the validator's per-budget rules.
+  const { LIMITS } = await import('../api/lib/backtest-contract.mjs');
+  const src = readFileSync(new URL('./ot.mjs', import.meta.url), 'utf8');
+  assert.match(src, /over the \$\{ceiling\} byte limit for a single file/);
+  assert.ok(LIMITS.maxSeriesBytes > 0);
+});
+
+// `ot run` and the queue must agree about how many passes to run, and at what
+// delay.
+//
+// The eighth time these two drifted was exactly this: when the comparison
+// passes became opt-in, the worker started reading `manifest.latency` while
+// `cmdRun` went on walking every built-in delay — the same manifest ran once
+// online and six times locally. Every previous divergence had the same shape:
+// they shared the decoder and nothing else.
+//
+// Now there is one pass on both sides, at the delay the manifest asked for.
+test('ot run replays once at the manifest delay, exactly as the worker does', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const HERE = new URL('.', import.meta.url).pathname;
+  const cli = await readFile(`${HERE}commands/run.mjs`, 'utf8');
+  const worker = await readFile(`${HERE}../runner/worker.mjs`, 'utf8');
+
+  for (const [name, src] of [['ot run', cli], ['the worker', worker]]) {
+    // No walking a built-in list of delays.
+    assert.doesNotMatch(src, /for \(const step of LATENCY_STEPS\)/,
+      `${name} walks a built-in delay list again`);
+    // The delay comes from the manifest, and defaults to none.
+    assert.match(src, /const delayMs = manifest\.latency \?\? 0;/,
+      `${name} no longer takes its fill delay from the manifest`);
+    // Exactly one pass is built from it.
+    assert.match(src, /const steps = \[\{ label: delayMs \? `\+\$\{delayMs\} ms` : '0 ms', ms: delayMs \}\];/,
+      `${name} no longer builds exactly one pass`);
+    // And the report records it.
+    assert.match(src, /fillDelayMs: delayMs/,
+      `${name} does not tell the report which delay it measured at`);
+  }
+});
+
+// NOTHING may branch on "is this the zero-delay pass" any more.
+//
+// This is the trap the single-pass model sets, and it has already been walked
+// into twice. Both the worker and `cmdRun` decided things by `step.ms === 0`
+// — back when pass 0 was the report and the rest were a survivable comparison
+// curve. With one pass at the manifest's delay, that test silently becomes
+// false the moment anyone writes `latency: 250`:
+//
+//   in the worker  the run replayed a SAMPLE and reported no progress at all;
+//   in `ot run`    sandbox rejections stopped being raised, so a refused or
+//                  over-budget replay produced a local report marked
+//                  `fill_delay_ms: 250` that the queue would reject outright.
+//
+// Neither errors. Both produce a report. It is only wrong.
+test('neither side branches on the delay being zero', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const HERE = new URL('.', import.meta.url).pathname;
+  for (const [name, file] of [
+    ['ot run', `${HERE}commands/run.mjs`],
+    ['the worker', `${HERE}../runner/worker.mjs`],
+  ]) {
+    const src = await readFile(file, 'utf8');
+    // Comments are allowed to mention it — that is where the lesson lives.
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    for (const pattern of [/step\.ms === 0/, /delayMs === 0/, /isMainPass/]) {
+      assert.doesNotMatch(code, pattern,
+        `${name} decides something by whether the delay is zero`
+        + ' — with one pass at the manifest delay that branch stops running'
+        + ' exactly when a delay is asked for');
+    }
   }
 });

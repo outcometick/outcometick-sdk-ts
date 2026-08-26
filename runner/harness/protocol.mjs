@@ -41,7 +41,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 export const JOB_FILE = 'job.json';
 
 /**
- * Results come back over FD 3, authenticated. There is no output directory.
+ * Results come back over stdout, authenticated. There is no output directory.
  *
  * `/out` used to be a writable bind mount holding trades.jsonl and fills.jsonl.
  * A Python strategy declaring the allowlisted `pandas` could call
@@ -72,10 +72,38 @@ export const CHANNEL = Object.freeze({
   fill: 'f',
   log: 'l',
   result: 'r',
+  /**
+   * "I have finished replaying market-day N." Display only.
+   *
+   * The worker used to count how many market-days it had WRITTEN into stdin,
+   * which is not the same thing: a write only proves the bytes were accepted
+   * into a buffer. Small days fit several at a time, so the bar ran ahead of
+   * the replay and could show 100% while the sandbox still had work to do —
+   * the "looks stuck" experience this panel exists to prevent.
+   *
+   * It comes from the sandbox, so it is attacker-influenced like every other
+   * line, and it is authenticated like every other line. That is fine for a
+   * progress bar and NOT fine for money: billing still uses only what the
+   * worker itself fetched and fed.
+   */
+  progress: 'p',
 });
 
-/** The fd the harness writes results to. 0 is the job, 1 and 2 are discarded. */
-export const RESULT_FD = 3;
+/**
+ * The authenticated result channel: the container's stdout.
+ *
+ * It used to be fd 3. Docker hands a container stdin/stdout/stderr and nothing
+ * else — the worker spawns `docker run` with a fourth pipe, but that fd belongs
+ * to the docker CLIENT, so inside the container fd 3 was closed and every write
+ * failed with EBADF. No containerised run had ever produced a result.
+ *
+ * Each harness makes fd 1 unreachable for the strategy before loading its code
+ * (Python dups it away and points 1 at /dev/null; JavaScript takes over
+ * `console`, which is the only route left once the analyser has refused
+ * `process`). The MAC is what makes forgery impossible, and always was —
+ * /proc/self/fd/1 was addressable either way.
+ */
+export const RESULT_FD = 1;
 
 /** Exit codes a harness may use. Anything else is treated as a crash. */
 export const EXIT = Object.freeze({

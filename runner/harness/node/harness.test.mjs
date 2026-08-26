@@ -58,7 +58,7 @@ async function runHarness({ strategy, job = {}, events = EVENTS, markets = null 
     seed: 7,
     feeBps: 0,
     fillDelayMs: 0,
-    limits: { perEventBudgetMicros: 400, logLinesPerMarketDay: 10 },
+    limits: { perEventBudgetMicros: 400, logBytesPerRun: 60, logLineChars: 512 },
     ...jobRest,
   };
   const marketList = markets ?? [{ market: MARKET, stream: 'prices' }];
@@ -66,11 +66,11 @@ async function runHarness({ strategy, job = {}, events = EVENTS, markets = null 
   const lines = [];
   let forged = 0;
   const code = await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [HARNESS, dir], { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [HARNESS, dir], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = '';
     let tail = '';
     child.stderr.on('data', (d) => { stderr += d; });
-    child.stdio[3].on('data', (d) => {
+    child.stdout.on('data', (d) => {
       tail += d;
       const parts = tail.split('\n');
       tail = parts.pop();
@@ -226,7 +226,7 @@ test('a rejection still writes a result file — nothing is billed, but the reas
 // logs
 // ---------------------------------------------------------------------------
 
-test('logs are captured, prefixed by market, and capped', async () => {
+test('logs are captured, prefixed by market, and capped by bytes', async () => {
   const r = await runHarness({
     strategy: `export class S {
       onMarketOpen() {}
@@ -235,8 +235,52 @@ test('logs are captured, prefixed by market, and capped', async () => {
   });
   assert.equal(r.code, EXIT.ok, r.stderr);
   assert.match(r.logs, /^0xm1 /m);
-  // 3 ticks x 5 lines = 15, capped at the job's logLinesPerMarketDay of 10.
-  assert.equal(r.logs.trim().split('\n').length, 10);
+  const lines = r.logs.trim().split('\n');
+  // 3 ticks x 5 lines = 15 lines of ~12 bytes each = ~180 bytes, cut short by
+  // the job's 60-byte budget. The first fixture used 220 and every line fitted
+  // — a cap that is not reached proves nothing about a cap.
+  assert.ok(lines.length < 15, `${lines.length} lines got through a 60-byte budget`);
+  assert.equal(r.result.logTruncated, true);
+  // AND THE READER IS TOLD, in the log itself. A log that simply stops reads as
+  // a strategy that stopped calling ctx.log, and sends someone hunting for a
+  // bug in their own code.
+  assert.match(r.logs, /log budget spent/,
+    'the log was truncated without saying so — the reader is left to guess');
+});
+
+test('the log budget is spent across the whole run, not per market', async () => {
+  // The hole this replaced: the budget was created inside replayMarket, so
+  // every market got a fresh one. polymarket runs ~386 markets a day, so the
+  // documented cap was really 386x itself, and ctx.log became a bulk export
+  // channel for the data we sell.
+  //
+  // Three markets, one 60-byte budget. If the budget is shared, market 1 spends
+  // it and the later markets log NOTHING. If it is per-market, each one gets a
+  // fresh 60 bytes and market 3 logs just as freely as market 1 — which is the
+  // bug, and is what makes this assertion discriminating.
+  const r = await runHarness({
+    strategy: `export class S {
+      onMarketOpen() {}
+      onTick(ctx) { for (let i = 0; i < 5; i++) ctx.log("line " + i); return null; }
+    }`,
+    markets: [
+      { market: MARKET, stream: 'prices' },
+      { market: { ...MARKET, market_id: '0xm2' }, stream: 'prices' },
+      { market: { ...MARKET, market_id: '0xm3' }, stream: 'prices' },
+    ],
+  });
+  assert.equal(r.code, EXIT.ok, r.stderr);
+
+  const strategyLines = r.logs.trim().split('\n').filter((l) => /^0x\w+ /.test(l));
+  const later = strategyLines.filter((l) => l.startsWith('0xm2 ') || l.startsWith('0xm3 '));
+  assert.equal(later.length, 0,
+    `markets after the first still logged ${later.length} lines — the budget reset per market`);
+
+  // And the total really is bounded by the job's budget, which is the property
+  // the archive's logs.txt depends on.
+  const bytes = strategyLines.reduce((n, l) => n + l.length + 1, 0);
+  assert.ok(bytes <= 60 + 40,
+    `${bytes} bytes of strategy log got through a 60-byte budget`);
   assert.equal(r.result.logTruncated, true);
 });
 
@@ -367,10 +411,10 @@ export class S {
   const subKey = 'f'.repeat(64);
   let subLogs = '';
   const { code } = await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [HARNESS, dir], { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [HARNESS, dir], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = '';
     child.stderr.on('data', (d) => { stderr += d; });
-    child.stdio[3].on('data', (d) => {
+    child.stdout.on('data', (d) => {
       for (const line of String(d).split('\n')) {
         const p = line ? parseOutputLine(subKey, line) : null;
         if (p && p.channel === CHANNEL.log) subLogs += `${p.payload}\n`;
@@ -384,7 +428,7 @@ export class S {
       entry: { file: 'strategy.mjs', className: 'S' },
       hooks: { on_market_open: 'onMarketOpen', on_tick: 'onTick' },
       arities: {}, params: {}, mode: 'market', seed: 1, feeBps: 0, fillDelayMs: 0,
-      limits: { perEventBudgetMicros: 400, logLinesPerMarketDay: 100 },
+      limits: { perEventBudgetMicros: 400, logBytesPerRun: 1 << 20, logLineChars: 512 },
     })}\n`);
     child.stdin.write(`${JSON.stringify({ market: MARKET, stream: 'prices', n: EVENTS.length })}\n`);
     for (const e of EVENTS) child.stdin.write(`${JSON.stringify(e)}\n`);

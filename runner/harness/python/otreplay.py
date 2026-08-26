@@ -14,10 +14,44 @@ the conformance vectors compare them row for row. In particular:
 
 from __future__ import annotations
 
+import os
+import select
 import time
 from typing import Any, Callable
 
 from otengine import Book, BudgetMonitor, Portfolio, Rec, RunAbort, make_rng
+
+
+def write_all(fd, data, write=os.write):
+    """Write every byte, or raise.
+
+    A bare `os.write` is a SHORT write waiting to happen, and the loss is
+    silent: it returns how many bytes it took and the caller that ignores the
+    number simply drops the rest. Under gVisor -- which is what runs in
+    production -- a write past the 64KB pipe buffer returns exactly 65536 and
+    the container exits 0, so nothing anywhere reports a problem.
+
+    That is not hypothetical. The result line carries one summary per market,
+    so it passes 64KB at roughly 500 markets; a market-day of polymarket is
+    ~386. Every Python run large enough to matter lost the tail of its result
+    line, the worker never saw a terminating newline, and `collect()` fell back
+    to a default whose markets_run is 0 -- reported to the customer as
+    "no market-days were replayed". Seventeen runs, no report, every one
+    refunded. Node was unaffected only because fs.writeSync loops internally.
+    """
+    view = memoryview(data)
+    while view:
+        try:
+            n = write(fd, view)
+        except BlockingIOError:
+            select.select([], [fd], [])
+            continue
+        if n <= 0:
+            # Not survivable and not silent: a result channel that accepts
+            # nothing means this run has no way to report anything at all.
+            raise OSError("short write to the result channel")
+        view = view[n:]
+
 
 HOOK_FOR = {"tick": "on_tick", "book": "on_book", "trade": "on_trade"}
 
@@ -93,6 +127,26 @@ class BookView:
 _INTERNALS: dict[int, dict] = {}
 
 
+# Mirrors LIMITS.logLineChars / LIMITS.logBytesPerRun in
+# api/lib/backtest-contract.mjs. Two engines disagreeing about how much a
+# strategy may log is the same strategy behaving differently in two languages,
+# which is the thing the conformance suite exists to prevent.
+LOG_LINE_CHARS = 512
+LOG_BYTES_PER_RUN = 2 * 1024 * 1024
+
+
+# A settlement recompute is a once-per-market claim, so these are generous.
+# `crosschecks` rides the same result line as everything else: unbounded, it is
+# an output channel with no budget. Mirrors replay.mjs.
+MAX_CROSSCHECKS_PER_MARKET = 16
+CROSSCHECK_CLAIMED_CHARS = 32
+
+
+def make_log_budget(bytes_: int = LOG_BYTES_PER_RUN, line_chars: int = LOG_LINE_CHARS) -> dict:
+    """A log allowance for one run, shared by every market in it."""
+    return {"bytes": bytes_, "line_chars": line_chars, "spent": 0}
+
+
 class Ctx:
     """The strategy's whole world.
 
@@ -102,9 +156,15 @@ class Ctx:
 
     __slots__ = ("p", "market_id", "__weakref__")
 
-    def __init__(self, params, portfolio, market_id, log_limit, references,
+    def __init__(self, params, portfolio, market_id, log_budget, references,
                  series, rng):
-        object.__setattr__(self, "p", params)
+        # Rec, not the bare dict the job JSON carries: the SDK documents
+        # `ctx.p.entry_z` and every Python example in the docs is written
+        # that way, so a plain dict makes all of them fail on the first
+        # hook with "'dict' object has no attribute ...", while the
+        # identical JavaScript runs. Same parity break Rec exists to stop;
+        # `p` was simply missed. Subscript access keeps working.
+        object.__setattr__(self, "p", Rec(params or {}))
         object.__setattr__(self, "market_id", market_id)
         _INTERNALS[id(self)] = {
             "now": 0,
@@ -112,7 +172,7 @@ class Ctx:
             "book": None,
             "history": [],
             "logs": [],
-            "log_limit": log_limit,
+            "log_budget": log_budget,
             "refs": references or {},
             "series": series or {},
             "rng": rng,
@@ -164,11 +224,23 @@ class Ctx:
         return s["pf"].position(self.market_id, s["book"])
 
     def log(self, msg: Any) -> None:
+        # Bytes for the WHOLE RUN, not lines per market -- the mirror of
+        # ctx.log in engine/replay.mjs. The old shape gave every market its own
+        # allowance of 10,000 unbounded lines, and polymarket has ~386 markets
+        # a day, so a run could pour the archive it had just paid for into a
+        # file the customer downloads.
         s = _INTERNALS[id(self)]
-        if len(s["logs"]) >= s["log_limit"]:
+        budget = s["log_budget"]
+        if budget["spent"] >= budget["bytes"]:
             s["log_truncated"] = True
             return
-        s["logs"].append(f'{s["now"]} {msg}')
+        line = f'{s["now"]} {msg}'[: budget["line_chars"]]
+        # BYTES, not characters -- logs.txt is UTF-8. The JS side counts the
+        # same way; a run logging Chinese would otherwise spend a third of what
+        # it actually writes. The line cap stays in characters (readability);
+        # the run cap is about how much data leaves with the customer.
+        budget["spent"] += len(line.encode("utf-8")) + 1
+        s["logs"].append(line)
 
     def random(self, seed: int | None = None):
         return _INTERNALS[id(self)]["rng"](seed)
@@ -232,9 +304,18 @@ class Ctx:
         """
         s = _INTERNALS[id(self)]
         official = (s["market"] or {}).get("outcome")
+        # BOUNDED, for the same reason ctx.log is, and mirrored in replay.mjs.
+        # `outcome` is whatever the strategy passed and this can be called on
+        # every event; the whole list is serialised onto the result line, sent
+        # and parsed before anything downstream can ignore it. The panel only
+        # shows an aggregate, and a settlement recompute is a once-per-market
+        # claim, so a cap costs nothing real.
+        if len(s["crosschecks"]) >= MAX_CROSSCHECKS_PER_MARKET:
+            return
+        claimed = outcome if isinstance(outcome, str) else str(outcome)
         s["crosschecks"].append({
             "market_id": self.market_id,
-            "claimed": outcome,
+            "claimed": claimed[:CROSSCHECK_CLAIMED_CHARS],
             "official": official,
             "match": official == outcome,
         })
@@ -242,7 +323,7 @@ class Ctx:
 
 def replay_market(*, market: dict, events: list, strategy, hooks: dict,
                   portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
-                  log_limit: int = 10_000, budget: BudgetMonitor | None = None,
+                  log_budget: dict | None = None, budget: BudgetMonitor | None = None,
                   references=None, series=None, seed: int = 1,
                   fee_bps: float = 0) -> dict:
     market_id = market["market_id"]
@@ -257,7 +338,8 @@ def replay_market(*, market: dict, events: list, strategy, hooks: dict,
     pf = portfolio if portfolio is not None else Portfolio(fee_bps=fee_bps)
     book = Book(market_id)
     monitor = budget if budget is not None else BudgetMonitor()
-    ctx = Ctx(getattr(strategy, "p", {}) or {}, pf, market_id, log_limit,
+    ctx = Ctx(getattr(strategy, "p", {}) or {}, pf, market_id,
+              log_budget if log_budget is not None else make_log_budget(),
               references, series, make_rng(seed))
     state = _INTERNALS[id(ctx)]
     state["book"] = book

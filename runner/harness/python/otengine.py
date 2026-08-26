@@ -21,6 +21,7 @@ is the only rounding this module uses.
 from __future__ import annotations
 
 import math
+
 from typing import Any, Callable, Iterable
 
 SIDES = ("UP", "DOWN")
@@ -229,7 +230,13 @@ def match_order(book: Book, order: dict) -> dict:
     ladder = book.ladders[side]["bids" if reducing else "asks"]
     quoted = ladder.best()
     fills, remaining, notional = ladder.take(size, order.get("limit"))
-    filled = size - remaining
+    # SUMMED FROM WHAT WAS TAKEN, not derived as `size - remaining`. Mirrors
+    # book.mjs: `remaining` is the requested size with each level subtracted
+    # from it, and at float precision 1e308 - 1000 is still 1e308 -- so a huge
+    # but finite order consumed the whole ladder while reporting filled 0. No
+    # position, no cash, no trade row, and an empty book for everything after
+    # it. Adding up the levels taken cannot drift from what was removed.
+    filled = sum(f["size"] for f in fills)
     return {
         "fills": fills,
         "filled": filled,
@@ -326,18 +333,74 @@ class Portfolio:
             return None
 
         leg = self._legs(market_id)[order["side"]]
-        size = float(order.get("size") or 0)
-        if not size > 0:
+
+        # ONE PLACE THAT DECIDES WHETHER AN ORDER IS USABLE.
+        # Mirrors portfolio.mjs line for line -- see the reasoning there. Every
+        # unusable order is COUNTED AND RETURNS None, never raised: ValueError
+        # or OverflowError here would turn "reject one order" into "fail the
+        # whole run", which is the same input producing two different outcomes
+        # in two engines that are supposed to be one engine.
+        def _finite(v):
+            # A NUMBER, not something float() is willing to turn into one.
+            # Mirrors portfolio.mjs: coercion is not validation, and the two
+            # languages coerce differently -- float("10") and Number("10") both
+            # give 10, but float([10]) raises where Number([10]) gives 10. One
+            # strategy, one input, two outcomes.
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return None
+            f = float(v)
+            return f if math.isfinite(f) else None
+
+        has_size = order.get("size") is not None
+        has_notional = order.get("notional") is not None
+        if has_size == has_notional:
             self.rejected += 1
             return None
 
+        limit = None
+        if order.get("limit") is not None:
+            limit = _finite(order.get("limit"))
+            if limit is None or limit < 0 or limit > 1:
+                self.rejected += 1
+                return None
+
+        if has_notional:
+            budget = _finite(order.get("notional"))
+            if budget is None or budget <= 0 or limit is None or limit <= 0:
+                self.rejected += 1
+                return None
+            # The QUOTIENT can overflow from two finite inputs: 1e308 / 0.01 is
+            # inf, and math.floor(inf) raises. Checked before the floor.
+            #
+            # floor(a / b), NOT a // b: Python's float floor-division is not
+            # the same function -- 80 // 0.64 is 124 where Math.floor(80 / 0.64)
+            # is 125, and 1 // 0.1 is 9.
+            q = budget / limit
+            if not math.isfinite(q):
+                self.rejected += 1
+                return None
+            size = float(math.floor(q))
+        else:
+            size = _finite(order.get("size"))
+        if size is None or not size > 0:
+            self.rejected += 1
+            return None
         if order.get("reduce_only"):
             size = min(size, leg.size)
             if not size > EPS:
                 self.rejected += 1
                 return None
 
-        res = match_order(book, {**order, "size": size})
+        # One effective order from here on -- AFTER the reduce_only clamp, so
+        # the row reports what was actually requested of the book rather than
+        # what the strategy asked for before clamping. The derived size has to
+        # reach the fill row as well as the match: it did not, and a
+        # notional-only order produced a row whose `requested` was NaN, which
+        # the parser dropped. The fill happened; only its record vanished.
+        # Mirrors portfolio.mjs.
+        order = {**order, "size": size, "limit": limit}
+
+        res = match_order(book, order)
         if res["filled"] <= 0:
             self.fills.append(self._fill_row(ts, market_id, order, res, tag, 0.0, 0.0))
             return res
@@ -470,15 +533,46 @@ class RunAbort(Exception):
 
 
 class BudgetMonitor:
-    def __init__(self, limit_micros: float = 400, sample_floor: int = 200,
-                 tolerance: float = 0.01) -> None:
+    """Per-event budget. The mirror of BudgetMonitor in engine/replay.mjs.
+
+    SUSTAINED cost, which is what the limit is for and what customers are told
+    it means. The mean, not the tail.
+
+    This judged the breach rate against a 1% tolerance, and it was measuring the
+    wrong machine: the budget brackets each hook with two wall-clock reads, on a
+    2-core box where the worker decompresses and feeds stdin the whole time, so
+    an event that gets descheduled is recorded as an event the strategy spent
+    4ms in. Measured inside the real image, the same strategy averages 7.8us on
+    an idle host and 20.9us under contention, with worst cases of 766us and
+    4090us. Nothing about the strategy changed.
+
+    The page's own sample was rejected in production at avg 72us, a fifth of its
+    400us budget, because 1.1% of its events had been interrupted -- and those
+    breaches were scattered (events 171, 2368, 3201), not front-loaded, so no
+    warm-up floor could have fixed it.
+
+    The mean predicts the thing this protects: the 20-minute wall clock is mean
+    times event count. A hook that never returns is caught by the run deadline,
+    which is where that belongs.
+
+    Windowed, not lifetime: one monitor covers the whole run, so a lifetime mean
+    lets a cheap prefix pay for an expensive phase.
+    """
+
+    def __init__(self, limit_micros: float = 400, sample_floor: int = 2000) -> None:
         self.limit_micros = limit_micros
         self.sample_floor = sample_floor
-        self.tolerance = tolerance
         self.count = 0
         self.breaches = 0
         self.max_micros = 0.0
         self.total_micros = 0.0
+        # The most recent sample_floor events, as a ring. One monitor covers the
+        # whole run, so a lifetime mean is diluted by everything that came
+        # before: 18,000 events at 8us then 2,000 at 2,000us averages 207us and
+        # passes, while the last two thousand are continuously 5x over budget.
+        self._window = [0.0] * sample_floor
+        self._window_sum = 0.0
+        self._window_at = 0
 
     def record(self, micros: float) -> None:
         self.count += 1
@@ -487,11 +581,20 @@ class BudgetMonitor:
             self.max_micros = micros
         if micros > self.limit_micros:
             self.breaches += 1
+        self._window_sum += micros - self._window[self._window_at]
+        self._window[self._window_at] = micros
+        self._window_at = (self._window_at + 1) % len(self._window)
+
+    @property
+    def window_micros(self) -> float:
+        """Mean of the most recent sample_floor events. Zero until it fills."""
+        if self.count < self.sample_floor:
+            return 0.0
+        return self._window_sum / len(self._window)
 
     @property
     def breached(self) -> bool:
-        return (self.count >= self.sample_floor
-                and self.breaches / self.count > self.tolerance)
+        return self.count >= self.sample_floor and self.window_micros > self.limit_micros
 
     def summary(self) -> dict:
         return {
@@ -499,6 +602,10 @@ class BudgetMonitor:
             "breaches": self.breaches,
             "breach_rate": (self.breaches / self.count) if self.count else 0,
             "avg_micros": (self.total_micros / self.count) if self.count else 0,
+            # The number the verdict is made on. Without it a rejection shows a
+            # lifetime average inside budget and reads as a lie.
+            "window_micros": self.window_micros,
+            "window_events": self.sample_floor,
             "max_micros": self.max_micros,
             "limit_micros": self.limit_micros,
         }

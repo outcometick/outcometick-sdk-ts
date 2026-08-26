@@ -20,7 +20,11 @@ import { fileURLToPath } from 'node:url';
 
 import { LANGUAGES, HOOK_NAMES, LIMITS } from '../../api/lib/backtest-contract.mjs';
 import { CHANNEL, EXIT, parseTrade, parseFill, parseResult, parseOutputLine } from '../../runner/harness/protocol.mjs';
-import { buildReport, metrics, LATENCY_STEPS } from '../../runner/engine/report.mjs';
+import {
+  countMarketDays, countStreams, buildCoverage, mergeReferenceRows, makeBookThrottle,
+} from '../../runner/events.mjs';
+import { loadSeries } from '../../runner/series-data.mjs';
+import { buildReport } from '../../runner/engine/report.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
 import { loadLocalDay, localDays, looksLikeArchive } from '../local-data.mjs';
 import { readSubmission, validate } from '../ot.mjs';
@@ -29,36 +33,65 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(HERE, '..', '..', 'runner');
 
 /** Run one pass of the local harness over the given markets. */
-function runHarness({ languageId, jobDir, job, markets, outputKey }) {
+function runHarness({
+  languageId, jobDir, job, markets, outputKey,
+  // The submitter's own CSV, already parsed. Threaded in rather than read here
+  // so it is parsed once for the whole run, exactly as the worker does.
+  seriesRows = {}, seriesLags = {}, seriesNames = [],
+}) {
   const cmd = languageId === 'python' ? (process.env.OT_PYTHON || 'python3') : process.execPath;
   const argv = languageId === 'python'
     ? [path.join(RUNNER, 'harness/python/harness.py'), jobDir]
     : [path.join(RUNNER, 'harness/node/harness.mjs'), jobDir];
 
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, argv, { stdio: ['pipe', 'inherit', 'pipe', 'pipe'] });
+    // stdout is the result channel (see runner/harness/protocol.mjs), so it
+    // cannot be inherited: a strategy's own output would land mid-line. The
+    // harness discards that output for the same reason a container does.
+    const child = spawn(cmd, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     const lines = [];
+    let forged = 0;
     let tail = '';
     let stderr = '';
     child.stderr.on('data', (d) => { stderr += d; });
-    child.stdio[3].on('data', (d) => {
+    child.stdout.on('data', (d) => {
       tail += d;
       const parts = tail.split('\n');
       tail = parts.pop();
       for (const line of parts) {
         if (!line) continue;
         const parsed = parseOutputLine(outputKey, line);
+        // Counted, not shrugged off. The queued worker counts the same bytes as
+        // forged, and a stray write between two real lines corrupts the one
+        // after it — so a local replay that quietly drops them can hand back a
+        // report the queued run would never have produced. Silence here is the
+        // exact shape of the divergence this CLI exists to rule out.
         if (parsed) lines.push(parsed);
+        else forged += 1;
       }
     });
     child.on('error', reject);
-    child.on('close', (code) => resolve({ code, stderr, lines }));
+    child.on('close', (code) => resolve({ code, stderr, lines, forged }));
 
     child.stdin.on('error', () => {});
     child.stdin.write(`${JSON.stringify({ ...job, outputKey })}\n`);
     for (const m of markets) {
-      child.stdin.write(`${JSON.stringify({ market: m.market, stream: m.stream, n: m.events.length })}\n`);
-      for (const ev of m.events) child.stdin.write(`${JSON.stringify(ev)}\n`);
+      // Series rows are INTERLEAVED into the same stream in event time, exactly
+      // as the worker sends them — and `lags` travels with them, or a signal
+      // that declared a publication delay would be visible the instant its row
+      // was stamped rather than when it could have existed.
+      const lines = m.events.map((ev) => JSON.stringify(ev));
+      const merged = seriesNames.length
+        ? mergeReferenceRows(lines, seriesRows, m.market, 'ext', seriesLags)
+        : lines;
+      child.stdin.write(`${JSON.stringify({
+        market: m.market,
+        stream: m.stream,
+        n: merged.length,
+        ...(seriesNames.length ? { series: seriesNames } : {}),
+        ...(Object.keys(seriesLags).length ? { lags: seriesLags } : {}),
+      })}\n`);
+      for (const line of merged) child.stdin.write(`${line}\n`);
     }
     child.stdin.end();
   });
@@ -68,20 +101,26 @@ function demux(lines) {
   const trades = [];
   const fills = [];
   const logs = [];
+  // Counted, not swallowed. The queue publishes `dropped_rows`, and a local run
+  // that discarded the same rows in silence reported a clean report over the
+  // identical archive — the number exists precisely so a customer can tell that
+  // something did not parse.
+  let malformed = 0;
   let result = parseResult({});
   for (const { channel, payload } of lines) {
     if (channel === CHANNEL.log) { logs.push(payload); continue; }
+    if (channel === CHANNEL.progress) continue;
     if (channel === CHANNEL.result) {
-      try { result = parseResult(JSON.parse(payload)); } catch { /* keep the empty one */ }
+      try { result = parseResult(JSON.parse(payload)); } catch { malformed += 1; }
       continue;
     }
     let raw;
-    try { raw = JSON.parse(payload); } catch { continue; }
+    try { raw = JSON.parse(payload); } catch { malformed += 1; continue; }
     const row = channel === CHANNEL.trade ? parseTrade(raw) : parseFill(raw);
-    if (!row) continue;
+    if (!row) { malformed += 1; continue; }
     (channel === CHANNEL.trade ? trades : fills).push(row);
   }
-  return { trades, fills, logs: logs.join('\n'), result };
+  return { trades, fills, logs: logs.join('\n'), result, malformed };
 }
 
 export async function cmdRun({ dir, flags }) {
@@ -107,23 +146,107 @@ export async function cmdRun({ dir, flags }) {
     throw new Error(`${unknown.join(', ')} not in ${path.resolve(dataRoot)} — it holds ${available[0]}..${available[available.length - 1]}`);
   }
 
+  // REFERENCE FEEDS ARE REFUSED. SERIES ARE NOT.
+  //
+  // The distinction is where the data lives, and it took a review to get right:
+  // a reference feed is the Binance archive, which sits on the worker's own disk
+  // and was deliberately never put in R2 — no local run can reach it. A series
+  // is the submitter's own CSV, and it is right here in the directory being run.
+  //
+  // Refusing both was the safe-looking answer and the wrong one: it would have
+  // forced every strategy using `ctx.ext()` to spend credits in the queue to
+  // discover a runtime mistake it could have found locally in a second. What
+  // must not happen is running with an EMPTY feed, which produces a report that
+  // looks comparable to the queued one and is not.
+  const refs = (manifest.reference ?? []).map((r) => (typeof r === 'string' ? r : r.name));
+  if (refs.length) {
+    throw new Error(
+      `this manifest declares reference feeds a local replay cannot supply:\n    ${refs.join('\n    ')}\n`
+      + '  They come from an archive held on the worker, so `ot run` would hand\n'
+      + '  your strategy empty feeds and a report that does not match the queued\n'
+      + '  one. Submit it instead:\n'
+      + '    ot submit .  --assets btc --range "30 days"',
+    );
+  }
+
+  // The submitter's own CSV, parsed by the SAME reader the queue uses, so a
+  // header it would reject there is rejected here too.
+  const seriesRows = manifest.series?.length
+    ? loadSeries(manifest.series, checked.files)
+    : { rowsByName: {}, problems: [] };
+  const fatalSeries = (seriesRows.problems ?? []).filter((x) => x.fatal !== false);
+  if (fatalSeries.length) {
+    throw new Error(`series could not be read:\n    ${
+      fatalSeries.map((x) => `${x.name} (${x.file}): ${x.problem}`).join('\n    ')}`);
+  }
+  const seriesLags = Object.fromEntries(
+    (manifest.series ?? []).filter((x) => x.lag_ms > 0).map((x) => [x.name, x.lag_ms]),
+  );
+  const seriesNames = Object.keys(seriesRows.rowsByName ?? {});
+
   const venue = flags.venue ?? 'polymarket';
   const assets = (flags.assets ?? '').split(',').map((a) => a.trim().toUpperCase()).filter(Boolean);
 
   const markets = [];
+  // Gaps are part of the answer, not noise to drop.
+  //
+  // A queued run's coverage names every market it could not use; a local run
+  // reading the same archive said nothing, so the two disagreed about what had
+  // been covered while agreeing about everything else. That is the harder
+  // discrepancy to notice, because the report looks complete.
+  const missing = [];
   for (const day of days) {
     const loaded = await loadLocalDay({
       root: dataRoot, day, venue,
       assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
       datasets: manifest.datasets,
+      intervals: manifest.intervals,
+      // The SAME cadence the queue would replay this range at — built from the
+      // whole range, not this day, so an asset's density never changes partway
+      // through a run. Per asset, not run-wide: see makeBookThrottle.
+      throttle: makeBookThrottle({
+        venue,
+        assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
+        from: days[0],
+        to: days[days.length - 1],
+      }),
     });
     if (loaded.markets.length === 0) {
       process.stderr.write(`  ${day}: ${loaded.reason}\n`);
+      missing.push({
+        day,
+        reason: loaded.reason ?? 'no markets',
+        ...(loaded.unusable?.length
+          ? {
+            partial: false,
+            markets: loaded.unusable.length,
+            dropped: loaded.unusable.slice(0, 10),
+            reasons: [...new Set(loaded.unusable.map((u) => u.why))],
+          }
+          : {}),
+      });
       continue;
+    }
+    if (loaded.unusable?.length) {
+      const why = `${loaded.unusable.length} market(s) dropped: ${loaded.unusable[0].why}`;
+      process.stderr.write(`  ${day}: ${why}\n`);
+      missing.push({
+        day, partial: true, markets: loaded.unusable.length, reason: why,
+        // Same bound the queue applies — see MAX_DROPPED_LISTED there.
+        dropped: loaded.unusable.slice(0, 10),
+        ...(loaded.unusable.length > 10
+          ? { dropped_truncated: loaded.unusable.length - 10 } : {}),
+        reasons: [...new Set(loaded.unusable.map((u) => u.why))],
+      });
     }
     markets.push(...loaded.markets);
   }
   if (markets.length === 0) throw new Error('no market-days could be read from that archive');
+  // ONE ASSET ON ONE UTC DAY — the unit the queue bills in. `markets` is one
+  // entry per market, and a day of BTC 15-minute markets is ninety-six of them,
+  // so counting entries reported a run as being a hundred times bigger than the
+  // customer is charged for and disagreed with the queue's own coverage.
+  const marketDaysScanned = countMarketDays(markets);
 
   const jobDir = await mkdtemp(path.join(tmpdir(), 'ot-run-'));
   try {
@@ -158,30 +281,53 @@ export async function cmdRun({ dir, flags }) {
     }
 
     if (!flags.json) {
-      process.stdout.write(`\n  ${markets.length} market-days · ${manifest.language} · local replay\n`);
+      process.stdout.write(`\n  ${marketDaysScanned} market-days · ${manifest.language} · local replay\n`);
     }
 
     const passes = [];
-    for (const step of LATENCY_STEPS) {
+    // ONE pass, at whatever delay the manifest asked for — the same shape the
+    // queue runs (runner/worker.mjs). These two have drifted eight times and
+    // every one was "we shared the decoder and nothing else".
+    const delayMs = manifest.latency ?? 0;
+    const steps = [{ label: delayMs ? `+${delayMs} ms` : '0 ms', ms: delayMs }];
+    for (const step of steps) {
       const outputKey = randomBytes(32).toString('hex');
       const res = await runHarness({
         languageId, jobDir, outputKey, markets,
         job: { ...baseJob, fillDelayMs: step.ms },
+        seriesRows: seriesRows.rowsByName ?? {}, seriesLags, seriesNames,
       });
       const out = demux(res.lines);
-      if (step.ms === 0) {
-        if (res.code === EXIT.rejected || res.code === EXIT.budget) {
-          const r = out.result.rejection ?? { code: 'E_RUNTIME', detail: res.stderr.slice(0, 2000) };
-          const err = new Error(r.detail);
-          err.code = r.code;
-          err.detail = r.detail;
-          throw err;
-        }
-        if (res.code !== EXIT.ok) throw new Error(res.stderr.slice(0, 2000) || `harness exited ${res.code}`);
+      if (res.forged > 0) {
+        // Almost always a dependency writing to stdout: the harness takes
+        // console away from the strategy before loading it, but a library that
+        // reaches the descriptor another way still lands on the channel.
+        const err = new Error(
+          `${res.forged} line(s) on the result channel did not authenticate.`
+          + ' Something in this strategy or its dependencies writes to stdout;'
+          + ' a queued run would count the same bytes as forged and could lose'
+          + ' results. Use ctx.log() for output.',
+        );
+        err.code = 'E_RUNTIME';
+        err.detail = err.message;
+        throw err;
       }
+      // UNCONDITIONAL. This used to be wrapped in `if (step.ms === 0)`, from
+      // when pass 0 was the report and the rest were a comparison curve whose
+      // failures were survivable. There is one pass now, and its delay is
+      // whatever the manifest asked for — so the guard silently stopped
+      // running the moment anyone wrote `latency: 250`, and a rejected or
+      // over-budget replay became a report: locally successful, marked
+      // `fill_delay_ms: 250`, and refused by the queue.
+      if (res.code === EXIT.rejected || res.code === EXIT.budget) {
+        const r = out.result.rejection ?? { code: 'E_RUNTIME', detail: res.stderr.slice(0, 2000) };
+        const err = new Error(r.detail);
+        err.code = r.code;
+        err.detail = r.detail;
+        throw err;
+      }
+      if (res.code !== EXIT.ok) throw new Error(res.stderr.slice(0, 2000) || `harness exited ${res.code}`);
       passes.push({ delayMs: step.ms, ...out, ok: res.code === EXIT.ok });
-      // A strategy that never traded has no latency curve to draw.
-      if (step.ms === 0 && out.trades.length === 0) break;
     }
 
     const base = passes[0];
@@ -199,36 +345,49 @@ export async function cmdRun({ dir, flags }) {
       runId: `local_${days[0]}`,
       submittedAt: 0,
       manifest,
+      // Local runs have no stored submission to hash, and saying null is
+      // truthful: this report is not tied to a submission at all.
+      sourceSha256: null,
       scope: {
         venue,
         assets: assets.length ? assets : [...new Set(markets.map((m) => m.market.asset).filter(Boolean))],
         from: days[0],
         to: days[days.length - 1],
-        marketDays: markets.length,
+        marketDays: marketDaysScanned,
         archivedDayCount: days.length,
       },
-      scanned: { markets: base.result.marketsRun, market_days: markets.length, events: base.result.eventsSeen },
+      scanned: {
+        markets: base.result.marketsRun,
+        market_days: marketDaysScanned,
+        events: base.result.eventsSeen,
+      },
       trades: base.trades,
       fills: base.fills,
       marketSummaries: [...marketMeta.values()],
       marketMeta,
       feesPaid: base.result.feesPaid,
-      latency: passes.filter((p) => p.ok).map((p) => ({
-        delayMs: p.delayMs, netPnl: metrics(p.trades).net_pnl ?? 0,
-      })),
+      fillDelayMs: delayMs,
       sweep: null,
       crosschecks: base.result.crosschecks,
       seed: Number(flags.seed ?? 1),
-      coverage: {
+      coverage: buildCoverage({
+        marketDaysScanned,
+        // NOT backfilled from `scanned`. Filling it in that way meant the
+        // headline always said "asked for N, scanned N" — so a day that was
+        // entirely unusable was recorded in `missing` and simultaneously denied
+        // at the top of the same file. A local run does not know what was asked
+        // for; null says that, and saying it is the point.
+        marketDaysRequested: null,
+        marketsReportedByRunner: base.result.marketsRun,
+        missing,
+        // Always empty here: a manifest that declares one is refused above,
+        // because a local replay cannot supply it.
+        referenceDeclared: [],
+        streams: countStreams([...marketMeta.values()]),
+        droppedRows: base.malformed ?? 0,
         local: true,
         source: path.resolve(dataRoot),
-        market_days_scanned: markets.length,
-        streams: [...marketMeta.values()].reduce((acc, m) => {
-          const k = m.stream ?? 'unknown';
-          acc[k] = (acc[k] ?? 0) + 1;
-          return acc;
-        }, {}),
-      },
+      }),
       budget: base.result.budget,
     });
 

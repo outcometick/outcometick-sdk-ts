@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   metrics, brier, edgePerContract, equityCurve, maxDrawdown, worstLosingRun,
-  calibration, baselines, slippage, splitByMarket, latencyPanel, sweepPanel,
-  buildReport, LATENCY_STEPS,
+  calibration, baselines, slippage, splitByMarket, sweepPanel,
+  buildReport,
 } from './report.mjs';
 
 const day = (d) => Date.parse(`2026-07-${String(d).padStart(2, '0')}T12:00:00Z`);
@@ -165,7 +165,7 @@ test('calibration compares what was paid with what settled', () => {
   ];
   const rows = calibration(trades);
   assert.equal(rows.length, 1);
-  assert.equal(rows[0].bucket, '0.40 – 0.50');
+  assert.equal(rows[0].bucket, '0.40-0.50');
   assert.equal(rows[0].implied, 0.45);
   assert.equal(rows[0].realized, 0.75);
   assert.equal(rows[0].edge_cents, 30);
@@ -175,7 +175,7 @@ test('calibration compares what was paid with what settled', () => {
 test('empty buckets are omitted, not reported as zero edge', () => {
   const rows = calibration([settled({ px: 0.55, won: true, d: 1 })]);
   assert.equal(rows.length, 1);
-  assert.equal(rows[0].bucket, '0.50 – 0.60');
+  assert.equal(rows[0].bucket, '0.50-0.60');
 });
 
 // ---------------------------------------------------------------------------
@@ -264,17 +264,6 @@ test('the split groups by asset and market period', () => {
   ]);
 });
 
-test('the latency panel is relative to the as-captured run', () => {
-  const rows = latencyPanel([
-    { delayMs: 0, netPnl: 1000 },
-    { delayMs: 250, netPnl: 500 },
-    { delayMs: 2000, netPnl: -100 },
-  ]);
-  assert.equal(rows[0].label, LATENCY_STEPS[0].label);
-  assert.equal(rows[1].ratio, 0.5);
-  assert.equal(rows[2].unprofitable, true);
-  assert.equal(rows[0].unprofitable, false);
-});
 
 test('the sweep grid is laid out by the two swept params', () => {
   const cells = [];
@@ -332,4 +321,37 @@ test('a clean cross-check and a missing one look different', () => {
   const bad = buildReport({ ...base, crosschecks: [{ match: true }, { match: false }] });
   assert.equal(bad.crosscheck.recompute_matches, 1);
   assert.equal(bad.crosscheck.mismatches, 1);
+});
+
+
+
+
+
+// A run replays ONCE, at whatever fill delay the submitter asked for. There is
+// no comparison table any more: five extra replays took five sixths of the
+// wall clock, and the sampled version that replaced them was an extrapolation
+// dressed as a measurement.
+//
+// So the delay has to be IN the report. It changes every number in it — the
+// same strategy over the same days at 0ms and at 250ms produces two different
+// reports that are otherwise indistinguishable, and a reader with the archive
+// in front of them would have no way to tell which one they have.
+test('the report says which fill delay it was measured at', () => {
+  const base = {
+    runId: 'run_abc123',
+    submittedAt: 1,
+    manifest: { schema: 1, language: 'python@3.14', mode: 'market' },
+    scope: { venue: 'polymarket', assets: ['BTC'], from: '2026-07-01', to: '2026-07-01', archivedDayCount: 1 },
+    trades: [settled({ px: 0.5, won: true, d: 1 })],
+    fills: [],
+    marketSummaries: [],
+  };
+  assert.equal(buildReport({ ...base, fillDelayMs: 250 }).fill_delay_ms, 250);
+  // Zero is a REPORTED value, not an absent one: "measured with no delay" and
+  // "we did not record the delay" must not look the same.
+  assert.equal(buildReport({ ...base, fillDelayMs: 0 }).fill_delay_ms, 0);
+  assert.equal(buildReport(base).fill_delay_ms, 0);
+  // And the comparison table is gone rather than empty.
+  assert.equal('latency' in buildReport(base), false,
+    'the report still carries a latency panel that nothing produces');
 });

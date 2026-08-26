@@ -30,9 +30,37 @@ export async function cmdSubmit({ dir, flags }) {
 
   // Locally first. The rejection codes are identical either way, so a customer
   // who fixes what `ot check` said will not be told something different here.
-  await validate(files);
+  const checked = await validate(files);
 
-  const body = { ...scope, files, ...(flags.email ? { email: flags.email } : {}) };
+  // Series go straight to R2, the same way the web editor sends them.
+  //
+  // Not an optimisation for the CLI's sake — it is what makes "a series never
+  // passes through the API box" true rather than true-for-browsers. Inlining a
+  // 4MB CSV cost 69MB resident there for one submission, and leaving one client
+  // doing it would have kept the whole cost while claiming it was gone.
+  const seriesNames = new Set((checked.manifest.series ?? []).map((x) => x.file));
+  const uploads = {};
+  for (const f of files.filter((x) => seriesNames.has(x.name))) {
+    const bytes = Buffer.byteLength(f.content, 'utf8');
+    const sign = await post(api, '/v1/backtest/upload', { bytes }, key);
+    if (sign.status !== 200 || !sign.json?.url) {
+      throw new Error(`could not stage ${f.name}: ${sign.json?.error ?? sign.text}`);
+    }
+    // Exactly the headers the server signed. `if-none-match: *` is among them
+    // and makes the url write-once; omitting any of them is a 403.
+    const put = await fetch(sign.json.url, {
+      method: 'PUT', headers: sign.json.headers, body: f.content,
+    });
+    if (!put.ok) throw new Error(`could not upload ${f.name}: HTTP ${put.status}`);
+    uploads[f.name] = sign.json.key;
+  }
+
+  const body = {
+    ...scope,
+    files: files.filter((x) => !seriesNames.has(x.name)),
+    ...(Object.keys(uploads).length ? { uploads } : {}),
+    ...(flags.email ? { email: flags.email } : {}),
+  };
   const { status, json, text } = await post(api, '/v1/backtest/submit', body, key);
 
   if (status === 202 && json?.run_id) {
