@@ -526,7 +526,34 @@ async function main() {
           + ' ctx.log output was dropped. ctx.log is for reading, not for'
           + ' exporting; see the SDK docs for the limit.\n');
       }
-      for (const line of out.logs) logsOut.write(`${entry.market.market_id} ${line}\n`);
+      // OPENING TIME FIRST, then a short id.
+      //
+      // The prefix used to be the full 64-character condition hash, which
+      // identifies a market to the venue and to nobody reading a log: there is
+      // no way to tell from it which market this was, or when. The opening
+      // time is the thing a person actually navigates by — it is what the
+      // venue puts in the slug — and eight characters of the hash still
+      // separate the several strikes that open at the same instant.
+      //
+      // MUST MATCH THE PYTHON HARNESS. Two log formats from one archive is the
+      // kind of divergence the conformance suite exists to catch.
+      // A market with no opening time keeps the id alone rather than gaining a
+      // leading space — every consumer of this file splits on whitespace, and
+      // a blank first field shifts all of them by one.
+      const shortId = String(entry.market.market_id ?? '').slice(0, 10);
+      // READABLE, because ctx.log already puts the EVENT time on every line as
+      // epoch millis. Two bare 13-digit numbers side by side are two numbers
+      // nobody can tell apart — and the one this prefix exists for is the one
+      // that would be mistaken for the other.
+      //
+      // UTC, to the minute: the market schedule is published in UTC and a
+      // market-day is a UTC day, so a local rendering would file a row under a
+      // different date than the archive does.
+      const openedAt = entry.market.open_ts_ms == null
+        ? null
+        : new Date(entry.market.open_ts_ms).toISOString().slice(0, 16).replace('T', ' ');
+      const prefix = openedAt == null ? shortId : `${openedAt} ${shortId}`;
+      for (const line of out.logs) logsOut.write(`${prefix} ${line}\n`);
       for (const c of out.crosschecks) result.crosschecks.push(c);
 
       // Tracked as the stream went past rather than scanned afterwards: there

@@ -22,6 +22,7 @@ import { LANGUAGES, HOOK_NAMES, LIMITS } from '../../api/lib/backtest-contract.m
 import { CHANNEL, EXIT, parseTrade, parseFill, parseResult, parseOutputLine } from '../../runner/harness/protocol.mjs';
 import {
   countMarketDays, countStreams, buildCoverage, mergeReferenceRows, makeBookThrottle,
+  sortMarketsForReplay,
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
 import { buildReport } from '../../runner/engine/report.mjs';
@@ -242,6 +243,15 @@ export async function cmdRun({ dir, flags }) {
     markets.push(...loaded.markets);
   }
   if (markets.length === 0) throw new Error('no market-days could be read from that archive');
+  // SESSION IS ONE STREAM ACROSS THE RANGE, so it is ordered once over every
+  // day — the same thing fetchMarketDays does for the queue. Ordering it a day
+  // at a time leaves the stream day-major, which is chronological only by
+  // accident and stops being so as soon as two assets are in scope. Session
+  // shares one Portfolio across every market, so this is part of the ANSWER,
+  // not of the log.
+  if ((manifest.mode ?? 'market') === 'session') {
+    sortMarketsForReplay(markets, { mode: 'session' });
+  }
   // ONE ASSET ON ONE UTC DAY — the unit the queue bills in. `markets` is one
   // entry per market, and a day of BTC 15-minute markets is ninety-six of them,
   // so counting entries reported a run as being a hundred times bigger than the

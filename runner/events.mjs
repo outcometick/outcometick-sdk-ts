@@ -619,8 +619,83 @@ export function countStreams(items) {
  * stream, or settled off an outcome we could not read, is invisible and makes
  * the report wrong.
  */
+/**
+ * Put one day's markets in the order they will be replayed.
+ *
+ * ASSET, THEN OPENING TIME, THEN ID — and shared, because `ot run` and the
+ * queue both feed markets to a strategy and a difference here is a difference
+ * in what a reader sees from the same archive.
+ *
+ * The decoder produces market_id order, which is a hash and therefore
+ * unrelated to time. Nothing about a RESULT depends on it — state is reset at
+ * every on_market_open, which is what lets these be sharded — but `ctx.log`
+ * from every market lands in one stream, and a human reads that stream as a
+ * timeline. In hash order its timestamps jump hours in both directions for no
+ * visible reason.
+ *
+ * Asset before time so each market-day stays a CONTIGUOUS block:
+ * `marketDayPrefix` counts a market-day done when its last market is done, and
+ * interleaving two assets pushes both of their last markets to the end of the
+ * run — a progress bar that sits still and then jumps, which is the "looks
+ * stuck" this channel exists to remove.
+ *
+ * The id breaks ties because many strikes open at the same instant, and an
+ * unstable order would make two runs of the same strategy over the same days
+ * emit their logs differently.
+ */
+export function sortMarketsForReplay(markets, { mode = 'market' } = {}) {
+  const byId = (a, b) => {
+    const ai = String(a.market?.market_id ?? '');
+    const bi = String(b.market?.market_id ?? '');
+    return ai < bi ? -1 : (ai > bi ? 1 : 0);
+  };
+  const byTime = (a, b) => (a.market?.open_ts_ms ?? 0) - (b.market?.open_ts_ms ?? 0);
+
+  // SESSION MODE IS ONE STREAM, so it is ordered by time and by nothing else.
+  //
+  // Session shares one instance and one Portfolio across every market in the
+  // range — the docs call it "one ordered stream across the range" — which
+  // makes the feed order part of the RESULT, not just of the log. Its equity
+  // curve, its position and its P&L accumulate in whatever order markets
+  // arrive. Feeding it asset-major would build that curve by walking all of
+  // BTC and then going back in time to walk all of ETH: not a sequence that
+  // ever happened, and not a number anyone can act on.
+  //
+  // Before this function existed, session got market_id order — a hash. The
+  // "ordered stream" in the docs was ordered by nothing at all.
+  if (mode === 'session') return markets.sort((a, b) => byTime(a, b) || byId(a, b));
+
+  // Market mode: each market is independent (state resets at every
+  // on_market_open), so the order changes no result — only what a human reads.
+  // Asset-major keeps each market-day a CONTIGUOUS block, which is what
+  // marketDayPrefix needs: it counts a market-day done when its LAST market is
+  // done, and interleaving assets pushes every asset's last market to the end
+  // of the run — a progress bar that sits still and then jumps.
+  return markets.sort((a, b) => {
+    const aa = a.market?.asset ?? '';
+    const ba = b.market?.asset ?? '';
+    if (aa !== ba) return aa < ba ? -1 : 1;
+    return byTime(a, b) || byId(a, b);
+  });
+}
+
 export function marketUnusable(market, inWindow) {
   if (!market) return 'no market metadata';
+  // WHICH ASSET IS THIS? Every layer above needs the answer and none of them
+  // can work it out later: the billing key is `asset|day|interval`, the book
+  // cadence is chosen per asset, and — since the decoded day became per-asset —
+  // a market with no asset belongs to no cache entry in particular. Predict
+  // publishes ONE venue-wide markets file, and the per-asset row filter is
+  // `if (m.asset && …)`, so a row missing its category lands in every asset's
+  // read at once, each carrying a different slice of its events under the same
+  // name. Keeping any one of those replays a market with half its data and
+  // nothing to say so.
+  //
+  // Decided HERE because this is the one function both the queue and `ot run`
+  // ask. The first version of this rule lived in the queue's merge step, which
+  // meant the local runner kept the market, and a single-asset run — which has
+  // nothing to merge — replayed it out of the cache anyway.
+  if (!market.asset) return 'market has no asset';
   if (market.stream == null) return 'settlement stream could not be resolved';
   if (market.outcome !== 'UP' && market.outcome !== 'DOWN') {
     return 'outcome could not be read';

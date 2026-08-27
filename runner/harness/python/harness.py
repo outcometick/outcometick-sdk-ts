@@ -18,6 +18,7 @@ import hmac
 import importlib.util
 import json
 import os
+import datetime as _datetime
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -447,7 +448,19 @@ def main() -> int:
                  " run's ctx.log output was dropped. ctx.log is for reading,"
                  " not for exporting; see the SDK docs for the limit.")
         for line in out["logs"]:
-            logs_fh.write(f'{entry["market"]["market_id"]} {line}\n')
+            # 开盘时间在前，短 id 在后 —— 见 node harness 里的同一处注释。
+            # 两个 harness 的日志格式必须一致。
+            _open = entry["market"].get("open_ts_ms")
+            _sid = str(entry["market"].get("market_id") or "")[:10]
+            # 格式化成可读的 UTC —— ctx.log 已经在每行放了事件时间（毫秒数），
+            # 两个 13 位裸数字挨在一起没人分得清。见 node harness 的注释。
+            # 没有开盘时间时只留 id，不要留一个前导空格。
+            if _open is None:
+                _prefix = _sid
+            else:
+                _dt = _datetime.datetime.fromtimestamp(_open / 1000, _datetime.timezone.utc)
+                _prefix = f"{_dt.strftime('%Y-%m-%d %H:%M')} {_sid}"
+            logs_fh.write(f'{_prefix} {line}\n')
         result["crosschecks"].extend(out["crosschecks"])
 
         # Tracked as the stream went past; there is no array left to scan.

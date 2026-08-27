@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.6.1';
+export const SDK_VERSION = '1.6.2';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -60,7 +60,7 @@ export const SDK_VERSION = '1.6.1';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.11.0';
+export const SANDBOX_IMAGE_TAG = '1.14.0';
 
 // ---------------------------------------------------------------------------
 // Languages
@@ -469,7 +469,17 @@ export const LIMITS = Object.freeze({
   // strategy being slow, and charging their execution budget for our network
   // is backwards — a 30-day run spent all twenty minutes fetching and was
   // killed without replaying an event.
-  wallClockMs: 20 * 60 * 1000,
+  //
+  // SIZED PER RUN, not a constant — see wallClockMsFor below. A flat twenty
+  // minutes was a limit on the SMALLEST run that could not finish: replay costs
+  // ~24s per market-day (measured, warm cache, 289 markets and ~1.04M events in
+  // a polymarket BTC day), so twenty minutes covers about fifty of them while
+  // the page was selling a ninety-day chip. The customer paid, watched it work
+  // for twenty minutes, and got a refund and no report.
+  //
+  // These two are the inputs to that function and the only numbers to tune.
+  replayBaseMs: 3 * 60 * 1000,
+  replayPerMarketDayMs: 35 * 1000,
   // The FETCH budget, separate and bounded. Not unbounded, because there is one
   // worker and one slot: a stalled R2 read used to sit inside the fetch while
   // the heartbeat kept renewing the lease, so nobody could reclaim the run and
@@ -490,6 +500,59 @@ export const LIMITS = Object.freeze({
   maxSweepCells: 256,
   archiveRetentionDays: 7,
 });
+
+/**
+ * The longest range one run may cover, in CALENDAR DAYS.
+ *
+ * The product limit. Checked against the days that actually exist in the
+ * archive — the range AFTER it is intersected — not against what was asked
+ * for: requesting more days than exist has always been fine and is billed for
+ * what was there, and moving the check earlier would hard-fail a page whose
+ * capacity figure is a few minutes stale.
+ *
+ * Enforced in the API and mirrored in the editor, so nobody can build a
+ * submission the queue will refuse.
+ *
+ * Raising it is a hardware decision, not a config one: there is one worker
+ * slot and a run holds it for its whole life.
+ */
+export const MAX_BACKTEST_DAYS = 90;
+
+/**
+ * The clamp on the REPLAY BUDGET's input — not a limit on what may be run.
+ *
+ * The budget below grows with market-days because that is what the machine
+ * spends time on, and market-days are days × assets × intervals: ninety days
+ * of one asset is 90, ninety days of seven assets over two intervals is 1,260.
+ * Without a clamp the second would be handed an eight-hour budget and would
+ * hold the only worker slot for a working day.
+ *
+ * So a run larger than this still RUNS — it simply is not given proportionally
+ * more time, and if it cannot finish it is refunded in full like any other
+ * overrun. That is the honest failure: bounded queue damage, money back.
+ */
+export const BUDGET_CLAMP_MARKET_DAYS = 180;
+
+/**
+ * How long a run's REPLAY may take, given its size.
+ *
+ * Derived rather than declared so the limit and the thing it limits cannot
+ * drift: `MAX_BACKTEST_DAYS` decides how long a range can be, this decides how long
+ * that size is allowed to take, and both come from the two constants in LIMITS.
+ *
+ * Sized on the WARM path (~24s/market-day measured) plus margin, because the
+ * fetch has its own budget — `fetchClockMs` — and a slow archive read is our
+ * pipe being slow, not the strategy. A run whose days are cold spends that
+ * time under the fetch clock and arrives here with the same work to do.
+ */
+export function wallClockMsFor(marketDays) {
+  const n = Number.isFinite(marketDays) && marketDays > 0 ? Math.ceil(marketDays) : 1;
+  return LIMITS.replayBaseMs
+    + LIMITS.replayPerMarketDayMs * Math.min(n, BUDGET_CLAMP_MARKET_DAYS);
+}
+
+/** The ceiling that follows from the numbers above. For copy and for docs. */
+export const MAX_WALL_CLOCK_MS = wallClockMsFor(BUDGET_CLAMP_MARKET_DAYS);
 
 // ---------------------------------------------------------------------------
 // Rejection codes
@@ -563,6 +626,12 @@ export function contractDocument() {
     referenceSymbols: [...REFERENCE_SYMBOLS],
     modes: MODES,
     limits: LIMITS,
+    // THE CEILINGS A CLIENT HAS TO KNOW BEFORE IT BUILDS A REQUEST. They are
+    // not in LIMITS because LIMITS describes the sandbox — what one strategy
+    // gets — and these describe what one RUN may ask for. A client that cannot
+    // read them discovers them as a 422 on the paid path.
+    maxBacktestDays: MAX_BACKTEST_DAYS,
+    maxMarketDays: BUDGET_CLAMP_MARKET_DAYS,
     rejectionCodes: REJECTION_CODES,
   };
 }

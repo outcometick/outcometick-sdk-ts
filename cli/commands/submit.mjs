@@ -79,7 +79,16 @@ export async function cmdSubmit({ dir, flags }) {
     }
     process.stdout.write(`  cost        ${json.credits_held} cr\n`);
     process.stdout.write(`  source      sha256 ${String(json.source_sha256).slice(0, 16)}…\n\n`);
-    process.stdout.write(`  ot status ${json.run_id}   (or wait for the email)\n\n`);
+    // DO NOT PROMISE THE EMAIL WHEN NONE WAS ASKED FOR. `--email` is what
+    // fills deliver_to, and without it the delivery poller correctly skips the
+    // run — so the old unconditional "(or wait for the email)" told every CLI
+    // submitter to wait for something that was never going to arrive. The flag
+    // was implemented and undocumented, which is the same failure from the
+    // other side: nobody could use the thing this line advertised.
+    process.stdout.write(flags.email
+      ? `  ot status ${json.run_id}   (or wait for the email)\n\n`
+      : `  ot status ${json.run_id}\n`
+        + '  (no --email, so nothing will be sent — note that id down)\n\n');
     return 0;
   }
 

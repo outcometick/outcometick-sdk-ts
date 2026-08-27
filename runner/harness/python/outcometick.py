@@ -46,7 +46,11 @@ class Order:
                  tif="ioc", tag=None, notional=None):
         if side not in SIDES:
             raise ValueError(f'side must be "UP" or "DOWN", got {side!r}')
-        # SIZE IN MONEY. Mirrors index.mjs exactly -- see the reasoning there.
+        # SIZING IN MONEY -- this is about the `notional` argument below.
+        # `size` is CONTRACTS (see OrderSizing in index.d.ts); it is not
+        # money, and reading this heading as if it were is the one wrong
+        # turn this comment can cause. Mirrors index.mjs exactly -- see
+        # the reasoning there.
         # Position sizing is nearly always a budget, and the only honest
         # divisor is your own limit: a contract costs whatever it fills at, so
         # dividing by the current best price overspends the moment there is any

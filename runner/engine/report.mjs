@@ -37,6 +37,64 @@ const r4 = (x) => (Number.isFinite(x) ? Number(x.toFixed(4)) : null);
 const collateralOf = (t) => (t.entry_px ?? 0) * (t.size ?? 0);
 
 /**
+ * The most money this strategy had at risk AT ONE TIME.
+ *
+ * THE NUMBER THAT ANSWERS "how much do I need to run this", and the one this
+ * report was missing. Summing every entry answers a different question: the
+ * sample strategy opened 1,676 positions over fifteen days and never held more
+ * than one, so its entries total $72,175 while it never needed more than $80.
+ * Dividing a loss by the sum therefore reported −4.35% for a strategy that had
+ * burned through its stake thirty-nine times over.
+ *
+ * Computed by sweeping the open/close events, so overlapping positions add up
+ * and sequential ones do not. Trades with no timestamps are skipped rather
+ * than assumed concurrent — an unknown that inflates the peak would make the
+ * strategy look safer to fund than it is.
+ */
+function peakCapital(trades) {
+  const events = [];
+  for (const t of trades) {
+    if (t.opened_ms == null || t.closed_ms == null) continue;
+    const amt = collateralOf(t);
+    if (!(amt > 0)) continue;
+    events.push([t.opened_ms, amt]);
+    events.push([t.closed_ms, -amt]);
+  }
+  // Closes before opens at the same instant: a position that ends exactly when
+  // the next begins did not need both stakes at once.
+  events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let cur = 0;
+  let peak = 0;
+  for (const [, delta] of events) {
+    cur += delta;
+    if (cur > peak) peak = cur;
+  }
+  return peak;
+}
+
+/** Share of the run's span with a position open. Money idle is money wasted. */
+function holdingRatio(trades) {
+  const withTimes = trades.filter((t) => t.opened_ms != null && t.closed_ms != null);
+  if (withTimes.length === 0) return null;
+  const first = Math.min(...withTimes.map((t) => t.opened_ms));
+  const last = Math.max(...withTimes.map((t) => t.closed_ms));
+  const span = last - first;
+  if (!(span > 0)) return null;
+  // Union of the intervals, not their sum: two overlapping positions are one
+  // stretch of being in the market, and summing them can exceed the span.
+  const spans = withTimes
+    .map((t) => [t.opened_ms, t.closed_ms])
+    .sort((a, b) => a[0] - b[0]);
+  let held = 0;
+  let [s, e] = spans[0];
+  for (const [a, b] of spans.slice(1)) {
+    if (a > e) { held += e - s; [s, e] = [a, b]; } else if (b > e) e = b;
+  }
+  held += e - s;
+  return held / span;
+}
+
+/**
  * Headline metrics — the twelve cells at the top of the report.
  */
 export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
@@ -52,6 +110,8 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
   const wins = pnls.filter((p) => p > 0);
   const losses = pnls.filter((p) => p < 0);
   const collateral = sum(closed.map(collateralOf));
+  const peak = peakCapital(closed);
+  const hold = holdingRatio(closed);
 
   const equity = equityCurve(closed);
   const dd = maxDrawdown(equity.map((p) => p.equity));
@@ -91,7 +151,20 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
     // is only an entry rate for strategies that enter once — this one is an
     // entry rate for all of them, and equals `trades` in the common case.
     markets_traded: new Set(closed.map((t) => t.market_id)).size,
+    // Net P&L over the SUM of every entry — "for each dollar traded, how much
+    // was made". Renamed on the page to say that, because "return on capital"
+    // reads as an account return and is not one: the same stake recycled a
+    // thousand times makes this number a thousand times smaller than what
+    // happened to the money.
     return_on_collateral: collateral > 0 ? r4(netPnl / collateral) : null,
+    // THE ACCOUNT NUMBER. Net P&L over the most that was ever at risk at once,
+    // which is what someone funding this strategy actually has to put up.
+    peak_capital: r2(peak),
+    return_on_peak: peak > 0 ? r4(netPnl / peak) : null,
+    // How much of the run had a position open. The sample strategy is in the
+    // market 13% of the time, which is the other half of why the two return
+    // figures differ by three orders of magnitude.
+    holding_ratio: hold == null ? null : r4(hold),
     // Cents of edge per contract: what the outcome was worth minus what was
     // paid, averaged. This is the number that says whether there was an edge
     // at all, as opposed to a lucky run of variance.

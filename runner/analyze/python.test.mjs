@@ -271,3 +271,50 @@ test('outcometick is importable as the SDK, never as a package prefix', async ()
     await analyzePythonSubmission(strategy(imp), { deps: [] });
   }
 });
+
+// The docs tell people to split a strategy across files. That instruction is
+// only true in one spelling.
+//
+// `/docs/sdk` used to say nothing at all about multi-file submissions; when the
+// section was written the first draft said "relative imports between them
+// work" and showed `from helpers import cheaper`, which this analyser rejects
+// with E_IMPORT — a bare module name is not on the allowlist and there is no
+// way for the reader to guess that the dot is the difference. These two cases
+// are what that paragraph now promises, so they are pinned here: a doc sentence
+// nothing enforces is a doc sentence that drifts.
+test('a sibling file is importable relatively, and only relatively', async () => {
+  const files = [
+    {
+      name: 'strategy.py',
+      content: `from outcometick import Strategy, Order
+from .helpers import cheaper
+
+
+class Demo(Strategy):
+    def on_tick(self, ctx, tick):
+        return None
+`,
+    },
+    { name: 'helpers.py', content: 'def cheaper(a, b):\n    return a\n' },
+  ];
+  const { imports } = await analyzePythonSubmission(files, { deps: [] });
+  assert.ok(Array.isArray(imports), 'the relative form must be accepted');
+});
+
+test('the same import without the dot is rejected', async () => {
+  const files = [
+    {
+      name: 'strategy.py',
+      content: `from outcometick import Strategy, Order
+from helpers import cheaper
+
+
+class Demo(Strategy):
+    def on_tick(self, ctx, tick):
+        return None
+`,
+    },
+    { name: 'helpers.py', content: 'def cheaper(a, b):\n    return a\n' },
+  ];
+  await rejects('E_IMPORT', files);
+});

@@ -17,7 +17,10 @@ const HARNESS = path.join(path.dirname(fileURLToPath(import.meta.url)), 'harness
 
 const MARKET = {
   market_id: '0xm1', asset: 'BTCUSD', interval: '1h',
-  strike: 65000, outcome: 'UP', close_ts_ms: 10_000,
+  // The opening time was missing from this fixture entirely, so nothing here
+  // exercised the shape a real market has — and the log prefix that navigates
+  // by it went untested.
+  strike: 65000, outcome: 'UP', open_ts_ms: 1_000, close_ts_ms: 10_000,
 };
 
 const book = (ts, upAsk = 0.50, upBid = 0.49) => ({
@@ -234,7 +237,16 @@ test('logs are captured, prefixed by market, and capped by bytes', async () => {
     }`,
   });
   assert.equal(r.code, EXIT.ok, r.stderr);
-  assert.match(r.logs, /^0xm1 /m);
+  // OPENING TIME, then a short id. The full condition hash identifies the
+  // market to the venue and to nobody reading the log — you cannot tell from
+  // it which market this was or when. The time is what a person navigates by.
+  // READABLE UTC, then a short id. Not epoch millis: ctx.log already puts the
+  // event time on every line as a bare 13-digit number, and two of those side
+  // by side are two numbers nobody can tell apart.
+  assert.match(r.logs, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2} 0xm1 /m,
+    'the log prefix is not the market\'s opening time in readable UTC');
+  assert.doesNotMatch(r.logs, /^\d{13} /m,
+    'the prefix is raw epoch millis, indistinguishable from the event time beside it');
   const lines = r.logs.trim().split('\n');
   // 3 ticks x 5 lines = 15 lines of ~12 bytes each = ~180 bytes, cut short by
   // the job's 60-byte budget. The first fixture used 220 and every line fitted
@@ -458,7 +470,10 @@ test('params do not leak between markets', async () => {
   // 9999 legitimately appears within market 1 — the strategy wrote it on its
   // own first tick and reads it back on the next two. What must NOT happen is
   // market 2 starting from it.
-  const firstOfMarket2 = r.logs.split('\n').find((l) => l.startsWith('0xm2 '));
+  // Found by the id ANYWHERE in the prefix, not by position: the prefix now
+  // leads with the market's opening time, and this test is about parameters
+  // not leaking — it should not break when the log gains a field.
+  const firstOfMarket2 = r.logs.split('\n').find((l) => l.includes('0xm2 '));
   assert.match(firstOfMarket2, /size=100$/,
     `market 2 started from a value market 1 wrote: ${firstOfMarket2}`);
 });
@@ -625,4 +640,22 @@ export class S {
   const stolen = Number(/stolen=(\d+)/.exec(r.logs)?.[1]);
   // At most the current row. Before the fix this was all 50.
   assert.ok(stolen <= 1, `a strategy saw ${stolen} ticks before its first hook fired`);
+});
+
+
+test('a market with no opening time keeps the id, without a leading space', async () => {
+  // Every consumer of logs.txt splits on whitespace. A blank first field
+  // shifts all of them by one, which is worse than the missing time itself.
+  const noOpen = { ...MARKET };
+  delete noOpen.open_ts_ms;
+  const r = await runHarness({
+    strategy: `export class S {
+      onMarketOpen() {}
+      onTick(ctx) { ctx.log("hello"); return null; }
+    }`,
+    markets: [{ market: noOpen, stream: 'prices' }],
+  });
+  assert.equal(r.code, EXIT.ok, r.stderr);
+  assert.match(r.logs, /^0xm1 /m, 'a missing opening time left a leading space');
+  assert.doesNotMatch(r.logs, /^ /m);
 });

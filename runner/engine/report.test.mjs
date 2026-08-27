@@ -355,3 +355,85 @@ test('the report says which fill delay it was measured at', () => {
   assert.equal('latency' in buildReport(base), false,
     'the report still carries a latency panel that nothing produces');
 });
+
+// ---------------------------------------------------------------------------
+// "how much money do I need to run this"
+// ---------------------------------------------------------------------------
+//
+// The report could not answer it. It divided P&L by the SUM of every entry,
+// and a strategy that recycles one stake a thousand times has a sum a thousand
+// times larger than the stake — so a run that burned through its money
+// thirty-nine times over reported −4.35%.
+
+test('peak capital is what was at risk AT ONCE, not the sum of entries', async () => {
+  const { metrics } = await import('./report.mjs');
+  // Three sequential positions, $80 each. The money is the same $80 three
+  // times over, and a strategy needing $240 is a different strategy.
+  const seq = [0, 1, 2].map((i) => ({
+    market_id: `m${i}`, pnl: -10, entry_px: 0.4, size: 200,
+    opened_ms: 1000 + i * 1000, closed_ms: 1500 + i * 1000,
+  }));
+  const m = metrics(seq);
+  assert.equal(m.collateral_deployed, 240, 'the sum of entries');
+  assert.equal(m.peak_capital, 80, 'but only $80 was ever at risk');
+  // And the two returns differ by exactly that factor.
+  assert.equal(m.return_on_collateral, -0.125);
+  assert.equal(m.return_on_peak, -0.375);
+});
+
+test('overlapping positions DO add up', async () => {
+  const { metrics } = await import('./report.mjs');
+  const overlap = [
+    { market_id: 'a', pnl: -1, entry_px: 0.5, size: 100, opened_ms: 0, closed_ms: 3000 },
+    { market_id: 'b', pnl: -1, entry_px: 0.5, size: 100, opened_ms: 1000, closed_ms: 2000 },
+  ];
+  assert.equal(metrics(overlap).peak_capital, 100, 'two concurrent $50 stakes need $100');
+});
+
+test('a position that ends where the next begins needs one stake, not two', async () => {
+  const { metrics } = await import('./report.mjs');
+  // Closes are processed before opens at the same instant. Getting this
+  // backwards doubles the answer for any strategy that trades back to back —
+  // which is most of them.
+  const backToBack = [
+    { market_id: 'a', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 0, closed_ms: 1000 },
+    { market_id: 'b', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 1000, closed_ms: 2000 },
+  ];
+  assert.equal(metrics(backToBack).peak_capital, 50);
+});
+
+test('a trade with no timestamps is skipped, not assumed concurrent', async () => {
+  const { metrics } = await import('./report.mjs');
+  // An unknown that inflated the peak would make a strategy look SAFER to
+  // fund than it is, which is the wrong direction to be wrong in.
+  const mixed = [
+    { market_id: 'a', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 0, closed_ms: 1000 },
+    { market_id: 'b', pnl: 0, entry_px: 0.5, size: 100 },
+  ];
+  assert.equal(metrics(mixed).peak_capital, 50);
+});
+
+test('time in market is the UNION of the positions, never their sum', async () => {
+  const { metrics } = await import('./report.mjs');
+  // Two overlapping hour-long positions are one hour of being in the market.
+  // Summing them can exceed the span and report over 100%.
+  const overlap = [
+    { market_id: 'a', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 0, closed_ms: 100 },
+    { market_id: 'b', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 50, closed_ms: 100 },
+  ];
+  assert.equal(metrics(overlap).holding_ratio, 1);
+
+  const gap = [
+    { market_id: 'a', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 0, closed_ms: 25 },
+    { market_id: 'b', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 75, closed_ms: 100 },
+  ];
+  assert.equal(metrics(gap).holding_ratio, 0.5, 'half the span had a position open');
+});
+
+test('no trades produces nulls, not zeros pretending to be answers', async () => {
+  const { metrics } = await import('./report.mjs');
+  const m = metrics([]);
+  assert.equal(m.return_on_peak, null);
+  assert.equal(m.holding_ratio, null);
+  assert.equal(m.peak_capital, 0);
+});

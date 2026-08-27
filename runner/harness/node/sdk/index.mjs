@@ -42,7 +42,10 @@ export class Order {
     if (!SIDES.includes(side)) {
       throw new Error(`side must be "UP" or "DOWN", got ${JSON.stringify(side)}`);
     }
-    // SIZE IN MONEY, converted here rather than in the engine.
+    // SIZING IN MONEY — this is about the `notional` field, converted here
+    // rather than in the engine. `size` is CONTRACTS (see OrderSizing in
+    // index.d.ts); it is not money, and reading this heading as if it were
+    // is the one wrong turn this comment can cause.
     //
     // Position sizing is nearly always a budget, not a contract count, and the
     // conversion has exactly one honest divisor: your own limit. A contract

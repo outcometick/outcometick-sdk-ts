@@ -11,7 +11,7 @@
 import { venueOfPath } from './venue-path.mjs';
 
 /** Asset symbols we collect, longest-first so BNBUSDT matches before BNB. */
-const ASSETS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'BNB', 'HYPE', 'ZEC'];
+export const ASSETS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'BNB', 'HYPE', 'ZEC'];
 
 /** Datasets, as a customer would name them. */
 export const DATASETS = {

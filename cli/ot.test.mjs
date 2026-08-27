@@ -396,3 +396,46 @@ test('neither side branches on the delay being zero', async (t) => {
   // run in; only the worker is optional.
   assert.ok(checked > 0, 'neither file was readable — this test asserted nothing');
 });
+
+// ---------------------------------------------------------------------------
+// --email
+// ---------------------------------------------------------------------------
+
+// The mirror of "do not print a command that does not exist": do not promise
+// an outcome that will not happen. `--email` is what fills `deliver_to`, and
+// the report delivery poller correctly skips a run without one — so the old
+// unconditional "(or wait for the email)" told every CLI submitter to wait for
+// something that could never arrive. The flag itself was implemented and left
+// out of the usage text, which is the same failure from the other side.
+test('--email is documented, because an undocumented flag is an absent one', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url');
+  const here = fileURLToPath(new URL('.', import.meta.url));
+  const src = await readFile(`${here}ot.mjs`, 'utf8');
+  const usage = src.slice(src.indexOf('ot submit <dir>'), src.indexOf('ot status <run_id>'));
+  assert.match(usage, /--email/,
+    'ot submit accepts --email but never says so — nobody can reach the delivery path');
+});
+
+test('the email is only promised when one was asked for', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url');
+  const here = fileURLToPath(new URL('.', import.meta.url));
+  const src = await readFile(`${here}commands/submit.mjs`, 'utf8');
+  // The promise has to be behind the flag that makes it true.
+  assert.match(src, /flags\.email\s*\n?\s*\?[^]*wait for the email/,
+    'the submit output promises an email unconditionally');
+  assert.match(src, /no --email, so nothing will be sent/,
+    'a submitter without --email is not told the report will not be sent');
+});
+
+test('--email really reaches the request body', async () => {
+  // Documented and printed is not the same as sent. This is the link that
+  // makes the other two mean anything.
+  const { readFile } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url');
+  const here = fileURLToPath(new URL('.', import.meta.url));
+  const src = await readFile(`${here}commands/submit.mjs`, 'utf8');
+  assert.match(src, /\.\.\.\(flags\.email \? \{ email: flags\.email \} : \{\}\)/,
+    'submit no longer forwards --email to the API');
+});

@@ -24,6 +24,7 @@ import {
 } from '../api/lib/backtest-datasets.mjs';
 import {
   indexMarkets, eventsFromRow, finaliseMarket, parseRow, buildSlugIndex, marketUnusable,
+  sortMarketsForReplay,
   makeBookThrottle,
 } from '../runner/events.mjs';
 
@@ -211,7 +212,11 @@ export async function loadLocalDay({ root, day, venue, assets, datasets, interva
     });
   }
   return {
-    markets: out,
+    // THE SAME ORDER THE QUEUE FEEDS — see sortMarketsForReplay. A local replay
+    // that emitted its logs in a different order than the queue would break the
+    // one promise `ot run` makes: the identical files from the identical
+    // archive.
+    markets: sortMarketsForReplay(out),
     unusable,
     reason: out.length === 0 && unusable.length
       ? `${unusable.length} market(s) unusable: ${unusable[0].why}`

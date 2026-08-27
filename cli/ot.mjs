@@ -41,6 +41,10 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
 
   ot submit <dir> --assets btc,eth --from <day> --to <day> [--venue polymarket]
       Send it to the queue. Needs OT_BACKTEST_KEY.
+      --email <address>   have the finished report emailed to you. Without it
+                          the run is only reachable from 'ot status', which
+                          means remembering the id — and a queued run outlives
+                          the terminal you started it from.
 
   ot status <run_id>
       Where a submitted run got to, and what it cost. Needs OT_BACKTEST_KEY.
