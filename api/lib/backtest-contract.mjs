@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.6.2';
+export const SDK_VERSION = '1.6.3';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -575,6 +575,12 @@ export const REJECTION_CODES = Object.freeze({
   E_COVERAGE: 'A captured stream was requested outside the window it was captured in.',
   E_LIMIT: 'A submission limit was exceeded — file count, total source size or series size.',
   E_SCOPE: 'The requested venue, asset or date range is not something we can serve.',
+  // The only one `ot check` cannot produce: it means the run started and did not
+  // finish. Used in eleven places across the API, the CLI and the worker long before
+  // it was declared here — so the docs table, which renders these keys, never listed
+  // the one code a customer was most likely to be holding when they came to look it up.
+  E_RUNTIME: 'The run started but could not finish — the sandbox crashed, the feed to it was'
+    + ' cut short, or the replay ended early. Nothing was billed.',
 });
 
 export const KNOWN_REJECTION_CODES = Object.freeze(Object.keys(REJECTION_CODES));

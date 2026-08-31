@@ -27,6 +27,7 @@ import {
 import { loadSeries } from '../../runner/series-data.mjs';
 import { buildReport } from '../../runner/engine/report.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
+import { createLineWriter } from '../../runner/stdin-writer.mjs';
 import { loadLocalDay, localDays, looksLikeArchive } from '../local-data.mjs';
 import { readSubmission, validate } from '../ot.mjs';
 
@@ -72,29 +73,50 @@ function runHarness({
       }
     });
     child.on('error', reject);
-    child.on('close', (code) => resolve({ code, stderr, lines, forged }));
+    child.on('close', (code) => {
+      // A short feed that still exited 0 is the dangerous case: the harness
+      // replayed whatever reached it, reported cleanly, and the report looks
+      // complete. It must not be resolved as a successful run. When the harness
+      // died first the pipe breaks as a CONSEQUENCE, and its own exit code and
+      // stderr say more than the EPIPE does — so let that path through
+      // unchanged and let the caller report the real failure.
+      if (streamError && code === EXIT.ok) { reject(streamError); return; }
+      resolve({ code, stderr, lines, forged });
+    });
 
-    child.stdin.on('error', () => {});
-    child.stdin.write(`${JSON.stringify({ ...job, outputKey })}\n`);
-    for (const m of markets) {
-      // Series rows are INTERLEAVED into the same stream in event time, exactly
-      // as the worker sends them — and `lags` travels with them, or a signal
-      // that declared a publication delay would be visible the instant its row
-      // was stamped rather than when it could have existed.
-      const lines = m.events.map((ev) => JSON.stringify(ev));
-      const merged = seriesNames.length
-        ? mergeReferenceRows(lines, seriesRows, m.market, 'ext', seriesLags)
-        : lines;
-      child.stdin.write(`${JSON.stringify({
-        market: m.market,
-        stream: m.stream,
-        n: merged.length,
-        ...(seriesNames.length ? { series: seriesNames } : {}),
-        ...(Object.keys(seriesLags).length ? { lags: seriesLags } : {}),
-      })}\n`);
-      for (const line of merged) child.stdin.write(`${line}\n`);
-    }
-    child.stdin.end();
+    // THE SAME writer the queue uses (runner/stdin-writer.mjs). This loop used
+    // to ignore what write() returned and swallow every stdin error, so once
+    // the pipe's buffer filled the rows simply stopped arriving: a 289-market
+    // day came back as a 2-market report, exit 0, no warning. `ot run` and the
+    // worker have drifted eight times; sharing the writer is how this one stops
+    // being a ninth.
+    let streamError = null;
+    const write = createLineWriter(child.stdin);
+    (async () => {
+      await write(JSON.stringify({ ...job, outputKey }));
+      for (const m of markets) {
+        // Series rows are INTERLEAVED into the same stream in event time,
+        // exactly as the worker sends them — and `lags` travels with them, or a
+        // signal that declared a publication delay would be visible the instant
+        // its row was stamped rather than when it could have existed.
+        const lines = m.events.map((ev) => JSON.stringify(ev));
+        const merged = seriesNames.length
+          ? mergeReferenceRows(lines, seriesRows, m.market, 'ext', seriesLags)
+          : lines;
+        await write(JSON.stringify({
+          market: m.market,
+          stream: m.stream,
+          n: merged.length,
+          ...(seriesNames.length ? { series: seriesNames } : {}),
+          ...(Object.keys(seriesLags).length ? { lags: seriesLags } : {}),
+        }));
+        for (const line of merged) await write(line);
+      }
+      child.stdin.end();
+    })().catch((err) => {
+      streamError = err;
+      child.stdin.destroy();
+    });
   });
 }
 
@@ -127,11 +149,13 @@ function demux(lines) {
 export async function cmdRun({ dir, flags }) {
   const dataRoot = flags.data;
   if (!dataRoot) {
-    throw new Error('--data is required: point it at a cloned sample archive\n'
-      + '  git clone https://github.com/Ligengxin96/polymarket-data-samples');
+    throw new Error('--data is required: point it at an unpacked sample archive\n'
+      + '  curl -L https://github.com/Ligengxin96/polymarket-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz');
   }
   if (!await looksLikeArchive(dataRoot)) {
-    throw new Error(`${path.resolve(dataRoot)} does not look like an archive — no recognisable data files under it`);
+    throw new Error(`${path.resolve(dataRoot)} does not look like an archive — no recognisable data files under it\n`
+      + '  the sample archive is a release download, not the git repository:\n'
+      + '  curl -L https://github.com/Ligengxin96/polymarket-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz');
   }
 
   const files = await readSubmission(dir);
@@ -341,6 +365,27 @@ export async function cmdRun({ dir, flags }) {
     }
 
     const base = passes[0];
+    // A SHORT REPLAY MUST FAIL EVEN WHEN NOTHING REPORTED AN ERROR.
+    //
+    // The backpressure bug produced exactly that shape: every write "succeeded",
+    // the harness exited 0, and 2 of 289 markets came back as a clean, complete
+    // looking report. Fixing the writer closes the cause we found; counting what
+    // came back is what catches the next one, whatever it turns out to be.
+    //
+    // `markets_run` is incremented by the harness only after a market is fully
+    // replayed, so on a clean exit it equals what was fed. A rejected or
+    // over-budget run never reaches here — those exit non-zero and are raised
+    // above with the sandbox's own reason, which says more than this count.
+    if (base.result.marketsRun < markets.length) {
+      const err = new Error(
+        `only ${base.result.marketsRun} of ${markets.length} market(s) were replayed —`
+        + ' the report would be incomplete, so none was written.'
+        + ' This usually means the feed to the runner was cut short.',
+      );
+      err.code = 'E_RUNTIME';
+      err.detail = err.message;
+      throw err;
+    }
     const marketMeta = new Map(markets.map((m) => [m.market.market_id, {
       market_id: m.market.market_id,
       asset: m.market.asset,

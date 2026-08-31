@@ -1,6 +1,6 @@
 {
   "name": "outcometick",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "description": "Strategy SDK and CLI for outcometick prediction-market backtests",
   "type": "module",
   "license": "MIT",

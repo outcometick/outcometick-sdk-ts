@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 5c26d7ed75e2172fff108af183089aa1460652ba.
+  Generated from monorepo revision 600941b94e4cf95204fc8daf624a24a05f9c43c0.
 -->
 
 # outcometick
@@ -18,7 +18,7 @@ Predict.fun crypto Up/Down markets.
 npm i -g outcometick
 
 ot check .                                           # validate, free, no data
-ot run . --data ./polymarket-data-samples --date …   # replay locally
+ot run . --data ./polymarket-data-samples            # replay locally
 ot submit . --assets btc,eth --from … --to …         # send it to the queue
 ot status <run_id>                                   # where it got to
 ot fetch  <run_id>                                   # download the report
@@ -63,7 +63,7 @@ ship in this package rather than being reimplemented client-side.
 It is the same engine, the same report and the same archive format the queue
 uses, against a local copy of the archive:
 
-    git clone https://github.com/Ligengxin96/polymarket-data-samples
+    curl -L https://github.com/Ligengxin96/polymarket-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz
 
 It is **not** the sandbox. Locally your strategy runs as you, with your
 privileges, on your machine — which is fine, because it is your code. On our

@@ -2,7 +2,7 @@
 // `ot` — the command line the SDK docs tell customers to use.
 //
 //   ot check .                                          validate, free, no data
-//   ot run . --data ./polymarket-data-samples --date …  replay locally
+//   ot run . --data ./polymarket-data-samples           replay locally
 //   ot submit . --assets btc,eth --from … --to …        send it to the queue
 //
 // The one thing this file must get right is that `ot check` runs the SAME
@@ -57,7 +57,7 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
       --api <url>     API base (default https://outcometick.com)
 
   Free sample data:
-      git clone https://github.com/Ligengxin96/polymarket-data-samples
+      curl -L https://github.com/Ligengxin96/polymarket-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz
 `;
 
 /** Parse argv into {command, dir, flags}. */
