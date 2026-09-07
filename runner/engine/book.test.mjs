@@ -248,3 +248,86 @@ test('filled and unfilled still account for the whole request', () => {
       `size ${size}: filled ${r.filled} + unfilled ${r.unfilled} is not the order`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// The unthrottled top-of-book bound.
+//
+// It is the only book input with no size behind it, so the rule is narrow on
+// purpose: it may DELETE levels the venue has moved past and may never add one.
+// A level invented without a size is the fabricated-liquidity bug this engine
+// has had to fix five times.
+test('a bound deletes levels strictly better than itself, on both ladders', () => {
+  const b = new Book('m');
+  b.snapshot(100, { UP: {
+    asks: [[0.44, 10], [0.45, 20], [0.46, 30]],
+    bids: [[0.43, 10], [0.42, 20], [0.40, 30]],
+  } });
+  // "Nothing better than 0.45 to buy, nothing better than 0.42 to sell into."
+  assert.equal(b.bbo(200, 'UP', 0.42, 0.45), 2);
+  // 0.44 was cheaper than the bound and is gone; 0.45 is AT it and stays —
+  // strictly better, not "at least as good". 0.43 was dearer than the bid bound
+  // and is gone; 0.42 is at it and stays.
+  assert.deepEqual(b.levels('UP'), [[0.45, 20], [0.46, 30]]);
+  assert.deepEqual(b.bidLevels('UP'), [[0.42, 20], [0.40, 30]]);
+});
+
+test('a bound never adds a level, however far it is from the book', () => {
+  const b = new Book('m');
+  b.snapshot(100, { UP: { asks: [[0.90, 5]], bids: [[0.10, 5]] } });
+  // A bound of 0.50/0.55 says the top of book is far better than anything
+  // resting here. It must not conjure one: there is no size to conjure it with.
+  assert.equal(b.bbo(200, 'UP', 0.50, 0.55), 0);
+  assert.deepEqual(b.levels('UP'), [[0.90, 5]]);
+  assert.deepEqual(b.bidLevels('UP'), [[0.10, 5]]);
+});
+
+test('an empty side is written as 0 or 1 and clears that ladder', () => {
+  const b = new Book('m');
+  b.snapshot(100, { UP: { asks: [[0.01, 5], [0.02, 5]], bids: [[0.005, 5]] } });
+  // How the venue writes "no quotes": best_bid "0" and, on the other token of
+  // the same market, best_ask "1" — measured as an exact pairing in the
+  // archive. No special case is needed, because deleting everything strictly
+  // better than 0 (bids) or 1 (asks) is precisely what those mean.
+  assert.equal(b.bbo(200, 'UP', 0, 1), 3);
+  assert.deepEqual(b.levels('UP'), []);
+  assert.deepEqual(b.bidLevels('UP'), []);
+});
+
+test('a level stamped the same millisecond as the bound survives it', () => {
+  const b = new Book('m');
+  b.snapshot(100, { UP: { asks: [[0.45, 10]], bids: [] } });
+  b.delta(200, 'UP', 'asks', 0.44, 7);
+  // The delta and the bound contradict each other and the archive does not say
+  // which came first. Requiring the level to be STRICTLY older makes the result
+  // independent of how a tie was sorted — otherwise the same archive replays
+  // two ways depending on the reader.
+  assert.equal(b.bbo(200, 'UP', null, 0.45), 0);
+  assert.deepEqual(b.levels('UP'), [[0.44, 7], [0.45, 10]]);
+  // One millisecond later the same bound does remove it.
+  assert.equal(b.bbo(201, 'UP', null, 0.45), 1);
+  assert.deepEqual(b.levels('UP'), [[0.45, 10]]);
+});
+
+test('an unusable bound changes nothing rather than emptying the ladder', () => {
+  const b = new Book('m');
+  const fresh = () => { b.snapshot(100, { UP: { asks: [[0.44, 10]], bids: [[0.40, 10]] } }); };
+  // A bound is a MAXIMAL deletion instruction, so an unreadable one would empty
+  // the book and the market would silently stop filling — an honest-looking
+  // report of a strategy that could not trade. The decoder already refuses
+  // these; this is the second door.
+  // Strings and booleans are in this list because the two engines disagreed
+  // about them: float('0.45') is 0.45 in Python while Number.isFinite('0.45')
+  // is false in JS, and a Python bool is an int, so `false` would have read as
+  // the bound 0 and deleted every bid.
+  for (const bad of [NaN, Infinity, -Infinity, null, undefined, 1.5, -0.1, '0.45', true, false]) {
+    fresh();
+    assert.equal(b.bbo(200, 'UP', bad, bad), 0, `bound ${bad} should be ignored`);
+    assert.deepEqual(b.levels('UP'), [[0.44, 10]]);
+    assert.deepEqual(b.bidLevels('UP'), [[0.40, 10]]);
+  }
+});
+
+test('a bound on an unknown side is refused, not silently dropped', () => {
+  const b = new Book('m');
+  assert.throws(() => b.bbo(200, 'SIDEWAYS', 0.4, 0.5), /unknown side/);
+});

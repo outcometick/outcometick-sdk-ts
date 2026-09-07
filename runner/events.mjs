@@ -11,7 +11,7 @@
 // if local and remote decode the archive differently.
 
 import { classifyPath } from '../api/lib/data-taxonomy.mjs';
-import { resolveSettlementStream } from '../api/lib/backtest-datasets.mjs';
+import { resolveSettlementStream, degradingCoverage, inputKeys } from '../api/lib/backtest-datasets.mjs';
 import { bookThrottleMs } from '../api/lib/backtest-contract.mjs';
 import { Book } from './engine/book.mjs';
 
@@ -465,6 +465,58 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
     }]];
   }
 
+  if (meta.dataset === 'best_bid_ask') {
+    // TOP OF BOOK AS A BOUND, not as a quote.
+    //
+    // This stream carries prices and no sizes, so it can never say what IS on
+    // the ladder — only what is NOT: "nothing better than this exists right
+    // now". The engine uses it to delete levels the venue has moved past and
+    // never to add one, because a level invented without a size is exactly the
+    // fabricated liquidity this product has had to fix five times.
+    //
+    // Emitted as kind:'book' deliberately: on_book already fires for the book,
+    // a strategy reads the refined ladder rather than this row, and no new hook
+    // or SDK surface appears. `bbo` marks it as a bound so the engine does not
+    // mistake it for a delta with a missing size.
+    const side = sideOfToken(market, row.asset_id ?? payload.asset_id);
+    if (!side) return [];
+    const bid = num(payload.best_bid);
+    const ask = num(payload.best_ask);
+    // MEASURED, over 900,000 rows across BTC-5m, SOL-15m and DOGE-5m on
+    // 2026-09-04: zero crossed, zero equal, zero outside [0,1], zero
+    // unparseable. So none of these guards fire on today's archive — they are
+    // here because the failure they prevent is silent and total. A garbage
+    // bound is a MAXIMAL deletion instruction: one unreadable row would empty a
+    // ladder, the market would stop filling, and the run would come back with
+    // an honest-looking report of a strategy that could not trade.
+    //
+    // Fail-safe rather than fail-closed, and that is the one place this differs
+    // from the rest of this file: dropping a bbo row costs nothing but the
+    // refinement, leaving the book exactly as it was before 2026-09-02. There
+    // is no wrong answer to propagate, so the market is not dropped.
+    if (bid == null || ask == null) return [];
+    if (bid < 0 || bid > 1 || ask < 0 || ask > 1) return [];
+    if (bid > ask) return [];
+    // 0 and 1 need NO special case, which is why the rule is phrased as a
+    // bound. `best_bid = "0"` is how the venue writes "no bid", and deleting
+    // every bid strictly better than 0 deletes all of them — correct. Its
+    // complement is `best_ask = "1"` on the other token of the same market,
+    // because UP + DOWN = 1: measured as an exact pairing, 3228 `bid=0 ask=0.01`
+    // against 3228 `bid=0.99 ask=1`, every count matching. An earlier version of
+    // this rule treated [0.001, 0.999] as the valid domain and would have
+    // thrown away precisely those rows — the ones carrying the MOST definite
+    // information about the book.
+    return [[id, {
+      kind: 'book',
+      ts_ms: ts,
+      snapshot: false,
+      bbo: true,
+      side,
+      bid,
+      ask,
+    }]];
+  }
+
   if (meta.dataset === 'price_change') {
     // A delta carries a batch, each entry naming its own token and ladder side.
     const changes = Array.isArray(payload.price_changes) ? payload.price_changes : [];
@@ -546,6 +598,21 @@ export function buildCoverage({
   streams = {},
   droppedRows = 0,
   unreconciledRows = 0,
+  /**
+   * Did the manifest declare `bbo`, and on which of the run's days did the
+   * archive actually have it?
+   *
+   * Always emitted, even when nothing declared it, because these three keys are
+   * the only place a reader can tell which book a report was computed against.
+   * `bbo` refines the ladder by deleting levels the venue has moved past, and a
+   * run over 2026-06-10 and a run over 2026-09-04 both succeed while using two
+   * different books. Same reason `fill_delay_ms` is written out: without it,
+   * whoever holds the archive cannot tell which of the two they have.
+   */
+  bboDeclared = false,
+  bboDays = [],
+  bboMissingDays = [],
+  bboPartialDays = [],
   local = false,
   source = null,
 }) {
@@ -568,9 +635,79 @@ export function buildCoverage({
     // Rows the harness produced that do not describe a market the caller
     // supplied. Published rather than swallowed.
     unreconciled_rows: unreconciledRows,
+    // Which book this report was computed against. `bbo_missing_days` is not an
+    // error and is not a gap in the archive for the days before 2026-09-02 —
+    // nothing was ever captured then. It is the list of days that ran exactly
+    // as this product ran for its whole life before that stream existed.
+    bbo_declared: bboDeclared,
+    bbo_days: bboDays,
+    bbo_missing_days: bboMissingDays,
+    // Dates where SOME market-days got the refinement and some did not, each
+    // naming the `asset|interval` that did not. A date is never in more than
+    // one of these three, and the three together are every date scanned.
+    bbo_partial_days: bboPartialDays,
     // Local-only, and last: a queued run has no source directory to name.
     ...(local ? { local: true, source } : {}),
   };
+}
+
+/**
+ * Which of a run's days the unthrottled top-of-book stream actually covered.
+ *
+ * SHARED, for the reason every predicate in this file is shared: `ot run` and
+ * the queue have drifted apart nine times, always by each computing a rule the
+ * other also computes. This one decides what a report SAYS about itself, so a
+ * second copy would let the local run and the queue describe the same archive
+ * differently.
+ *
+ * Days come from the markets actually scanned rather than from the requested
+ * range, so the answer describes the run that happened.
+ *
+ * `bbo_missing_days` is not an error and not a gap in our archive: before
+ * 2026-09-02 nothing was captured, so those days ran exactly as this product
+ * ran for its whole life before the stream existed. Reported anyway, because
+ * two runs that used different books are otherwise indistinguishable — the same
+ * reason `fill_delay_ms` is written out.
+ */
+export { inputKeys };
+
+export function bboCoverage({ venue, datasets, markets, applied = null }) {
+  if (!(datasets ?? []).includes('bbo')) {
+    return { bboDeclared: false, bboDays: [], bboMissingDays: [], bboPartialDays: [] };
+  }
+  // MEASURED OR NOTHING. There used to be a fallback that inferred coverage
+  // from CAPTURE_WINDOWS when no measurement was passed, and that is fail-OPEN
+  // for precisely the bug this function exists to prevent: a caller added later
+  // — or a refactor that drops an argument — would silently go back to claiming
+  // a refinement the replay never had. The window says what SHOULD have been
+  // possible; only the decode knows what happened.
+  if (!applied) {
+    throw new Error('bboCoverage: `applied` is required when the manifest declares bbo '
+      + '— coverage must be measured from what was decoded, never inferred from the capture window');
+  }
+
+  // THE UNIT IS THE MARKET-DAY, the same `asset|day|interval` the run is billed
+  // on. Collapsing to the date makes one asset speak for every asset.
+  const byDay = new Map();
+  for (const m of markets ?? []) {
+    const day = m?.day;
+    if (!day) continue;
+    if (!byDay.has(day)) byDay.set(day, new Set());
+    byDay.get(day).add(`${m.market?.asset ?? 'unknown'}|${m.market?.interval ?? 'none'}`);
+  }
+
+  const full = [], none = [], partial = [];
+  for (const day of [...byDay.keys()].sort()) {
+    const scanned = [...byDay.get(day)];
+    const got = applied.get(day) ?? new Set();
+    const without = scanned.filter((k) => !got.has(k)).sort();
+    if (without.length === 0) full.push(day);
+    else if (without.length === scanned.length) none.push(day);
+    // NAMED, not counted. "Some of 2026-09-04 ran on the old book" is not
+    // actionable; "ETH|5m did" is. Same reason uncapturedRange returns the gap.
+    else partial.push({ day, without });
+  }
+  return { bboDeclared: true, bboDays: full, bboMissingDays: none, bboPartialDays: partial };
 }
 
 /**
@@ -781,7 +918,15 @@ export function finaliseMarket(events, market) {
   let downPx = null;
   for (const ev of inWindow) {
     if (ev.kind !== 'book') continue;
-    if (ev.snapshot) book.snapshot(ev.ts_ms, ev.levels);
+    // THE SAME THREE BRANCHES AS replay.mjs, IN THE SAME ORDER. A bound was
+    // missing here while the engine applied it, so the strategy traded against
+    // a pruned ladder and the report compared it to an unpruned one: a bound
+    // landing between the UP and DOWN snapshots left up_px at the stale 0.44
+    // while ctx.book() already said 0.45. The baseline is what every headline
+    // number is measured against, so a book it never traded on is worse than a
+    // missing baseline.
+    if (ev.bbo) book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask);
+    else if (ev.snapshot) book.snapshot(ev.ts_ms, ev.levels);
     else if (ev.side && ev.ladder) book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
     // BOTH SIDES FROM ONE BOOK STATE, captured together.
     //

@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.6.3';
+export const SDK_VERSION = '1.6.4';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -60,7 +60,7 @@ export const SDK_VERSION = '1.6.3';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.14.0';
+export const SANDBOX_IMAGE_TAG = '1.15.0';
 
 // ---------------------------------------------------------------------------
 // Languages
@@ -154,11 +154,52 @@ export const DATASETS = Object.freeze({
   twap30s: 'TWAP over a 30-second lookback.',
   twap60s: 'TWAP over a 60-second lookback.',
   book: 'Order-book snapshots and deltas.',
+  bbo: 'Unthrottled top of book. Prices only, no sizes — it removes ladder levels the venue has since moved past, and never adds any.',
   trades: 'Every trade print on the venue.',
   markets: 'Per-market metadata, strike and settlement outcome.',
 });
 
 export const KNOWN_DATASETS = Object.freeze(Object.keys(DATASETS));
+
+/**
+ * Declarable, but NOT part of the manifest the editor seeds or the prewarm warms.
+ *
+ * Two reasons, and NOT coverage — see DEGRADING_DATASETS: a range that predates
+ * the stream runs fine, so seeding it would not break anything.
+ *
+ * 1. REPORT CONTINUITY. bbo changes which ladder levels are fillable, so
+ *    turning it on by default changes the fills of every manifest already
+ *    written. Reports we have already delivered would stop reproducing, and
+ *    the customer did not ask for a different book.
+ * 2. BANDWIDTH. Archive fetch is the binding constraint (1.9-3.5 MB/s against a
+ *    20-minute wall clock), and the busiest series measure +13%~+29% on top of
+ *    a ~112MB market-day. That is charged to every run, including the ones
+ *    that would never look at it.
+ *
+ * The cost of opt-in is that an opted-in run pays a full decode instead of
+ * hitting the prewarm, because the prewarm warms the default shape. That is the
+ * honest trade: warming both shapes doubles a cache sized in tens of GB.
+ */
+export const OPT_IN_DATASETS = Object.freeze(['bbo']);
+
+/**
+ * Datasets that DEGRADE instead of rejecting when the archive lacks them.
+ *
+ * The general rule for a captured stream is the opposite — outside its window
+ * is E_COVERAGE, never a silent substitution — and that rule is right for
+ * anything a strategy READS. `bbo` is different in kind: a strategy never reads
+ * it. It refines the order book by deleting levels the venue has since moved
+ * past, so a day without it is not a wrong answer, it is the answer this
+ * product gave for its whole life before 2026-09-02.
+ *
+ * So a range that straddles the start of capture runs: the days that have it
+ * are refined, the days that do not behave exactly as they did before. What is
+ * NOT optional is saying so — `bbo_days` / `bbo_missing_days` in coverage and
+ * `bbo_applied` in the report, for the same reason `fill_delay_ms` is written
+ * out: two reports that used different books are otherwise identical, and
+ * whoever holds the archive has no way to tell which one they have.
+ */
+export const DEGRADING_DATASETS = Object.freeze(['bbo']);
 
 /**
  * A derived stream is computed from one we hold rather than captured. It is
@@ -194,6 +235,12 @@ export const CAPTURE_WINDOWS = Object.freeze({
     twap30s: Object.freeze({ from: '2026-08-07', to: null }),
     twap60s: Object.freeze({ from: '2026-08-07', to: null }),
     book: Object.freeze({ from: FIRST_COMPLETE_DAY.polymarket, to: null }),
+    // MEASURED, not the deploy date: collection began 2026-09-02T00:42:18.154Z,
+    // so 09-02 is missing its first 42 minutes and every market that opened in
+    // them has no top of book at all. Registering 09-02 would accept a run over
+    // a day it can only half serve — silent degradation, which is the one thing
+    // a stream added mid-archive must not do. 09-03 is the first complete day.
+    bbo: Object.freeze({ from: '2026-09-03', to: null }),
     trades: Object.freeze({ from: FIRST_COMPLETE_DAY.polymarket, to: null }),
     markets: Object.freeze({ from: FIRST_COMPLETE_DAY.polymarket, to: null }),
   }),

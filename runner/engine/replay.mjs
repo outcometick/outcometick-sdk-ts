@@ -571,14 +571,35 @@ export function replayMarket({
     control.setNow(ev.ts_ms);
 
     if (ev.kind === 'book') {
-      if (ev.snapshot) book.snapshot(ev.ts_ms, ev.levels);
+      // BEFORE the snapshot test, because a bound carries snapshot:false and
+      // would otherwise be applied as a delta with no ladder, no price and no
+      // size — which Book.delta rejects by throwing, taking the whole run with
+      // it.
+      if (ev.bbo) book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask);
+      else if (ev.snapshot) book.snapshot(ev.ts_ms, ev.levels);
       else book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
     }
     drainUntil(ev.ts_ms);
 
     if (ev.kind === 'tick') control.pushTick(ev);
 
-    const hook = HOOK_FOR[ev.kind];
+    // A BOUND REFINES THE BOOK SILENTLY. Three reasons it must not reach a hook,
+    // and the first one alone is enough:
+    //
+    //  - The event has no `levels`, `ladder`, `px` or `size`. Handing it to
+    //    on_book gives a documented SDK input a shape no documentation
+    //    describes, and a strategy reading ev.levels gets undefined.
+    //  - This stream is UNTHROTTLED — 1.3M rows in a day of BTC-5m against a
+    //    price_change stream thinned to 20-500ms. Firing a hook on each would
+    //    multiply hook invocations several-fold inside a 20-minute wall clock,
+    //    and a run that times out is refunded in full at our cost.
+    //  - Nothing is lost by staying quiet: ctx.book() is live, so the next real
+    //    event already sees the refined ladder. Pruning only ever REMOVES
+    //    liquidity, so not waking a strategy cannot cost it an opportunity that
+    //    existed — which is the direction this engine resolves ambiguity in.
+    //
+    // MUST MATCH otreplay.py. Both engines or neither.
+    const hook = ev.bbo ? null : HOOK_FOR[ev.kind];
     if (hook && hooks[hook]) emit(call(hook, ev), ev.ts_ms);
 
     if (monitor.breached) {

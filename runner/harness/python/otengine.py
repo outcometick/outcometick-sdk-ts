@@ -85,27 +85,33 @@ class Ladder:
 
     def __init__(self, direction: int) -> None:
         self.direction = direction
-        self.levels: list[list[int | float]] = []  # [ticks, size], best first
+        # [ticks, size, ts], best first. `ts` is when this level was last
+        # stated by the archive; `prune` needs it to tell a level the venue has
+        # moved past from one stamped the same millisecond as the bound that
+        # would delete it. Kept as a third slot rather than a parallel map so
+        # both engines carry it the same way.
+        self.levels: list[list[int | float]] = []
 
     def _worse(self, a: int, b: int) -> int:
         return (a - b) if self.direction > 0 else (b - a)
 
-    def reset(self, levels: Iterable[Any]) -> None:
+    def reset(self, levels: Iterable[Any], ts: int = 0) -> None:
         rows = []
         for entry in levels or ():
             px, size = entry[0], float(entry[1])
             if size > 0:
-                rows.append([to_ticks(float(px)), size])
+                rows.append([to_ticks(float(px)), size, ts])
         rows.sort(key=lambda r: r[0] * (1 if self.direction > 0 else -1))
         self.levels = rows
 
-    def apply(self, px: float, size: float) -> None:
+    def apply(self, px: float, size: float, ts: int = 0) -> None:
         ticks = to_ticks(float(px))
         n = float(size)
         for i, level in enumerate(self.levels):
             if level[0] == ticks:
                 if n > 0:
                     level[1] = n
+                    level[2] = ts
                 else:
                     self.levels.pop(i)
                 return
@@ -114,7 +120,54 @@ class Ladder:
         j = len(self.levels)
         while j > 0 and self._worse(self.levels[j - 1][0], ticks) > 0:
             j -= 1
-        self.levels.insert(j, [ticks, n])
+        self.levels.insert(j, [ticks, n, ts])
+
+    def prune(self, bound: float | None, ts: int) -> int:
+        """Delete every level STRICTLY BETTER than `bound` that is older than `ts`.
+
+        The whole of what the unthrottled top-of-book stream may do. It carries
+        prices and no sizes, so it can state what is NOT on the ladder and never
+        what is; adding a level from it would be liquidity invented without a
+        size.
+
+        Why it matters: `take()` eats from the best end while the delta stream
+        maintaining this ladder is thinned to the venue's capture cadence, so the
+        stalest levels are exactly the ones an order hits first — and stale in
+        one direction only, since a price already taken still looks available.
+
+        OLDER THAN, not "at or older than": a delta and a bound stamped the same
+        millisecond contradict each other and the archive does not say which came
+        first, so requiring the level to be strictly older makes the result the
+        same whichever way a tie was sorted.
+
+        MUST MATCH Ladder.prune in runner/engine/book.mjs exactly.
+        """
+        # A NUMBER, not something that parses as one. float('0.45') is 0.45
+        # while JavaScript's Number.isFinite('0.45') is false, so accepting
+        # strings here would make the same event prune in Python and not in
+        # Node. bool is excluded because it is an int in Python and True would
+        # otherwise read as the bound 1.
+        if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+            return 0
+        b = float(bound)
+        if b != b or b in (float("inf"), float("-inf")):
+            return 0
+        # Inside [0, 1], for the reason spelled out in Ladder.prune in
+        # runner/engine/book.mjs: a bound is a maximal deletion instruction, and
+        # an outcome token cannot quote outside that range.
+        if b < 0.0 or b > 1.0:
+            return 0
+        cap = to_ticks(b)
+        kept = []
+        removed = 0
+        for level in self.levels:
+            if self._worse(level[0], cap) < 0 and level[2] < ts:
+                removed += 1
+                continue
+            kept.append(level)
+        if removed:
+            self.levels = kept
+        return removed
 
     def best(self) -> float | None:
         return from_ticks(self.levels[0][0]) if self.levels else None
@@ -122,14 +175,14 @@ class Ladder:
     def depth(self, bound: float | None = None) -> float:
         cap = None if bound is None else to_ticks(float(bound))
         total = 0.0
-        for ticks, size in self.levels:
+        for ticks, size, _ts in self.levels:
             if cap is not None and self._worse(ticks, cap) > 0:
                 break
             total += size
         return total
 
     def view(self, n: int = 10) -> list[list[float]]:
-        return [[from_ticks(t), s] for t, s in self.levels[:n]]
+        return [[from_ticks(t), s] for t, s, _ts in self.levels[:n]]
 
     def take(self, size: float, bound: float | None):
         cap = None if bound is None else to_ticks(float(bound))
@@ -169,8 +222,8 @@ class Book:
             spec = (levels or {}).get(side)
             if not spec:
                 continue
-            self.ladders[side]["asks"].reset(spec.get("asks"))
-            self.ladders[side]["bids"].reset(spec.get("bids"))
+            self.ladders[side]["asks"].reset(spec.get("asks"), ts)
+            self.ladders[side]["bids"].reset(spec.get("bids"), ts)
 
     def delta(self, ts: int, side: str, kind: str, px: float, size: float) -> None:
         self.ts = ts
@@ -178,7 +231,26 @@ class Book:
             raise ValueError(f"unknown side {side}")
         if kind not in ("asks", "bids"):
             raise ValueError(f"unknown ladder {kind}")
-        self.ladders[side][kind].apply(px, size)
+        self.ladders[side][kind].apply(px, size, ts)
+
+    def bbo(self, ts: int, side: str, bid: float | None, ask: float | None) -> int:
+        """Apply an unthrottled top-of-book bound. DELETES ONLY.
+
+        `bid` and `ask` are prices with no size behind them, so they can shrink
+        the book and never grow it.
+
+        0 and 1 need no special case. `bid = 0` is how the venue writes "no bid",
+        and deleting every bid strictly better than 0 deletes all of them. Its
+        complement is `ask = 1` on the other token of the same market, since
+        UP + DOWN = 1 — measured as an exact pairing in the archive.
+
+        MUST MATCH Book.bbo in runner/engine/book.mjs exactly.
+        """
+        self.ts = ts
+        if side not in SIDES:
+            raise ValueError(f"unknown side {side}")
+        lad = self.ladders[side]
+        return lad["asks"].prune(ask, ts) + lad["bids"].prune(bid, ts)
 
     def best(self, side: str) -> float | None:
         """The price to BUY that outcome at — the best ask."""

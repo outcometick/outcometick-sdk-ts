@@ -11,7 +11,8 @@
 import { classifyPath } from './data-taxonomy.mjs';
 import {
   CAPTURE_WINDOWS, DERIVED_DATASETS, KNOWN_DATASETS, BacktestRejection,
-  MARKET_INTERVALS, DEFAULT_INTERVALS, MAX_LATENCY_MS,
+  MARKET_INTERVALS, DEFAULT_INTERVALS, MAX_LATENCY_MS, OPT_IN_DATASETS,
+  DEGRADING_DATASETS,
 } from './backtest-contract.mjs';
 
 /**
@@ -28,9 +29,15 @@ const ARCHIVE_DATASETS = Object.freeze({
     twap30s: Object.freeze(['twap30s']),
     twap60s: Object.freeze(['twap60s']),
     book: Object.freeze(['book', 'price_change']),
+    bbo: Object.freeze(['best_bid_ask']),
     trades: Object.freeze(['last_trade_price']),
     markets: Object.freeze(['markets']),
   }),
+  // Predict.fun has no equivalent stream. Deliberately absent rather than
+  // mapped to something close: `archiveDatasetsFor` would silently fetch
+  // nothing, and a strategy would get an empty feed with no error. The
+  // rejection comes from CAPTURE_WINDOWS.predict having no `bbo` entry, which
+  // makes uncapturedRange return the whole range -> E_COVERAGE.
   predict: Object.freeze({
     prices: Object.freeze(['prices']),
     twap30s: Object.freeze(['twap30s']),
@@ -140,6 +147,11 @@ const nextDay = (d) => shiftDay(d, 1);
 export function assertCoverage({ datasets, venue, from, to }) {
   for (const ds of datasets ?? []) {
     if (ds === 'settlement') continue;
+    // A degrading dataset never blocks a run: where the archive has it the run
+    // is refined, where it does not the run behaves as it always did. The days
+    // it covers are reported rather than enforced — see bboCoverage below and
+    // DEGRADING_DATASETS for why this one is not like the others.
+    if (DEGRADING_DATASETS.includes(ds)) continue;
     if (DERIVED_DATASETS[ds]) {
       // A derived stream is a function of one we hold, so its availability is
       // the SOURCE stream's availability, not its own.
@@ -162,6 +174,76 @@ export function assertCoverage({ datasets, venue, from, to }) {
         { dataset: ds, venue, gap, capturedFrom: w?.from ?? null, capturedTo: w?.to ?? null });
     }
   }
+}
+
+/**
+ * Did this day actually read the archive dataset, judged by what it was decoded
+ * from rather than by what was asked for?
+ *
+ * `inputs` are "<path>:<sha256>" entries recorded by the decoder for every
+ * object it really opened. The sha is hex and paths do not contain a colon at
+ * the end, so the split is on the LAST one.
+ *
+ * WHY NOT THE REQUESTED DATASET LIST. A day inside the capture window whose
+ * object is simply missing from the catalog — our outage, not the customer's
+ * date range — still asks for `best_bid_ask`, decodes fine on the old book, and
+ * would be reported as covered. The report would then claim a refinement the
+ * replay never had.
+ */
+export function inputsInclude(inputs, archiveDataset) {
+  return inputKeys(inputs, archiveDataset).size > 0;
+}
+
+/**
+ * Which MARKET-DAYS an archive dataset was actually read for: `asset|interval`.
+ *
+ * The day alone is not the unit. A run reads each asset group separately and
+ * their inputs are merged, so "this date opened a best_bid_ask object" is true
+ * as soon as ONE asset did — a BTC+ETH run where only BTC has the object would
+ * replay ETH on the old book and report the whole date as covered. Same
+ * false-coverage class as inferring from the capture window, hidden one
+ * dimension further in.
+ *
+ * `asset|interval` rather than the full billing key because the caller already
+ * knows which day it is asking about; joined with the day it is exactly the
+ * `asset|day|interval` that countMarketDays bills on.
+ *
+ * A venue-wide object carries no asset (markets metadata does not), so it
+ * contributes nothing here — which is right: it is not a per-market-day fact.
+ */
+export function inputKeys(inputs, archiveDataset) {
+  const out = new Set();
+  for (const entry of inputs ?? []) {
+    const raw = String(entry);
+    // The sha is hex and an object key has no trailing colon, so split on the
+    // LAST one — a path that itself contains a colon must still classify.
+    const cut = raw.lastIndexOf(':');
+    const p = cut > 0 ? raw.slice(0, cut) : raw;
+    const c = classifyPath(p);
+    if (c.dataset !== archiveDataset) continue;
+    if (!c.asset) continue;
+    out.add(`${c.asset}|${c.interval ?? 'none'}`);
+  }
+  return out;
+}
+
+/**
+ * Split a run's days into the ones a degrading dataset covers and the ones it
+ * does not, so the report can state it rather than leave it to be inferred.
+ *
+ * Deliberately computed from CAPTURE_WINDOWS rather than from which files the
+ * worker happened to find: a day inside the window with a missing object is a
+ * gap in OUR archive and belongs in the same coverage entry as any other
+ * missing object, while a day before the window is not a gap at all — nothing
+ * was ever captured. Conflating them would report our outages as the customer's
+ * date range being too early.
+ *
+ * @returns {{covered: string[], missing: string[]}}
+ */
+export function degradingCoverage(venue, dataset, days) {
+  const covered = [], missing = [];
+  for (const d of days ?? []) (isCaptured(venue, dataset, d) ? covered : missing).push(d);
+  return { covered, missing };
 }
 
 /**
@@ -189,6 +271,34 @@ export function archiveDatasetsFor({ datasets, venue, from, to }) {
   const map = ARCHIVE_DATASETS[venue] ?? {};
   for (const w of wanted) for (const a of map[w] ?? []) out.add(a);
   return [...out].sort();
+}
+
+/**
+ * The archive datasets to read FOR ONE DAY.
+ *
+ * Identical to archiveDatasetsFor for everything that is not degrading. The
+ * difference is the whole point: a degrading dataset is dropped on a day its
+ * capture window does not cover, so the files are never fetched, never decoded
+ * and never applied.
+ *
+ * WITHOUT THIS the range-level list is used for every day, and a run spanning
+ * the start of capture reads a PARTIAL day's file and applies it — while
+ * `bboCoverage` reports that same day as missing, because it asks
+ * CAPTURE_WINDOWS. The report would then state that a day ran on the old
+ * behaviour while it actually ran on a half-covered book. 2026-09-02 is exactly
+ * that day: capture began at 00:42:18Z, so markets opening before then get no
+ * refinement and markets after do — a density change inside one day, which is
+ * the thing the book cadence is carefully arranged never to produce.
+ *
+ * The range is still passed through rather than collapsed to the day, because
+ * `settlement` expands against the whole range and narrowing that here would
+ * change which streams a day fetches for reasons unrelated to this.
+ */
+export function archiveDatasetsForDay({ datasets, venue, day, from, to }) {
+  const usable = (datasets ?? []).filter(
+    (d) => !DEGRADING_DATASETS.includes(d) || isCaptured(venue, d, day),
+  );
+  return archiveDatasetsFor({ datasets: usable, venue, from, to });
 }
 
 /**
@@ -345,5 +455,28 @@ export function normalizeDatasets(list) {
  */
 const SETTLEMENT_STREAMS = new Set(['prices', 'twap30s', 'twap60s']);
 export const PREWARM_DATASETS = Object.freeze(
-  KNOWN_DATASETS.filter((d) => !SETTLEMENT_STREAMS.has(d)),
+  KNOWN_DATASETS.filter((d) => !SETTLEMENT_STREAMS.has(d) && !OPT_IN_DATASETS.includes(d)),
 );
+
+/**
+ * EVERY dataset shape worth warming: the default one, plus the default one with
+ * each opt-in dataset added.
+ *
+ * A decoded day is cached per SHAPE, so warming only the default leaves every
+ * opted-in run paying the full decode — the timer stays green, the cache grows,
+ * and the one customer who asked for more waits longest. That is the failure
+ * this file already documents for the default shape; an opt-in dataset just
+ * moves it one step along.
+ *
+ * The cost is bounded and mostly imaginary: on a day the opt-in dataset is not
+ * captured, `archiveDatasetsForDay` drops it, both shapes normalise to the same
+ * archive files, and the second warm is a cache HIT rather than a second copy.
+ * Only days that actually carry it are stored twice.
+ *
+ * Derived, so a dataset added to the product is warmed without anyone
+ * remembering to come here.
+ */
+export const PREWARM_SHAPES = Object.freeze([
+  PREWARM_DATASETS,
+  ...OPT_IN_DATASETS.map((d) => Object.freeze([...PREWARM_DATASETS, d])),
+]);

@@ -57,15 +57,21 @@ class Ladder {
   #order(a, b) { return this.dir > 0 ? a - b : b - a; }
 
   /** Replace the whole ladder (a snapshot). */
-  reset(levels) {
+  reset(levels, ts = 0) {
     this.levels = (levels ?? [])
-      .map(([px, size]) => ({ ticks: toTicks(px), size: Number(size) }))
+      .map(([px, size]) => ({ ticks: toTicks(px), size: Number(size), ts }))
       .filter((l) => l.size > 0 && Number.isFinite(l.ticks))
       .sort((a, b) => this.#order(a.ticks, b.ticks));
   }
 
-  /** Apply one delta. A size of zero removes the level. */
-  apply(px, size) {
+  /**
+   * Apply one delta. A size of zero removes the level.
+   *
+   * `ts` is carried on the level itself so `prune` can tell a level the venue
+   * has moved past from one that arrived in the same millisecond as the bound
+   * about to delete it. See prune.
+   */
+  apply(px, size, ts = 0) {
     const ticks = toTicks(px);
     const n = Number(size);
     const i = this.levels.findIndex((l) => l.ticks === ticks);
@@ -73,10 +79,63 @@ class Ladder {
       if (i >= 0) this.levels.splice(i, 1);
       return;
     }
-    if (i >= 0) { this.levels[i].size = n; return; }
+    if (i >= 0) { this.levels[i].size = n; this.levels[i].ts = ts; return; }
     let j = this.levels.length;
     while (j > 0 && this.#order(this.levels[j - 1].ticks, ticks) > 0) j -= 1;
-    this.levels.splice(j, 0, { ticks, size: n });
+    this.levels.splice(j, 0, { ticks, size: n, ts });
+  }
+
+  /**
+   * Delete every level STRICTLY BETTER than `bound` that is older than `ts`.
+   *
+   * This is the whole of what the unthrottled top-of-book stream is allowed to
+   * do. That stream carries prices and no sizes, so it can state what is NOT on
+   * the ladder — "nothing better than this exists right now" — and can never
+   * state what is. Adding a level from it would be liquidity invented without a
+   * size, which is the class of bug this engine has had to fix five times.
+   *
+   * WHY IT MATTERS AT ALL: `take()` eats from the best end, and the delta stream
+   * that maintains this ladder is thinned to the venue's capture cadence (500ms
+   * for most assets). So the levels that are stalest are exactly the ones an
+   * order hits first, and they are stale in one direction only — a price that
+   * has since been taken still looks available. That is a systematic bias in the
+   * strategy's favour, which is the opposite of this file's stated bias.
+   *
+   * OLDER THAN, not "at or older than", and that is the point of carrying `ts`
+   * per level. A delta and a bound stamped the same millisecond contradict each
+   * other and the archive does not say which came first; leaving it to arrival
+   * order would make the result depend on how the reader happened to sort a tie.
+   * Requiring the level to be strictly older makes the outcome the same either
+   * way.
+   *
+   * Levels are best-first, so everything better than the bound is a prefix —
+   * but the age test is not prefix-aligned, so the prefix is filtered rather
+   * than sliced.
+   */
+  prune(bound, ts) {
+    // Not just finite: inside [0, 1]. An outcome token pays 0 or 1, so a bound
+    // outside that is a row we cannot read, and a bound is a MAXIMAL deletion
+    // instruction — acting on a misread one empties the ladder and the market
+    // silently stops filling. The decoder already refuses these; this is the
+    // second door, and it is what makes the engines, the Python engine and
+    // scripts/audit-report.py agree on the same rule rather than three
+    // slightly different ones.
+    // A NUMBER, not something that parses as one. `Number.isFinite('0.45')` is
+    // false because it does not coerce, while Python's `float('0.45')` is 0.45
+    // — so accepting strings on one side would make the same event prune in one
+    // engine and not the other. Both refuse anything that is not already a
+    // number, which is what the decoder emits.
+    if (typeof bound !== 'number' || !Number.isFinite(bound)) return 0;
+    if (bound < 0 || bound > 1) return 0;
+    const cap = toTicks(bound);
+    let removed = 0;
+    const kept = [];
+    for (const l of this.levels) {
+      if (this.#order(l.ticks, cap) < 0 && l.ts < ts) { removed += 1; continue; }
+      kept.push(l);
+    }
+    if (removed) this.levels = kept;
+    return removed;
   }
 
   /** Best resting price, or null when empty. */
@@ -138,8 +197,8 @@ export class Book {
     for (const side of SIDES) {
       const l = levels?.[side];
       if (!l) continue;
-      this.ladders[side].asks.reset(l.asks);
-      this.ladders[side].bids.reset(l.bids);
+      this.ladders[side].asks.reset(l.asks, ts);
+      this.ladders[side].bids.reset(l.bids, ts);
     }
   }
 
@@ -147,7 +206,29 @@ export class Book {
     this.ts = ts;
     if (!isSide(side)) throw new Error(`unknown side ${side}`);
     if (kind !== 'asks' && kind !== 'bids') throw new Error(`unknown ladder ${kind}`);
-    this.ladders[side][kind].apply(px, size);
+    this.ladders[side][kind].apply(px, size, ts);
+  }
+
+  /**
+   * Apply an unthrottled top-of-book bound: the venue says nothing better than
+   * this rests on either ladder right now.
+   *
+   * DELETES ONLY. `bid` and `ask` are prices with no size behind them, so they
+   * can shrink the book and never grow it.
+   *
+   * 0 and 1 need no special case. `bid = 0` is how the venue writes "no bid",
+   * and deleting every bid strictly better than 0 deletes all of them, which is
+   * exactly what it means. Its complement is `ask = 1` on the other token of the
+   * same market, since UP + DOWN = 1 — measured as an exact pairing in the
+   * archive, count for count.
+   *
+   * @returns {number} levels removed, for the caller that reports it
+   */
+  bbo(ts, side, bid, ask) {
+    this.ts = ts;
+    if (!isSide(side)) throw new Error(`unknown side ${side}`);
+    const l = this.ladders[side];
+    return l.asks.prune(ask, ts) + l.bids.prune(bid, ts);
   }
 
   /**

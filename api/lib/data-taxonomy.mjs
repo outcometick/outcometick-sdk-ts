@@ -19,6 +19,7 @@ export const DATASETS = {
   twap30s: 'TWAP 30s settlement stream — settled 5-minute markets before they moved to the 60s lookback; still archived daily',
   twap60s: 'TWAP 60s settlement stream — settles both 5-minute and 15-minute markets',
   book: 'Full-depth order-book snapshots',
+  best_bid_ask: 'Top of book, unthrottled — the same best bid/ask price_change carries, at every update rather than the capture cadence; prices only, no sizes, so depth still needs book or price_change',
   price_change: 'Order-book deltas with best bid/ask',
   last_trade_price: 'Every trade print',
   markets: 'Per-market metadata, strike and settlement outcome',
@@ -59,13 +60,35 @@ export function classifyPath(filePath) {
       return { venue, dataset: 'klines', asset: assetOf(segs[3]), interval: num(segs[4]), ext };
     }
     if (ds === 'orderbook') {
-      // BTC-5M / BTC-15M / MARKET-<id>
-      const m = /^([A-Za-z]+)-(\d+[mMhHdD]|DAILY)$/.exec(segs[3] ?? '');
+      // BTC-5M / BTC-15M / BTC-HOURLY / BTC-DAILY / BTC-OTHER / MARKET-<id>
+      //
+      // Predict names its hourly and daily series by word rather than by
+      // duration. Both are mapped onto the vocabulary every other dataset
+      // already uses, because the alternative cost customers real data twice
+      // over:
+      //
+      //   HOURLY matched neither branch of the earlier pattern, so the whole
+      //   series classified to interval:null. `interval=1h` returned an empty
+      //   list — no error, just nothing — while the files sat in the archive,
+      //   and /v1/meta never named the value at all, so a customer building an
+      //   enumeration from it could not learn the data existed.
+      //
+      //   DAILY did match, but produced `daily`: a value no duration parser
+      //   accepts, that sorts after 1mo because sortIntervals cannot read it,
+      //   and that shares one array with the klines' own `1d` while meaning
+      //   the same span.
+      //
+      // The list stays a whitelist. Widening the second group to \w+ would
+      // turn BTC-OTHER into interval:'other' — inventing a period for the
+      // series that exists precisely because its period is unknown.
+      const BY_WORD = { HOURLY: '1h', DAILY: '1d' };
+      const m = /^([A-Za-z]+)-(\d+[mMhHdD]|HOURLY|DAILY)$/.exec(segs[3] ?? '');
+      const period = m?.[2];
       return {
         venue,
         dataset: 'orderbook',
         asset: assetOf(m?.[1] ?? segs[3]),
-        interval: m ? m[2].toLowerCase() : null,
+        interval: period ? (BY_WORD[period.toUpperCase()] ?? period.toLowerCase()) : null,
         ext,
       };
     }

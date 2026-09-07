@@ -429,7 +429,13 @@ def replay_market(*, market: dict, events: list, strategy, hooks: dict,
         state["now"] = ts
 
         if ev.get("kind") == "book":
-            if ev.get("snapshot"):
+            # BEFORE the snapshot test, because a bound carries snapshot:false
+            # and would otherwise be applied as a delta with no ladder, no price
+            # and no size — which Book.delta rejects by raising, taking the whole
+            # run with it. MUST MATCH the same ordering in runner/engine/replay.mjs.
+            if ev.get("bbo"):
+                book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"))
+            elif ev.get("snapshot"):
                 book.snapshot(ts, ev.get("levels") or {})
             else:
                 book.delta(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
@@ -441,7 +447,11 @@ def replay_market(*, market: dict, events: list, strategy, hooks: dict,
             # comment in replay.mjs.
             state["history"].append(Rec(ev))
 
-        hook = HOOK_FOR.get(ev.get("kind"))
+        # A bound refines the book silently and never reaches a hook — the event
+        # has no levels/ladder/px/size, the stream is unthrottled, and ctx.book()
+        # is live so the next real event already sees the refined ladder. Full
+        # reasoning in replay.mjs; both engines or neither.
+        hook = None if ev.get("bbo") else HOOK_FOR.get(ev.get("kind"))
         if hook and hooks.get(hook):
             emit(call(hook, ev_rec), ts)
 

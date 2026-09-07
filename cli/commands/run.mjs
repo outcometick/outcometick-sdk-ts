@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { LANGUAGES, HOOK_NAMES, LIMITS } from '../../api/lib/backtest-contract.mjs';
 import { CHANNEL, EXIT, parseTrade, parseFill, parseResult, parseOutputLine } from '../../runner/harness/protocol.mjs';
 import {
-  countMarketDays, countStreams, buildCoverage, mergeReferenceRows, makeBookThrottle,
+  countMarketDays, countStreams, buildCoverage, bboCoverage, mergeReferenceRows, makeBookThrottle,
   sortMarketsForReplay,
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
@@ -220,6 +220,7 @@ export async function cmdRun({ dir, flags }) {
   // been covered while agreeing about everything else. That is the harder
   // discrepancy to notice, because the report looks complete.
   const missing = [];
+  const bboApplied = new Map();  // day -> Set('<ASSET>|<interval>')
   for (const day of days) {
     const loaded = await loadLocalDay({
       root: dataRoot, day, venue,
@@ -236,6 +237,13 @@ export async function cmdRun({ dir, flags }) {
         to: days[days.length - 1],
       }),
     });
+    // Measured from EVENTS, keyed by market-day — the same fact the queue
+    // records, produced by the same decoder. See fetchDay's bboKeys.
+    if (loaded.bboKeys?.length) {
+      const acc = bboApplied.get(day) ?? new Set();
+      for (const k of loaded.bboKeys) acc.add(k);
+      bboApplied.set(day, acc);
+    }
     if (loaded.markets.length === 0) {
       process.stderr.write(`  ${day}: ${loaded.reason}\n`);
       missing.push({
@@ -440,6 +448,7 @@ export async function cmdRun({ dir, flags }) {
         referenceDeclared: [],
         streams: countStreams([...marketMeta.values()]),
         droppedRows: base.malformed ?? 0,
+        ...bboCoverage({ venue, datasets: manifest.datasets, markets, applied: bboApplied }),
         local: true,
         source: path.resolve(dataRoot),
       }),

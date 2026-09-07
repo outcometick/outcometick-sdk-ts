@@ -20,7 +20,7 @@ import path from 'node:path';
 
 import { classifyPath } from '../api/lib/data-taxonomy.mjs';
 import {
-  archiveDatasetsFor, fileMatchesRun, normalizeIntervals, settlementPathsFor, orderedFeed,
+  archiveDatasetsForDay, fileMatchesRun, normalizeIntervals, settlementPathsFor, orderedFeed,
 } from '../api/lib/backtest-datasets.mjs';
 import {
   indexMarkets, eventsFromRow, finaliseMarket, parseRow, buildSlugIndex, marketUnusable,
@@ -115,7 +115,10 @@ export function dayOfPath(rel) {
  * the harness identically.
  */
 export async function loadLocalDay({ root, day, venue, assets, datasets, intervals, throttle = null }) {
-  const archiveDatasets = archiveDatasetsFor({ datasets, venue, from: day, to: day });
+  // Day-scoped, and degrading datasets gated by their capture window — the
+  // same call the queue makes, because `ot run` and the worker have drifted
+  // apart nine times and every one of them was a rule computed twice.
+  const archiveDatasets = archiveDatasetsForDay({ datasets, venue, day, from: day, to: day });
   // Same normalisation, same default, same two filters as the queue. `ot run`
   // promises the identical files and checksums; an interval narrowing applied
   // on one side only would break that on the very first 15m market.
@@ -160,11 +163,18 @@ export async function loadLocalDay({ root, day, venue, assets, datasets, interva
     all.filter((rel) => dayOfPath(rel) === day), { venue, assets, already: wanted })]);
 
   const byMarket = new Map();
+  const bboSeen = new Set();  // '<ASSET>|<interval>' that produced a usable bound
   for (const rel of feed) {
     if (classifyPath(rel).dataset === 'markets') continue;
     for await (const row of readRows(root, rel)) {
       for (const [id, ev] of eventsFromRow(rel, row, markets, bySlug, throttle)) {
         if (!markets.has(id)) continue;
+        // Same fact, same source as the queue: an EVENT, not a file. See
+        // fetchDay's bboKeys.
+        if (ev.bbo) {
+          const mk = markets.get(id);
+          if (mk?.asset) bboSeen.add(`${String(mk.asset).toUpperCase()}|${mk.interval ?? 'none'}`);
+        }
         let list = byMarket.get(id);
         if (!list) { list = []; byMarket.set(id, list); }
         list.push(ev);
@@ -217,6 +227,11 @@ export async function loadLocalDay({ root, day, venue, assets, datasets, interva
     // one promise `ot run` makes: the identical files from the identical
     // archive.
     markets: sortMarketsForReplay(out),
+    // Every file this day was actually read from, the same field the queue
+    // records — coverage states which days really read the top-of-book stream,
+    // and it has to answer that the same way on both sides.
+    inputs: feed,
+    bboKeys: [...bboSeen].sort(),
     unusable,
     reason: out.length === 0 && unusable.length
       ? `${unusable.length} market(s) unusable: ${unusable[0].why}`

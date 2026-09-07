@@ -849,3 +849,40 @@ test('the budget floor outlasts a strategy warming up', async () => {
   for (let i = 0; i < 50; i += 1) tiny.record(9000);
   assert.equal(tiny.breached, false, 'fifty events is not a verdict');
 });
+
+// ---------------------------------------------------------------------------
+// The unthrottled top-of-book bound refines the book WITHOUT waking anyone.
+//
+// Its own test rather than a conformance case: the cross-engine suite can only
+// prove the two engines agree, and both firing the hook is a way for them to
+// agree and both be wrong — which is exactly what the mutation that leaks it in
+// both engines does.
+test('a bound refines the book but never reaches a hook', () => {
+  const seen = [];
+  const strategy = {
+    on_market_open() {},
+    on_book(ctx, e) { seen.push(e); },
+    on_tick(ctx, t) { seen.push(['tick', t.ts_ms, ctx.book().best('UP')]); },
+  };
+  replayMarket({
+    market: MARKET,
+    events: [
+      // A real snapshot: this one SHOULD wake on_book.
+      snap(1000, { asks: [[0.44, 10], [0.45, 20]], bids: [[0.40, 10]] },
+        { asks: [[0.56, 10]], bids: [[0.55, 10]] }),
+      // A bound: prunes 0.44 and must stay silent.
+      { kind: 'book', ts_ms: 2000, snapshot: false, bbo: true, side: 'UP', bid: 0.40, ask: 0.45 },
+      tick(2001, 65000),
+    ],
+    strategy,
+    hooks: { on_market_open: 'on_market_open', on_book: 'on_book', on_tick: 'on_tick' },
+  });
+
+  const books = seen.filter((s) => !Array.isArray(s));
+  assert.equal(books.length, 1, 'exactly the real snapshot should have woken on_book');
+  assert.ok(books[0].levels, 'the event handed to on_book must be a real book event');
+  // And the refinement did happen — the strategy sees it through ctx.book(),
+  // which is live, on the next event it IS woken for.
+  const t = seen.find((s) => Array.isArray(s));
+  assert.deepEqual(t, ['tick', 2001, 0.45], 'the pruned ladder is what the next hook reads');
+});
