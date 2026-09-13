@@ -12,6 +12,13 @@
 
 export type Side = 'UP' | 'DOWN';
 
+/**
+ * How a market settled. `'TIE'` is a 50:50 settlement — Predict.fun resolves
+ * an end price equal to the start price this way, and every UP and DOWN
+ * contract pays $0.50.
+ */
+export type Outcome = Side | 'TIE';
+
 export declare const SIDES: readonly ['UP', 'DOWN'];
 
 /** One level of resting depth: [price, size]. */
@@ -129,7 +136,7 @@ export interface Ctx<P = Record<string, unknown>> {
    * one. Recorded for the cross-check panel, never enforced — a mismatch is
    * information, not a failed run.
    */
-  assert_outcome(market: unknown, outcome: Side): void;
+  assert_outcome(market: unknown, outcome: Outcome): void;
 }
 
 /**
@@ -207,7 +214,7 @@ export declare class Order {
  *     onTick(ctx: Ctx, tick: Tick): Order | null
  *     onBook(ctx: Ctx, book: BookView): Order | null
  *     onTrade(ctx: Ctx, trade: Tick): Order | null
- *     onSettle(ctx: Ctx, market: Market, outcome: Side): void
+ *     onSettle(ctx: Ctx, market: Market, outcome: Outcome): void
  */
 export declare class Strategy<P = Record<string, unknown>> {
   /** Params from the manifest, injected by the runner before the first hook. */

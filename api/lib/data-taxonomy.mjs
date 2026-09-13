@@ -21,12 +21,42 @@ export const DATASETS = {
   book: 'Full-depth order-book snapshots',
   best_bid_ask: 'Top of book, unthrottled — the same best bid/ask price_change carries, at every update rather than the capture cadence; prices only, no sizes, so depth still needs book or price_change',
   price_change: 'Order-book deltas with best bid/ask',
-  last_trade_price: 'Every trade print',
+  last_trade_price: 'Trade prints, unthrottled',
   markets: 'Per-market metadata, strike and settlement outcome',
   tick_size_change: 'Tick-size changes',
   orderbook: 'Order-book snapshots (Predict.fun)',
-  klines: 'OHLCV candles derived from the settlement feed',
+  klines: 'OHLC candles derived from the settlement feed, with a tick count — no trade volume; the settlement feed is a price feed',
   other: 'Uncategorised',
+};
+
+/**
+ * The same descriptions in Chinese.
+ *
+ * HERE, not in the page that renders them. Two of these lines state the
+ * SETTLEMENT BASIS — which TWAP stream settles which market — and CLAUDE.md
+ * pins that fact to four places that must move together. A Chinese copy living
+ * in a component would be a fifth, and it would drift the way every other
+ * hand-copy in this repo has: the basis already moved once (5-minute markets
+ * settled on the 30s stream until 2026-08-07, on the 60s stream after), and an
+ * AI assistant quoted a stale copy of our coverage back to a customer.
+ *
+ * Sitting beside DATASETS means changing one entry puts the other on screen in
+ * the same diff. data-taxonomy.test.mjs asserts the key sets match, so a new
+ * dataset cannot land with only one language.
+ */
+export const DATASETS_ZH = {
+  prices: '结算价流，逐 tick（Chainlink 瞬时流）',
+  twap30s: 'TWAP 30 秒结算流——5 分钟市场改用 60 秒回看之前的结算线，至今仍逐日归档',
+  twap60s: 'TWAP 60 秒结算流——5 分钟与 15 分钟市场都判定在它上面',
+  book: '全深度盘口快照',
+  best_bid_ask: '盘口顶部，未抽稀——与 price_change 携带的是同一个最优买卖价，但每次更新都出一行，而不是按采集节奏；只有价格没有挂单量，深度仍需 book 或 price_change',
+  price_change: '盘口增量，带最优买卖价',
+  last_trade_price: '成交流，未抽稀',
+  markets: '每个市场的元数据、strike 与结算结果',
+  tick_size_change: '最小变动价位的变更',
+  orderbook: '盘口快照（Predict.fun）',
+  klines: '由结算价流推导的 OHLC K 线，带 tick 计数——没有成交量，结算流是价格流不是成交流',
+  other: '未归类',
 };
 
 const num = (s) => (s == null ? null : s);

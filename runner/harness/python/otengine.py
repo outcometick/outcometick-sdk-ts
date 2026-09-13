@@ -321,7 +321,14 @@ def match_order(book: Book, order: dict) -> dict:
     }
 
 
-def contract_value(side: str, outcome: str) -> int:
+OUTCOME_TIE = "TIE"
+
+
+def contract_value(side: str, outcome: str) -> float:
+    # A tie settles 50:50: both outcome tokens pay half a dollar. MUST MATCH
+    # portfolio.mjs `contractValue`.
+    if outcome == OUTCOME_TIE:
+        return 0.5
     return 1 if outcome == side else 0
 
 

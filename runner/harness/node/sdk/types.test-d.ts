@@ -10,7 +10,7 @@
 // sdk-types.test.mjs is what stops that drift being silent.
 
 import { Strategy, Order, SIDES } from './index.js';
-import type { Ctx, Tick, Market, BookView, Side, Level, Position } from './index.js';
+import type { Ctx, Tick, Market, BookView, Side, Level, Position, Outcome } from './index.js';
 
 interface Params {
   entry_z: number;
@@ -55,7 +55,7 @@ export default class MeanReversion extends Strategy<Params> {
     return new Order({ side, size: ctx.p.size, limit: best, tag: 'entry' });
   }
 
-  onSettle(ctx: Ctx<Params>, market: Market, outcome: Side): void {
+  onSettle(ctx: Ctx<Params>, market: Market, outcome: Outcome): void {
     ctx.assert_outcome(market, outcome);
   }
 }

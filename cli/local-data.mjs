@@ -4,7 +4,7 @@
 // R2. Both go through runner/events.mjs for the row -> event mapping, because
 // the docs make a promise about exactly this pair:
 //
-//     The identical files, same checksums, same coverage report. A backtest
+//     The identical files, byte for byte, with the same checksums. A backtest
 //     here and a backtest on your own machine after subscribing read the same
 //     bytes — that is the point of offering it.
 //

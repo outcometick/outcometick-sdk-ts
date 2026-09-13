@@ -6,6 +6,7 @@
 // untrusted output — the container is the boundary, not the harness.
 //
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { OUTCOMES } from '../engine/portfolio.mjs';
 
 // This is also the reason the REPORT is not computed inside. Metrics,
 // calibration, latency and slippage are all derived outside, in one shared
@@ -159,7 +160,7 @@ export function parseTrade(raw) {
     opened_ms: finite(raw.opened_ms) ? raw.opened_ms : null,
     closed_ms: finite(raw.closed_ms) ? raw.closed_ms : null,
     how: typeof raw.how === 'string' ? raw.how : 'exit',
-    outcome: raw.outcome === 'UP' || raw.outcome === 'DOWN' ? raw.outcome : undefined,
+    outcome: OUTCOMES.includes(raw.outcome) ? raw.outcome : undefined,
   };
 }
 
@@ -232,7 +233,7 @@ export function parseResult(raw) {
       market_id: typeof m.market_id === 'string' ? m.market_id : null,
       asset: typeof m.asset === 'string' ? m.asset : null,
       interval: typeof m.interval === 'string' ? m.interval : null,
-      outcome: m.outcome === 'UP' || m.outcome === 'DOWN' ? m.outcome : null,
+      outcome: OUTCOMES.includes(m.outcome) ? m.outcome : null,
       up_px: finite(m.up_px) ? m.up_px : null,
       down_px: finite(m.down_px) ? m.down_px : null,
       stream: typeof m.stream === 'string' ? m.stream : null,

@@ -659,3 +659,15 @@ test('a market with no opening time keeps the id, without a leading space', asyn
   assert.match(r.logs, /^0xm1 /m, 'a missing opening time left a leading space');
   assert.doesNotMatch(r.logs, /^ /m);
 });
+
+// A 50:50 settlement is a real outcome. Narrowing it to undefined here would
+// silently strip it from every trade row and market summary the worker reads.
+test('a TIE outcome survives the protocol parse, and nonsense does not', () => {
+  const row = { market_id: '0xm1', side: 'UP', size: 1, pnl: 0, entry_px: 0.5, exit_px: 0.5, how: 'settled' };
+  assert.equal(parseTrade({ ...row, outcome: 'TIE' }).outcome, 'TIE');
+  assert.equal(parseTrade({ ...row, outcome: 'MAYBE' }).outcome, undefined);
+  const r = parseResult({
+    market_summaries: [{ market_id: '0xm1', outcome: 'TIE' }, { market_id: '0xm2', outcome: 'X' }],
+  });
+  assert.deepEqual(r.marketSummaries.map((m) => m.outcome), ['TIE', null]);
+});

@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.6.4';
+export const SDK_VERSION = '1.6.5';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -60,7 +60,7 @@ export const SDK_VERSION = '1.6.4';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.15.0';
+export const SANDBOX_IMAGE_TAG = '1.16.0';
 
 // ---------------------------------------------------------------------------
 // Languages
@@ -293,6 +293,24 @@ const BOOK_CAPTURE = Object.freeze({
     Object.freeze({ from: '2026-08-25', defaultMs: 0, perAsset: Object.freeze({}) }),
   ]),
 });
+
+/**
+ * The days the book cadence changed, oldest first.
+ *
+ * Exported for the prewarm, which has to warm one shape PER CADENCE TIER: the
+ * cadence is chosen from a run's date RANGE, so a range that stops short of a
+ * change and one that crosses it are two different cache entries for the same
+ * day. Warming a single range therefore covers exactly one tier and silently
+ * misses the others — which is what happened between 2026-08-25 and
+ * 2026-09-07, when the prewarm warmed the whole sellable span (500ms) while
+ * every run over recent days wanted 20ms.
+ *
+ * Derived from the table above rather than restated, so a new cadence entry
+ * grows the warm set without anyone remembering to come here.
+ */
+export function bookCadenceChangeDays(venue) {
+  return (BOOK_CAPTURE[venue] ?? []).map((e) => e.from);
+}
 
 /**
  * The cadence ONE ASSET replays at within a run: the COARSEST its date range

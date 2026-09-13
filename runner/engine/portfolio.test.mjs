@@ -179,6 +179,28 @@ test('a losing side settles at zero and loses the whole stake', () => {
   near(p.cash, -250);
 });
 
+test('a tie settles 50:50 — both sides at half a dollar a contract', () => {
+  assert.equal(contractValue('UP', 'TIE'), 0.5);
+  assert.equal(contractValue('DOWN', 'TIE'), 0.5);
+
+  const p = new Portfolio();
+  const b = mkBook();
+  p.execute({ book: b, ts: 1, marketId: '0xm', order: { side: 'UP', size: 500, limit: 0.55 } });
+  const [t] = p.settle('0xm', 'TIE', 9999);
+  near(t.pnl, 500 * (0.5 - 0.50));
+  near(t.exit_px, 0.5);
+  assert.equal(t.outcome, 'TIE');
+  assert.equal(t.how, 'settled');
+  near(p.cash, 0);
+
+  // Both legs of a hedge pay out: 100 pairs bought at 0.50 + 0.51, received 1.00.
+  const h = new Portfolio();
+  h.execute({ book: b, ts: 1, marketId: '0xm', order: { side: 'UP', size: 100, limit: 1 } });
+  h.execute({ book: b, ts: 1, marketId: '0xm', order: { side: 'DOWN', size: 100, limit: 1 } });
+  assert.equal(h.settle('0xm', 'TIE', 9999).length, 2);
+  near(h.cash, 100 * (1 - 0.50 - 0.51));
+});
+
 test('settling with nothing open produces no trade row', () => {
   const p = new Portfolio();
   assert.deepEqual(p.settle('0xm', 'UP', 1), []);

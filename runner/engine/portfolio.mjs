@@ -12,8 +12,24 @@
 
 import { matchOrder, isSide } from './book.mjs';
 
-/** Settlement value of one contract, given the official outcome. */
-export const contractValue = (side, outcome) => (outcome === side ? 1 : 0);
+/**
+ * A market that settled 50:50. Predict.fun resolves end_price == start_price
+ * this way: both outcome tokens pay half a dollar.
+ */
+export const OUTCOME_TIE = 'TIE';
+
+/** Every official outcome a market can settle on. */
+export const OUTCOMES = Object.freeze(['UP', 'DOWN', OUTCOME_TIE]);
+
+/**
+ * Settlement value of one contract, given the official outcome.
+ *
+ * MUST MATCH otengine.py `contract_value`, and `scripts/audit-report.py`.
+ */
+export const contractValue = (side, outcome) => {
+  if (outcome === OUTCOME_TIE) return 0.5;
+  return outcome === side ? 1 : 0;
+};
 
 const EPS = 1e-9;
 

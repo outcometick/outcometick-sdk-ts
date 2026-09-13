@@ -6,7 +6,7 @@
 //
 // The lesson this is applying is the one runner/conformance already enforces
 // for the two engines: two implementations of the same rules drift, and the
-// drift is silent. "The identical files, same checksums, same coverage report"
+// drift is silent. "The identical files, byte for byte, with the same checksums"
 // is a published promise about `ot run` versus a queued run — it cannot be true
 // if local and remote decode the archive differently.
 
@@ -14,6 +14,7 @@ import { classifyPath } from '../api/lib/data-taxonomy.mjs';
 import { resolveSettlementStream, degradingCoverage, inputKeys } from '../api/lib/backtest-datasets.mjs';
 import { bookThrottleMs } from '../api/lib/backtest-contract.mjs';
 import { Book } from './engine/book.mjs';
+import { OUTCOME_TIE, OUTCOMES } from './engine/portfolio.mjs';
 
 /**
  * Coerce a field to a number, or null.
@@ -146,16 +147,33 @@ function predictRecord(row) {
   const closeMs = num(row.end_sec) == null ? null : num(row.end_sec) * 1000;
   const start = num(row.start_price);
   const end = num(row.end_price);
-  // RESOLVED is the venue's own word for "this is final". An OPEN market has no
-  // outcome even if both prices are present — they are live quotes then, not a
-  // settlement, and treating them as one would hand a strategy the answer.
-  // Same rule, and the same reason: only a RESOLVED market with two readable
-  // prices has an outcome. A tie is not a guess either — the venue settles it
-  // one way and we do not know which, so the market-day is dropped.
-  const outcome = String(row.status).toUpperCase() === 'RESOLVED'
-    && start != null && end != null && end !== start
-    ? (end > start ? 'UP' : 'DOWN')
-    : null;
+  // `end_price` is the settlement marker, NOT `status`.
+  //
+  // This used to require status === 'RESOLVED', on the theory that an OPEN
+  // market's prices are live quotes rather than a settlement. Both halves were
+  // wrong. `end_price` is written only by the settlement backfill, which is
+  // driven by `end_price IS NULL` and drops a market from its re-read queue the
+  // moment it lands — so `status` is whatever the venue last said while we were
+  // still polling, and it freezes there. There is no row in the whole table
+  // with status RESOLVED and no end_price, so the implication runs one way
+  // only: end_price present ⇒ settled.
+  //
+  // MEASURED 2026-09-08, all assets: 1245 markets, every one of them with an
+  // end_price, but only 1104 said RESOLVED. The check discarded 39/873 of the
+  // 5-minute markets (4.5%) and 21/291 of the 15-minute ones (7.2%) — reported
+  // to the customer as "outcome could not be read" while the outcome was right
+  // there, and billed for, because a market-day charges whole.
+  //
+  // A TIE IS ITS OWN OUTCOME. Predict.fun settles end_price == start_price
+  // 50:50 — every UP and every DOWN contract pays $0.50 (`contractValue`).
+  // It used to be dropped because the engines only knew UP/DOWN, which cost the
+  // customer 0.53–1.20% of the 5-minute markets they paid for, reported as
+  // "outcome could not be read". Never "fix" a tie by picking a side: half of
+  // them would be scored backwards.
+  let outcome = null;
+  if (start != null && end != null) {
+    outcome = end > start ? 'UP' : end < start ? 'DOWN' : OUTCOME_TIE;
+  }
   return {
     market_id: String(row.market_id ?? row.condition_id ?? ''),
     slug: row.category_slug ?? null,
@@ -582,7 +600,7 @@ export function buildSlugIndex(markets) {
  * The coverage block, in ONE shape.
  *
  * The docs promise a local run and a queued run produce "the identical files,
- * same checksums, same coverage report". They already shared the decoder and
+ * byte for byte, with the same checksums". They already shared the decoder and
  * the feed list; the coverage object was still built twice, so `ot run` emitted
  * five keys where the queue emitted ten, and anyone diffing the two saw a
  * schema difference rather than an answer. A field a local run genuinely cannot
@@ -834,7 +852,7 @@ export function marketUnusable(market, inWindow) {
   // nothing to merge — replayed it out of the cache anyway.
   if (!market.asset) return 'market has no asset';
   if (market.stream == null) return 'settlement stream could not be resolved';
-  if (market.outcome !== 'UP' && market.outcome !== 'DOWN') {
+  if (!OUTCOMES.includes(market.outcome)) {
     return 'outcome could not be read';
   }
   if (!inWindow || inWindow.length === 0) return 'no events inside the market window';

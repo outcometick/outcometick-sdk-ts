@@ -210,6 +210,25 @@ test('the favourite is the side the market thinks will win', () => {
   assert.equal(lost.always_favourite, -0.70);
 });
 
+// A 50:50 settlement pays 0.5 on both sides, so it scores as 0.5 everywhere a
+// won/lost 1/0 used to go — never as a win or a loss.
+test('a TIE scores 0.5 in edge, brier, calibration and every baseline', () => {
+  const tie = (px) => ({
+    market_id: '0xa', side: 'UP', size: 100, entry_px: px, exit_px: 0.5,
+    pnl: (0.5 - px) * 100, fees: 0, opened_ms: day(1) - 60_000, closed_ms: day(1),
+    how: 'settled', outcome: 'TIE',
+  });
+  assert.equal(Number(edgePerContract([tie(0.4)]).toFixed(4)), 0.1);
+  assert.equal(Number(brier([tie(0.9)]).toFixed(4)), 0.16);
+  const [row] = calibration([tie(0.45), settled({ px: 0.45, won: true, d: 2 })]);
+  assert.equal(row.realized, 0.75);
+
+  const b = baselines([{ outcome: 'TIE', up_px: 0.70, down_px: 0.32 }], { size: 1 });
+  assert.equal(b.always_up, -0.20);
+  assert.equal(b.always_down, 0.18);
+  assert.equal(b.always_favourite, -0.20);
+});
+
 test('markets with no outcome are skipped rather than counted as losses', () => {
   const b = baselines([{ outcome: null, up_px: 0.4, down_px: 0.6 }]);
   assert.equal(b.always_up, 0);

@@ -8,6 +8,8 @@
 // Nothing in this module can see the strategy. It reads the trade and fill logs
 // the engine produced, so a report cannot be tuned by the thing it is judging.
 
+import { contractValue } from './portfolio.mjs';
+
 /** Entry-price buckets for the calibration panel. */
 export const CALIBRATION_BUCKETS = Object.freeze([
   [0.0, 0.1], [0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5],
@@ -181,10 +183,11 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
 /**
  * Mean realised edge per contract, in dollars.
  *
- * A binary token bought at p is worth 1 if its side settles and 0 otherwise, so
- * the edge on one contract is (outcome - p). Only settled trades carry an
- * outcome; a trade closed early is edge against the market, not against the
- * truth, and is excluded rather than scored as if it had settled.
+ * A binary token bought at p is worth 1 if its side settles and 0 otherwise
+ * (0.5 on a TIE — `contractValue`), so the edge on one contract is
+ * (outcome - p). Only settled trades carry an outcome; a trade closed early is
+ * edge against the market, not against the truth, and is excluded rather than
+ * scored as if it had settled.
  */
 export function edgePerContract(trades) {
   const settled = trades.filter((t) => t.how === 'settled' && t.entry_px != null && t.outcome);
@@ -192,8 +195,7 @@ export function edgePerContract(trades) {
   let contracts = 0;
   let edge = 0;
   for (const t of settled) {
-    const won = t.outcome === t.side ? 1 : 0;
-    edge += (won - t.entry_px) * t.size;
+    edge += (contractValue(t.side, t.outcome) - t.entry_px) * t.size;
     contracts += t.size;
   }
   return contracts > 0 ? edge / contracts : 0;
@@ -207,8 +209,7 @@ export function brier(trades) {
   const settled = trades.filter((t) => t.how === 'settled' && t.entry_px != null && t.outcome);
   if (!settled.length) return null;
   return mean(settled.map((t) => {
-    const won = t.outcome === t.side ? 1 : 0;
-    return (t.entry_px - won) ** 2;
+    return (t.entry_px - contractValue(t.side, t.outcome)) ** 2;
   }));
 }
 
@@ -268,7 +269,7 @@ export function calibration(trades) {
     const inBucket = settled.filter((t) => t.entry_px >= lo && t.entry_px < hi);
     if (!inBucket.length) return null;
     const implied = mean(inBucket.map((t) => t.entry_px));
-    const realized = mean(inBucket.map((t) => (t.outcome === t.side ? 1 : 0)));
+    const realized = mean(inBucket.map((t) => contractValue(t.side, t.outcome)));
     return {
       bucket: `${lo.toFixed(2)}-${hi.toFixed(2)}`,
       lo,
@@ -298,8 +299,8 @@ export function baselines(marketSummaries, { size = 1 } = {}) {
   const out = { always_up: 0, always_down: 0, always_favourite: 0 };
   for (const m of marketSummaries) {
     if (!m.outcome || m.up_px == null || m.down_px == null) continue;
-    out.always_up += ((m.outcome === 'UP' ? 1 : 0) - m.up_px) * size;
-    out.always_down += ((m.outcome === 'DOWN' ? 1 : 0) - m.down_px) * size;
+    out.always_up += (contractValue('UP', m.outcome) - m.up_px) * size;
+    out.always_down += (contractValue('DOWN', m.outcome) - m.down_px) * size;
     // The favourite is the side the market thinks is MORE likely, and on a
     // binary market the price IS the implied probability — so it is the DEARER
     // side, not the cheaper one. This was inverted: the panel labelled "always
@@ -307,7 +308,7 @@ export function baselines(marketSummaries, { size = 1 } = {}) {
     // handed customers a backwards comparison to judge their strategy against.
     const favSide = m.up_px >= m.down_px ? 'UP' : 'DOWN';
     const favPx = Math.max(m.up_px, m.down_px);
-    out.always_favourite += ((m.outcome === favSide ? 1 : 0) - favPx) * size;
+    out.always_favourite += (contractValue(favSide, m.outcome) - favPx) * size;
   }
   return {
     always_up: r2(out.always_up),
