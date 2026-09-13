@@ -95,6 +95,16 @@ const MUST_NOT_COMPILE = [
     import type { Market } from './sdk/index.js';
     export function f(m: Market): string { return m.outcome; }
   `],
+  // on_book gets the CHANGE, not the book. Declaring it as a BookView made
+  // `event.best()` type-check, and it throws on the first book event.
+  ['reading the book off a book event, which carries only the change', `
+    import type { BookEvent } from './sdk/index.js';
+    export function f(e: BookEvent) { return e.best('UP'); }
+  `],
+  ['treating a trade print as a settlement tick', `
+    import type { TradeEvent } from './sdk/index.js';
+    export function f(t: TradeEvent): number { return t.value; }
+  `],
   ['a hook returning something that is not an Order', `
     import type { Ctx, Tick } from './sdk/index.js';
     import { Order } from './sdk/index.js';
@@ -136,4 +146,72 @@ test('every runtime export is declared, and every declared value exists', async 
   assert.ok(sdk.default, 'index.mjs has no default export');
   assert.deepEqual(Object.keys(sdk.default).sort(), runtime);
   assert.match(dts, /export default/, 'index.d.ts declares no default export');
+});
+
+// The declarations against what the decoder REALLY hands a hook.
+//
+// on_book was declared as receiving a BookView while every engine passed the
+// raw event, so `event.best()` type-checked and threw on the first book row.
+// Hand-written fixtures would only prove the declarations agree with
+// themselves; these events come out of runner/events.mjs, and each one is
+// assigned as an object literal under `strict`, so a field the runtime sends
+// that the type lacks, or a required field it does not send, is a compile error.
+test('real decoded events type-check against Tick, BookEvent and TradeEvent', async () => {
+  const { eventsFromRow, buildSlugIndex, indexMarkets } = await import('../../events.mjs');
+  const UP = '38293413631092421766722553077150584523582731647519935429040512234425496259883';
+  const DOWN = '73242593869086725011786596522214389181524388147217527609156532700137054617370';
+  const slug = 'btc-updown-15m-1787184000';
+  const pm = indexMarkets([{
+    slug, asset: 'btc', interval_sec: 900,
+    condition_id: '0x7985322c3a51af1ac5fe83cf1819cc6ae53bc4bffbe1bb581e6f5de75f58fbb3',
+    token_ids: [UP, DOWN], start_sec: 1787184000, end_sec: 1787184900, resolved: true,
+    outcome_prices: ['1', '0'], strike_value: '69291621054540903612416',
+    raw: { cryptoMarketConfig: { twapLookbackSeconds: 60 } },
+  }]);
+  const pd = indexMarkets([{
+    category_slug: 'btc-updown-15m-1787184000', asset: 'btc', interval_label: '15m',
+    market_id: 1506747, price_feed_id: 1, start_sec: 1787184000, end_sec: 1787184900,
+    start_price: '627.505', end_price: '628.265', status: 'RESOLVED',
+  }], { venue: 'predict' });
+  const one = (path, row, idx) => {
+    const out = eventsFromRow(path, row, idx, buildSlugIndex(idx));
+    assert.ok(out.length > 0, `fixture decoded to nothing for ${path}`);
+    return out[0][1];
+  };
+  const D = '2026-08-20';
+  const events = {
+    Tick: [
+      one(`data/chainlink-twap-60s/daily/prices/BTCUSD/BTCUSD-twap60s-prices-${D}.csv.gz`,
+        { feed_ts_ms: '1787184060000', value: '69300.5' }, pm),
+      one(`data/predict-fun/prices/BTCUSDT/BTCUSDT-feed1-predict-prices-${D}.csv.gz`,
+        { price_feed_id: '1', publish_time: '1787184060', server_ts: '1787184060100', price: '69300.5', recv_ms: '1787184060200' }, pd),
+    ],
+    BookEvent: [
+      one(`data/polymarket/daily/book/BTC-15m/BTC-15m-book-${D}.jsonl.gz`, {
+        slug, asset_id: UP, event_ts_ms: 1787184000311,
+        payload: { asks: [{ size: '10', price: '0.99' }], bids: [{ size: '10', price: '0.51' }] },
+      }, pm),
+      one(`data/polymarket/daily/price_change/BTC-15m/BTC-15m-price_change-${D}.jsonl.gz`, {
+        slug, event_ts_ms: 1787184000203,
+        payload: { price_changes: [{ side: 'BUY', size: '5', price: '0.31', asset_id: UP }] },
+      }, pm),
+      one(`data/predict-fun/orderbook/BTC-15M/BTC-15M-predict-orderbook-${D}.jsonl.gz`, {
+        market_id: 1506747, update_ts_ms: 1787184000630,
+        payload: { asks: [[0.61, 30.6]], bids: [[0.59, 55.261]] },
+      }, pd),
+    ],
+    TradeEvent: [
+      one(`data/polymarket/daily/last_trade_price/BTC-15m/BTC-15m-last_trade_price-${D}.jsonl.gz`, {
+        slug, asset_id: UP, event_ts_ms: 1787184000386,
+        payload: { side: 'BUY', size: '5', price: '0.52', asset_id: UP },
+      }, pm),
+    ],
+  };
+  const lines = [`import type { Tick, BookEvent, TradeEvent } from './sdk/index.js';`];
+  let i = 0;
+  for (const [type, list] of Object.entries(events)) {
+    for (const ev of list) lines.push(`export const e${i++}: ${type} = ${JSON.stringify(ev)};`);
+  }
+  const { ok, out } = await typecheck({ 'events.ts': lines.join('\n') });
+  assert.ok(ok, `a decoded event does not match its declared type:\n${out}\n${lines.join('\n')}`);
 });

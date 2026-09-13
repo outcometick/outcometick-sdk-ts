@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.6.5';
+export const SDK_VERSION = '1.6.6';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -60,7 +60,7 @@ export const SDK_VERSION = '1.6.5';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.16.0';
+export const SANDBOX_IMAGE_TAG = '1.17.0';
 
 // ---------------------------------------------------------------------------
 // Languages

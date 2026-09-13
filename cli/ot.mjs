@@ -32,9 +32,11 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
       import. Touches no data and costs nothing. This is the exact validator
       the queue runs.
 
-  ot run <dir> --data <archive> [--date <YYYY-MM-DD>] [--out <file>]
+  ot run <dir> --data <archive> [--date <YYYY-MM-DD>] [--venue polymarket|predict] [--out <file>]
       Replay locally against a cloned sample archive, using the same engine
       the queue uses. Writes a report archive.
+      --venue defaults to the venue the archive holds (polymarket if it holds
+      both or neither).
       Refused if the manifest declares a reference feed: those come from an
       archive held on the worker, so a local replay would hand your strategy
       empty ones. Your own CSV series work locally.

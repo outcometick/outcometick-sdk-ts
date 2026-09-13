@@ -250,6 +250,29 @@ export async function localDays(root) {
   return [...days].sort();
 }
 
+/** The venues a local archive holds data files for. */
+export async function archiveVenues(root) {
+  const venues = new Set();
+  for (const rel of await walk(root)) {
+    const meta = classifyPath(rel);
+    if (meta.dataset !== 'other') venues.add(meta.venue);
+  }
+  return venues;
+}
+
+/**
+ * The venue `ot run` replays when `--venue` is not given.
+ *
+ * The public samples are one venue per archive, and a polymarket read of the
+ * predict one sees no files at all — so the documented
+ * `ot run . --data ./predict-fun-data-samples` failed with "no files for <day>"
+ * and nothing pointed at the missing flag. Only an archive that holds predict
+ * and nothing else changes the default; everything else keeps polymarket.
+ */
+export function defaultVenue(venues) {
+  return venues.size === 1 && venues.has('predict') ? 'predict' : 'polymarket';
+}
+
 /** Does this look like a cloned sample archive at all? */
 export async function looksLikeArchive(root) {
   try {

@@ -439,3 +439,13 @@ test('--email really reaches the request body', async () => {
   assert.match(src, /\.\.\.\(flags\.email \? \{ email: flags\.email \} : \{\}\)/,
     'submit no longer forwards --email to the API');
 });
+
+test('ot run documents --venue and infers it from the archive when it is omitted', async () => {
+  // An undocumented flag is an absent one: without it a predict sample archive
+  // read as "no files for <day>" with nothing pointing at the fix.
+  const { stderr, stdout } = await ot(['help']);
+  assert.match(`${stdout}${stderr}`, /ot run <dir> --data <archive>[^\n]*--venue polymarket\|predict/);
+  const src = readFileSync(fileURLToPath(new URL('./commands/run.mjs', import.meta.url)), 'utf8');
+  assert.match(src, /const venue = flags\.venue \?\? defaultVenue\(await archiveVenues\(dataRoot\)\);/,
+    'ot run no longer asks the archive which venue it holds');
+});

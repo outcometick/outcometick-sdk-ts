@@ -10,7 +10,9 @@
 // sdk-types.test.mjs is what stops that drift being silent.
 
 import { Strategy, Order, SIDES } from './index.js';
-import type { Ctx, Tick, Market, BookView, Side, Level, Position, Outcome } from './index.js';
+import type {
+  Ctx, Tick, Market, BookView, Side, Level, Position, Outcome, BookEvent, TradeEvent, Ladders,
+} from './index.js';
 
 interface Params {
   entry_z: number;
@@ -30,6 +32,8 @@ export default class MeanReversion extends Strategy<Params> {
   }
 
   onTick(ctx: Ctx<Params>, tick: Tick): Order | null {
+    const market: string = tick.market_id;
+    ctx.log(market);
     const z: number = ctx.zscore(tick.value, { window: 180 });
     if (this.entered || Math.abs(z) < ctx.p.entry_z) return null;
 
@@ -53,6 +57,25 @@ export default class MeanReversion extends Strategy<Params> {
 
     this.entered = true;
     return new Order({ side, size: ctx.p.size, limit: best, tag: 'entry' });
+  }
+
+  // The event is the change; the book it produced comes from ctx.book().
+  onBook(ctx: Ctx<Params>, event: BookEvent): Order | null {
+    if (event.snapshot) {
+      const up: Ladders | undefined = event.levels.UP;
+      ctx.log(`snapshot at ${event.ts_ms}: ${up?.asks.length ?? 0} UP asks`);
+    } else {
+      const level: Level = [event.px, event.size];
+      ctx.log(`${event.side} ${event.ladder} ${level[0]} x ${level[1]}`);
+    }
+    const best: number | null = ctx.book().best('UP');
+    return best === null ? null : new Order({ side: 'UP', size: ctx.p.size, limit: best });
+  }
+
+  onTrade(ctx: Ctx<Params>, trade: TradeEvent): Order | null {
+    const notional: number = trade.px * trade.size;
+    ctx.log(`${trade.market_id} ${trade.side} ${trade.taker} ${notional}`);
+    return null;
   }
 
   onSettle(ctx: Ctx<Params>, market: Market, outcome: Outcome): void {

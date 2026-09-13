@@ -47,10 +47,65 @@ export interface BookView {
   mid(side: Side): number | null;
 }
 
-/** A settlement-stream observation. */
+/** A settlement-stream observation — what on_tick receives. */
 export interface Tick {
+  kind: 'tick';
   ts_ms: number;
+  market_id: string;
   value: number;
+  /** The settlement stream this row came from, e.g. `twap60s`. */
+  source?: string;
+  server_ts_ms?: number | null;
+  recv_ts_ms?: number | null;
+}
+
+/**
+ * The asks and bids of one outcome token, as the archive sent them. The order is
+ * not guaranteed (venues sort differently), so find the best price rather than
+ * taking element 0 — `ctx.book()` already does.
+ */
+export interface Ladders {
+  asks: Level[];
+  bids: Level[];
+}
+
+/**
+ * What on_book receives: the book CHANGE that was just applied, not the book.
+ *
+ * Read the book it produced through `ctx.book()`. The event carries no
+ * `market_id` — the hook only fires for the market being replayed. A snapshot
+ * replaces the ladders it names (Polymarket sends one side per row, so `levels`
+ * may hold only `side`); a delta sets one level, and size 0 removes it.
+ */
+export type BookEvent =
+  | {
+    kind: 'book';
+    ts_ms: number;
+    snapshot: true;
+    side?: Side;
+    levels: Partial<Record<Side, Ladders>>;
+  }
+  | {
+    kind: 'book';
+    ts_ms: number;
+    snapshot: false;
+    side: Side;
+    ladder: 'asks' | 'bids';
+    px: number;
+    size: number;
+  };
+
+/** What on_trade receives: one trade print in the archive. */
+export interface TradeEvent {
+  kind: 'trade';
+  ts_ms: number;
+  market_id: string;
+  px: number;
+  size: number;
+  /** Which outcome token traded. */
+  side: Side;
+  /** The taker's direction, separate from which outcome traded. */
+  taker: 'BUY' | 'SELL';
 }
 
 /**
@@ -212,8 +267,8 @@ export declare class Order {
  *
  *     onMarketOpen(ctx: Ctx, market: Market): void
  *     onTick(ctx: Ctx, tick: Tick): Order | null
- *     onBook(ctx: Ctx, book: BookView): Order | null
- *     onTrade(ctx: Ctx, trade: Tick): Order | null
+ *     onBook(ctx: Ctx, event: BookEvent): Order | null   // the book itself: ctx.book()
+ *     onTrade(ctx: Ctx, trade: TradeEvent): Order | null
  *     onSettle(ctx: Ctx, market: Market, outcome: Outcome): void
  */
 export declare class Strategy<P = Record<string, unknown>> {

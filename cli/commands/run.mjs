@@ -28,7 +28,9 @@ import { loadSeries } from '../../runner/series-data.mjs';
 import { buildReport } from '../../runner/engine/report.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
 import { createLineWriter } from '../../runner/stdin-writer.mjs';
-import { loadLocalDay, localDays, looksLikeArchive } from '../local-data.mjs';
+import {
+  loadLocalDay, localDays, looksLikeArchive, archiveVenues, defaultVenue,
+} from '../local-data.mjs';
 import { readSubmission, validate } from '../ot.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -209,7 +211,8 @@ export async function cmdRun({ dir, flags }) {
   );
   const seriesNames = Object.keys(seriesRows.rowsByName ?? {});
 
-  const venue = flags.venue ?? 'polymarket';
+  // Inferred from the archive when not given: see defaultVenue.
+  const venue = flags.venue ?? defaultVenue(await archiveVenues(dataRoot));
   const assets = (flags.assets ?? '').split(',').map((a) => a.trim().toUpperCase()).filter(Boolean);
 
   const markets = [];
