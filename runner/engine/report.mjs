@@ -78,8 +78,14 @@ function peakCapital(trades) {
 function holdingRatio(trades) {
   const withTimes = trades.filter((t) => t.opened_ms != null && t.closed_ms != null);
   if (withTimes.length === 0) return null;
-  const first = Math.min(...withTimes.map((t) => t.opened_ms));
-  const last = Math.max(...withTimes.map((t) => t.closed_ms));
+  // A loop, not Math.min(...rows): one argument per trade throws RangeError
+  // somewhere past ~100k, which is a normal trade count for a busy strategy.
+  let first = Infinity;
+  let last = -Infinity;
+  for (const t of withTimes) {
+    if (t.opened_ms < first) first = t.opened_ms;
+    if (t.closed_ms > last) last = t.closed_ms;
+  }
   const span = last - first;
   if (!(span > 0)) return null;
   // Union of the intervals, not their sum: two overlapping positions are one
@@ -213,6 +219,43 @@ export function brier(trades) {
   }));
 }
 
+/**
+ * The most equity points the report carries; the archive's equity.csv has all.
+ * report.json is stored in Postgres, served by the API and drawn by the page,
+ * so anything in it that grows with the trade count is a ceiling on how much a
+ * strategy may trade. 400k trades made a ~100MB curve on its own.
+ */
+export const EQUITY_MAX_POINTS = 2000;
+
+/** How many trades the report shows as a preview; trades.csv has all. */
+export const TRADES_HEAD = 20;
+
+/**
+ * Thin a curve to at most `max` points without hiding its extremes.
+ *
+ * Min and max of each bucket, in their original order, plus both ends. A plain
+ * stride would step over the trough and the drawn curve would show a smaller
+ * drawdown than the metric printed above it.
+ */
+export function downsampleEquity(points, max = EQUITY_MAX_POINTS) {
+  if (points.length <= max) return points;
+  const buckets = Math.floor((max - 2) / 2);
+  const inner = points.length - 2;
+  const keep = new Set([0, points.length - 1]);
+  for (let b = 0; b < buckets; b++) {
+    const lo = 1 + Math.floor((b * inner) / buckets);
+    const hi = 1 + Math.floor(((b + 1) * inner) / buckets);
+    let iMin = lo;
+    let iMax = lo;
+    for (let i = lo; i < hi; i++) {
+      if (points[i].equity < points[iMin].equity) iMin = i;
+      if (points[i].equity > points[iMax].equity) iMax = i;
+    }
+    if (hi > lo) { keep.add(iMin); keep.add(iMax); }
+  }
+  return [...keep].sort((a, b) => a - b).map((i) => points[i]);
+}
+
 /** Cumulative realised PnL, one point per closed trade. */
 export function equityCurve(trades) {
   const ordered = [...trades].sort((a, b) => (a.closed_ms ?? 0) - (b.closed_ms ?? 0));
@@ -324,41 +367,82 @@ export function baselines(marketSummaries, { size = 1 } = {}) {
  * is what it actually cost. The gap is the slippage, and the unfilled remainder
  * is the size the book never had.
  */
-export function slippage(fills) {
-  const attempted = fills.filter((f) => f.action === 'open');
-  if (!attempted.length) {
-    return {
-      fills_at_quote: null, partial_fills: null, unfilled: null,
-      median_slippage_cents: null, worst_1pct_slippage_cents: null, pnl_lost_to_slippage: null,
-      orders: 0,
-    };
-  }
-  const atQuote = attempted.filter((f) => f.filled > 0 && f.levels_walked === 1);
-  const walked = attempted.filter((f) => f.filled > 0 && f.levels_walked > 1);
-  const nothing = attempted.filter((f) => f.filled === 0);
-
-  const slips = attempted
-    .filter((f) => f.filled > 0 && f.quoted_px != null && f.avg_px != null)
-    .map((f) => (f.avg_px - f.quoted_px) * 100);
-  const sorted = [...slips].sort((a, b) => a - b);
-  const at = (q) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] : null);
-
-  const cost = sum(attempted
-    .filter((f) => f.filled > 0 && f.quoted_px != null && f.avg_px != null)
-    .map((f) => (f.avg_px - f.quoted_px) * f.filled));
-
+/**
+ * The slippage panel, fed one fill at a time.
+ *
+ * Streaming because the worker no longer holds the fill log in memory — it can
+ * be millions of rows, and the panel needs a handful of counters plus one
+ * number per filled order for the percentiles. `slippage(fills)` below is the
+ * same accumulator over an array, so there is one definition of the panel.
+ */
+export function slippageAccumulator() {
+  let orders = 0;
+  let atQuote = 0;
+  let walked = 0;
+  let nothing = 0;
+  let cost = 0;
+  let unfilledSize = 0;
+  let requestedSize = 0;
+  // Float64Array, grown by doubling and sorted in place: 8 bytes per filled
+  // order, off the V8 heap (so it does not compete with the trades for the
+  // heap limit), and no second copy for the sort. A plain array plus a sorted
+  // copy was the one per-fill cost left once the fills moved to disk.
+  let slips = new Float64Array(1024);
+  let n = 0;
   return {
-    orders: attempted.length,
-    fills_at_quote: r4(atQuote.length / attempted.length),
-    partial_fills: r4(walked.length / attempted.length),
-    unfilled: r4(nothing.length / attempted.length),
-    median_slippage_cents: r2(at(0.5)),
-    worst_1pct_slippage_cents: r2(at(0.99)),
-    // Negative: this is money the strategy did not keep.
-    pnl_lost_to_slippage: r2(-cost),
-    // Size the book never had, as a fraction of what was asked for.
-    unfilled_size_ratio: r4(sum(attempted.map((f) => f.unfilled)) / sum(attempted.map((f) => f.requested))),
+    add(f) {
+      if (f.action !== 'open') return;
+      orders += 1;
+      if (f.filled > 0 && f.levels_walked === 1) atQuote += 1;
+      if (f.filled > 0 && f.levels_walked > 1) walked += 1;
+      if (f.filled === 0) nothing += 1;
+      if (f.filled > 0 && f.quoted_px != null && f.avg_px != null) {
+        if (n === slips.length) {
+          const grown = new Float64Array(slips.length * 2);
+          grown.set(slips);
+          slips = grown;
+        }
+        slips[n++] = (f.avg_px - f.quoted_px) * 100;
+        cost += (f.avg_px - f.quoted_px) * f.filled;
+      }
+      unfilledSize += f.unfilled;
+      requestedSize += f.requested;
+    },
+    result() {
+      if (!orders) {
+        return {
+          fills_at_quote: null, partial_fills: null, unfilled: null,
+          median_slippage_cents: null, worst_1pct_slippage_cents: null, pnl_lost_to_slippage: null,
+          orders: 0,
+        };
+      }
+      const sorted = slips.subarray(0, n).sort();
+      const at = (q) => (n ? sorted[Math.min(n - 1, Math.floor(q * n))] : null);
+      return {
+        orders,
+        fills_at_quote: r4(atQuote / orders),
+        partial_fills: r4(walked / orders),
+        unfilled: r4(nothing / orders),
+        median_slippage_cents: r2(at(0.5)),
+        worst_1pct_slippage_cents: r2(at(0.99)),
+        // Negative: this is money the strategy did not keep.
+        pnl_lost_to_slippage: r2(-cost),
+        // Size the book never had, as a fraction of what was asked for.
+        unfilled_size_ratio: r4(unfilledSize / requestedSize),
+      };
+    },
   };
+}
+
+export function slippage(fills) {
+  const acc = slippageAccumulator();
+  for (const f of fills) acc.add(f);
+  return acc.result();
+}
+
+/** What the report needs from the fill log: its size and the slippage panel. */
+export function fillStats(fills) {
+  return { count: fills.length, slippage: slippage(fills) };
 }
 
 /** PnL split by asset and market period, for the by-market panel. */
@@ -415,7 +499,7 @@ export function sweepPanel(cells, { xParam, yParam, metric = 'sharpe' }) {
  */
 export function buildReport({
   runId, submittedAt, manifest, scope, sourceSha256 = null,
-  trades, fills, marketSummaries, marketMeta,
+  trades, fillStats: fillSummary, marketSummaries, marketMeta,
   feesPaid = 0, fillDelayMs = 0, sweep = null, coverage = null,
   crosschecks = [], budget = null, seed = null, scanned = {},
 }) {
@@ -443,7 +527,8 @@ export function buildReport({
     },
     scanned,
     metrics: metrics(closed, { feesPaid, days: scope?.archivedDayCount ?? 1 }),
-    equity: equity.map((p) => ({ ts_ms: p.ts_ms, equity: r2(p.equity) })),
+    // Thinned. The full curve is equity.csv in the archive.
+    equity: downsampleEquity(equity).map((p) => ({ ts_ms: p.ts_ms, equity: r2(p.equity) })),
     crosscheck: {
       markets_touched: new Set(closed.map((t) => t.market_id)).size,
       recompute_checks: crosschecks.length,
@@ -452,8 +537,13 @@ export function buildReport({
       // "everything reconciled".
       mismatches: crosschecks.length - matched,
     },
-    trades: closed,
-    fills,
+    // NO FULL ROW ARRAYS. They made report.json grow with the trade count,
+    // and report.json is a Postgres jsonb value (hard cap ~256MB) that the API
+    // hands to the page. The rows live in trades.csv / fills.csv; the key is
+    // renamed rather than truncated in place so a reader of the old `trades`
+    // fails loudly instead of summing a preview as if it were the run.
+    trades_head: closed.slice(0, TRADES_HEAD),
+    rows: { trades: closed.length, fills: fillSummary.count, equity_points: equity.length },
     calibration: calibration(closed),
     // Same markets, same sizing — the average size the strategy actually
     // traded, so the comparison is like for like.
@@ -461,7 +551,9 @@ export function buildReport({
       size: closed.length ? closed.reduce((a, t) => a + (t.size ?? 0), 0) / closed.length : 1,
     }),
     split: splitByMarket(closed, marketMeta ?? new Map()),
-    slippage: slippage(fills ?? []),
+    // From the caller's pass over the fill log (fillStats / the worker's
+    // streaming pass): the log itself is never handed to the report.
+    slippage: fillSummary.slippage,
     // THE DELAY THIS RUN WAS PRICED AT, not a comparison table.
     //
     // There used to be five extra replays at 100ms..2s, then one, and the

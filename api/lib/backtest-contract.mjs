@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.6.6';
+export const SDK_VERSION = '1.6.7';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -26,6 +26,13 @@ export const SDK_VERSION = '1.6.6';
  * runs the old harness under the new worker — and the failure is silent. The
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
+ *
+ * 1.19.0: no protocol change. engine/report.mjs's slippage panel became a
+ * streaming accumulator (the worker spools fills to disk); stamp moved again.
+ *
+ * 1.18.0: no protocol change. engine/report.mjs stopped embedding full rows in
+ * report.json and the image COPYs engine/, so its source stamp moved; the tag
+ * moves with it so deploy-worker's fingerprint check finds a matching image.
  *
  * 1.9.0: the per-event budget judges SUSTAINED cost — the mean — instead of the
  * rate of events over the limit. The old rule measured the machine, not the
@@ -60,7 +67,7 @@ export const SDK_VERSION = '1.6.6';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.17.0';
+export const SANDBOX_IMAGE_TAG = '1.19.0';
 
 // ---------------------------------------------------------------------------
 // Languages
@@ -544,7 +551,10 @@ export const LIMITS = Object.freeze({
   //
   // These two are the inputs to that function and the only numbers to tune.
   replayBaseMs: 3 * 60 * 1000,
-  replayPerMarketDayMs: 35 * 1000,
+  // NO per-market-day rate here any more (2026-09-23): it is not one number.
+  // See REPLAY_MS_PER_MARKET_DAY below — a predict market-day is ~7× the bytes
+  // of a polymarket one and python replays it ~3.4× slower than nodejs, so a
+  // single figure named a budget three of the four combinations could not meet.
   // The FETCH budget, separate and bounded. Not unbounded, because there is one
   // worker and one slot: a stalled R2 read used to sit inside the fetch while
   // the heartbeat kept renewing the lease, so nobody could reclaim the run and
@@ -596,28 +606,152 @@ export const MAX_BACKTEST_DAYS = 90;
  * more time, and if it cannot finish it is refunded in full like any other
  * overrun. That is the honest failure: bounded queue damage, money back.
  */
-export const BUDGET_CLAMP_MARKET_DAYS = 180;
+/**
+ * The most REPLAY time any single run may be given, whatever it is.
+ *
+ * This is the real constraint: there is one worker and one slot, so this plus
+ * `fetchClockMs` is how long one run can keep everyone else waiting. Held at
+ * the value the old flat coefficient produced at its clamp (180 market-days ×
+ * 35s + 3 min), so the worst case is unchanged by making the rate per-load.
+ */
+export const MAX_REPLAY_MS = 6_480_000;   // 108 minutes
 
 /**
- * How long a run's REPLAY may take, given its size.
+ * Measured milliseconds of REPLAY per market-day, by venue and language.
  *
- * Derived rather than declared so the limit and the thing it limits cannot
- * drift: `MAX_BACKTEST_DAYS` decides how long a range can be, this decides how long
- * that size is allowed to take, and both come from the two constants in LIMITS.
+ * ALL FOUR MEASURED, 2026-09-23, with an EMPTY strategy on one real
+ * market-day — so these are the floor the pipeline costs before a strategy
+ * does anything at all:
  *
- * Sized on the WARM path (~24s/market-day measured) plus margin, because the
- * fetch has its own budget — `fetchClockMs` — and a slow archive read is our
- * pipe being slow, not the strategy. A run whose days are cold spends that
- * time under the fetch clock and arrives here with the same work to do.
+ *   polymarket nodejs   48.9 s   5.58M events/market-day, 278 MB
+ *   polymarket python   89.8 s   (16 µs/event)
+ *   predict    nodejs   39.3 s   0.49M events/market-day,  32 MB
+ *   predict    python  134.6 s   (274 µs/event)
+ *
+ * TWO THINGS THAT LOOK WRONG AND ARE NOT. predict has an eighth of the events
+ * and still costs python three times as much: its decoded event line averages
+ * 2060 characters against polymarket's 134, because every predict book event
+ * is a full two-sided ladder snapshot (98.7% of a decoded day's characters)
+ * while polymarket sends one-sided deltas. And polymarket, with the cheapest
+ * events, is not the cheapest market-day, because it has eleven times as many
+ * of them since BTC went to 20ms capture on 2026-08-25.
+ *
+ * THE FLAT 35s WAS BELOW ITS OWN FLOOR. It came from ~24s measured on
+ * polymarket nodejs before that cadence change, and nothing moved it after —
+ * so it sat under the 48.9s the same shape costs today, while the clamp
+ * derived from it sold 180 market-days that would need 2.4 hours against a
+ * 108-minute budget. On predict/python the same constant meant
+ * `135n > 180 + 35n`: no run of two market-days or more could finish
+ * REGARDLESS OF THE STRATEGY, and seventeen paying customers' runs died on it
+ * before anyone noticed.
+ *
+ * The values carry ~33% over the measured floor: the real customer strategy
+ * that exposed this ran at 141 s/market-day against a 134.6 floor, so the
+ * strategy itself was 5% of the cost. MEASURE AGAIN AFTER ANY CADENCE OR
+ * DECODER CHANGE — both of the surprises above came from a capture change that
+ * nobody thought to re-measure against. Emitting predict book events as deltas
+ * is worth about 2× (measured: 4.2× the bytes, 5.3× the parse, 5.7× the apply)
+ * and would bring predict's two back down.
  */
-export function wallClockMsFor(marketDays) {
-  const n = Number.isFinite(marketDays) && marketDays > 0 ? Math.ceil(marketDays) : 1;
-  return LIMITS.replayBaseMs
-    + LIMITS.replayPerMarketDayMs * Math.min(n, BUDGET_CLAMP_MARKET_DAYS);
+export const REPLAY_MS_PER_MARKET_DAY = Object.freeze({
+  polymarket: Object.freeze({ nodejs: 65_000, python: 120_000 }),
+  predict: Object.freeze({ nodejs: 55_000, python: 180_000 }),
+});
+
+/**
+ * The rate for one run. Unknown venue or language gets the SLOWEST rate.
+ *
+ * Fail-closed, because the two failures are not symmetric: too much budget
+ * costs queue time on a run that was going to finish anyway, while too little
+ * sells a run that cannot produce a report and refunds it after the customer
+ * has waited. `polymarket/python` is the one value here that was not measured
+ * — it is the measured python/nodejs ratio (3.4×) applied to polymarket's
+ * rate, and it should be measured before anything is built on it.
+ */
+export function replayMsPerMarketDay({ venue, language } = {}) {
+  const rates = (byVenue) => Object.values(byVenue);
+  const byVenue = REPLAY_MS_PER_MARKET_DAY[venue];
+  // AN ABSENT LANGUAGE IS NOT nodejs. It used to fall through to the fast
+  // rate, so a quote that did not carry the runtime — which the public /quote
+  // route did not — answered as if every submission were nodejs, and a python
+  // one was then refused at /submit against a different number. Unknown means
+  // unknown: take the slowest thing it could turn out to be.
+  const known = language === undefined || language === null
+    ? null
+    : (String(language).startsWith('python') ? 'python' : 'nodejs');
+  if (!byVenue) {
+    const all = Object.values(REPLAY_MS_PER_MARKET_DAY)
+      .flatMap((v) => (known ? [v[known]] : rates(v)));
+    return Math.max(...all);
+  }
+  return known ? byVenue[known] : Math.max(...rates(byVenue));
 }
 
-/** The ceiling that follows from the numbers above. For copy and for docs. */
-export const MAX_WALL_CLOCK_MS = wallClockMsFor(BUDGET_CLAMP_MARKET_DAYS);
+/**
+ * How many market-days one run of this shape can actually replay in its budget.
+ *
+ * DERIVED, not declared. It used to be a constant 180, which was only correct
+ * for the one combination the flat rate was measured on; for the others it
+ * named a size the run could never finish, so the quote accepted it, charged
+ * it, ran it for the whole budget and refunded it. Now the ceiling is the
+ * fixed thing and the count falls out of the rate — so a slower shape is sold
+ * less, rather than sold something it cannot deliver.
+ */
+export function budgetClampMarketDays(shape = {}) {
+  return Math.floor((MAX_REPLAY_MS - LIMITS.replayBaseMs) / replayMsPerMarketDay(shape));
+}
+
+/**
+ * How long a run's REPLAY may take, given its size AND its shape.
+ *
+ * Sized on the WARM path, because the fetch has its own budget —
+ * `fetchClockMs` — and a slow archive read is our pipe being slow, not the
+ * strategy. A run whose days are cold spends that time under the fetch clock
+ * and arrives here with the same work to do.
+ */
+export function wallClockMsFor(marketDays, shape = {}) {
+  const n = Number.isFinite(marketDays) && marketDays > 0 ? Math.ceil(marketDays) : 1;
+  return LIMITS.replayBaseMs
+    + replayMsPerMarketDay(shape) * Math.min(n, budgetClampMarketDays(shape));
+}
+
+/**
+ * The ceiling that follows from the numbers above. For copy and for docs.
+ *
+ * The same for every shape by construction — that is what `MAX_REPLAY_MS` is —
+ * so the public "up to N minutes" stays one number. Stated directly rather
+ * than derived through `wallClockMsFor`: passing it an infinite size returns
+ * the budget for ONE market-day, because an infinite count is not a finite
+ * number and falls to the guard. (It did, and printed 3.9 minutes.)
+ */
+export const MAX_WALL_CLOCK_MS = MAX_REPLAY_MS;
+
+/**
+ * The clamp a client can rely on WITHOUT knowing its shape: the slowest one.
+ *
+ * Do not read this as "the size we sell". It is the floor across every shape,
+ * so a client that only has this number will under-ask on three of the four —
+ * which is why `MAX_MARKET_DAYS_BY_SHAPE` is published beside it and why the
+ * quote's refusal names the shape it applied. A single scalar here was how the
+ * flat 180 survived: one number that was true for one combination and a lie
+ * for the rest.
+ */
+export const BUDGET_CLAMP_MARKET_DAYS = budgetClampMarketDays();
+
+/**
+ * Every clamp, keyed by the exact strings a submission carries: the venue and
+ * the full language id (`python@3.14`, not `python`). Derived from the rate
+ * table, so it cannot drift from what the quote actually enforces.
+ */
+export const MAX_MARKET_DAYS_BY_SHAPE = Object.freeze(
+  Object.fromEntries(Object.keys(REPLAY_MS_PER_MARKET_DAY).map((venue) => [
+    venue,
+    Object.freeze(Object.fromEntries(Object.keys(LANGUAGES).map((language) => [
+      language,
+      budgetClampMarketDays({ venue, language }),
+    ]))),
+  ])),
+);
 
 // ---------------------------------------------------------------------------
 // Rejection codes
@@ -702,7 +836,11 @@ export function contractDocument() {
     // gets — and these describe what one RUN may ask for. A client that cannot
     // read them discovers them as a 422 on the paid path.
     maxBacktestDays: MAX_BACKTEST_DAYS,
+    // The scalar is the floor across every shape; the table is what a client
+    // should actually size against. Publishing only the scalar would have a
+    // polymarket/nodejs customer asking for 35 market-days when 96 is real.
     maxMarketDays: BUDGET_CLAMP_MARKET_DAYS,
+    maxMarketDaysByShape: MAX_MARKET_DAYS_BY_SHAPE,
     rejectionCodes: REJECTION_CODES,
   };
 }

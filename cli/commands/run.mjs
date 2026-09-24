@@ -25,9 +25,10 @@ import {
   sortMarketsForReplay,
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
-import { buildReport } from '../../runner/engine/report.mjs';
+import { buildReport, fillStats } from '../../runner/engine/report.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
 import { createLineWriter } from '../../runner/stdin-writer.mjs';
+import { readEventLines } from '../../runner/spool-day.mjs';
 import {
   loadLocalDay, localDays, looksLikeArchive, archiveVenues, defaultVenue,
 } from '../local-data.mjs';
@@ -38,7 +39,7 @@ const RUNNER = path.join(HERE, '..', '..', 'runner');
 
 /** Run one pass of the local harness over the given markets. */
 function runHarness({
-  languageId, jobDir, job, markets, outputKey,
+  languageId, jobDir, job, markets, outputKey, eventsDir,
   // The submitter's own CSV, already parsed. Threaded in rather than read here
   // so it is parsed once for the whole run, exactly as the worker does.
   seriesRows = {}, seriesLags = {}, seriesNames = [],
@@ -101,7 +102,9 @@ function runHarness({
         // exactly as the worker sends them — and `lags` travels with them, or a
         // signal that declared a publication delay would be visible the instant
         // its row was stamped rather than when it could have existed.
-        const lines = m.events.map((ev) => JSON.stringify(ev));
+        // One market read back from its spool file (see spoolDay): the day is
+        // never all in memory, only the market being fed.
+        const lines = await readEventLines(path.join(eventsDir, m.eventsFile));
         const merged = seriesNames.length
           ? mergeReferenceRows(lines, seriesRows, m.market, 'ext', seriesLags)
           : lines;
@@ -222,273 +225,280 @@ export async function cmdRun({ dir, flags }) {
   // reading the same archive said nothing, so the two disagreed about what had
   // been covered while agreeing about everything else. That is the harder
   // discrepancy to notice, because the report looks complete.
-  const missing = [];
-  const bboApplied = new Map();  // day -> Set('<ASSET>|<interval>')
-  for (const day of days) {
-    const loaded = await loadLocalDay({
-      root: dataRoot, day, venue,
-      assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
-      datasets: manifest.datasets,
-      intervals: manifest.intervals,
-      // The SAME cadence the queue would replay this range at — built from the
-      // whole range, not this day, so an asset's density never changes partway
-      // through a run. Per asset, not run-wide: see makeBookThrottle.
-      throttle: makeBookThrottle({
-        venue,
-        assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
-        from: days[0],
-        to: days[days.length - 1],
-      }),
-    });
-    // Measured from EVENTS, keyed by market-day — the same fact the queue
-    // records, produced by the same decoder. See fetchDay's bboKeys.
-    if (loaded.bboKeys?.length) {
-      const acc = bboApplied.get(day) ?? new Set();
-      for (const k of loaded.bboKeys) acc.add(k);
-      bboApplied.set(day, acc);
-    }
-    if (loaded.markets.length === 0) {
-      process.stderr.write(`  ${day}: ${loaded.reason}\n`);
-      missing.push({
-        day,
-        reason: loaded.reason ?? 'no markets',
-        ...(loaded.unusable?.length
-          ? {
-            partial: false,
-            markets: loaded.unusable.length,
-            dropped: loaded.unusable.slice(0, 10),
-            reasons: [...new Set(loaded.unusable.map((u) => u.why))],
-          }
-          : {}),
-      });
-      continue;
-    }
-    if (loaded.unusable?.length) {
-      const why = `${loaded.unusable.length} market(s) dropped: ${loaded.unusable[0].why}`;
-      process.stderr.write(`  ${day}: ${why}\n`);
-      missing.push({
-        day, partial: true, markets: loaded.unusable.length, reason: why,
-        // Same bound the queue applies — see MAX_DROPPED_LISTED there.
-        dropped: loaded.unusable.slice(0, 10),
-        ...(loaded.unusable.length > 10
-          ? { dropped_truncated: loaded.unusable.length - 10 } : {}),
-        reasons: [...new Set(loaded.unusable.map((u) => u.why))],
-      });
-    }
-    markets.push(...loaded.markets);
-  }
-  if (markets.length === 0) throw new Error('no market-days could be read from that archive');
-  // SESSION IS ONE STREAM ACROSS THE RANGE, so it is ordered once over every
-  // day — the same thing fetchMarketDays does for the queue. Ordering it a day
-  // at a time leaves the stream day-major, which is chronological only by
-  // accident and stops being so as soon as two assets are in scope. Session
-  // shares one Portfolio across every market, so this is part of the ANSWER,
-  // not of the log.
-  if ((manifest.mode ?? 'market') === 'session') {
-    sortMarketsForReplay(markets, { mode: 'session' });
-  }
-  // ONE ASSET ON ONE UTC DAY — the unit the queue bills in. `markets` is one
-  // entry per market, and a day of BTC 15-minute markets is ninety-six of them,
-  // so counting entries reported a run as being a hundred times bigger than the
-  // customer is charged for and disagreed with the queue's own coverage.
-  const marketDaysScanned = countMarketDays(markets);
-
-  const jobDir = await mkdtemp(path.join(tmpdir(), 'ot-run-'));
+  // Where each day's events are spooled, one file per market (see spoolDay).
+  // Removed on every exit path: a day of Predict BTC is hundreds of MB.
+  const eventsDir = await mkdtemp(path.join(tmpdir(), 'ot-events-'));
   try {
-    const src = path.join(jobDir, 'src');
-    await mkdir(src, { recursive: true });
-    for (const f of checked.files) {
-      const dest = path.resolve(src, f.name);
-      await mkdir(path.dirname(dest), { recursive: true });
-      await writeFile(dest, f.content);
-    }
-    // The SDK has to be resolvable exactly as it is in the image, or the
-    // documented `import … from "outcometick"` fails locally and works remotely.
-    if (languageId === 'nodejs') {
-      const { cp } = await import('node:fs/promises');
-      await cp(path.join(RUNNER, 'harness/node/sdk'),
-        path.join(jobDir, 'node_modules', 'outcometick'), { recursive: true });
-    }
-
-    const baseJob = {
-      entry: manifest.entry,
-      hooks: Object.fromEntries(manifest.hooks.map((h) => [h, HOOK_NAMES[languageId][h]])),
-      arities: { on_market_open: 3, on_tick: 3, on_book: 3, on_trade: 3, on_settle: 4 },
-      params: manifest.params,
-      mode: manifest.mode,
-      seed: Number(flags.seed ?? 1),
-      feeBps: Number(flags['fee-bps'] ?? 0),
-      limits: LIMITS,
-    };
-    if (languageId === 'python') {
-      process.env.PYTHONPATH = [path.join(RUNNER, 'harness/python'), process.env.PYTHONPATH]
-        .filter(Boolean).join(path.delimiter);
-    }
-
-    if (!flags.json) {
-      process.stdout.write(`\n  ${marketDaysScanned} market-days · ${manifest.language} · local replay\n`);
-    }
-
-    const passes = [];
-    // ONE pass, at whatever delay the manifest asked for — the same shape the
-    // queue runs (runner/worker.mjs). These two have drifted eight times and
-    // every one was "we shared the decoder and nothing else".
-    const delayMs = manifest.latency ?? 0;
-    const steps = [{ label: delayMs ? `+${delayMs} ms` : '0 ms', ms: delayMs }];
-    for (const step of steps) {
-      const outputKey = randomBytes(32).toString('hex');
-      const res = await runHarness({
-        languageId, jobDir, outputKey, markets,
-        job: { ...baseJob, fillDelayMs: step.ms },
-        seriesRows: seriesRows.rowsByName ?? {}, seriesLags, seriesNames,
+    const missing = [];
+    const bboApplied = new Map();  // day -> Set('<ASSET>|<interval>')
+    for (const day of days) {
+      const loaded = await loadLocalDay({
+        root: dataRoot, day, venue, eventsDir,
+        assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
+        datasets: manifest.datasets,
+        intervals: manifest.intervals,
+        // The SAME cadence the queue would replay this range at — built from the
+        // whole range, not this day, so an asset's density never changes partway
+        // through a run. Per asset, not run-wide: see makeBookThrottle.
+        throttle: makeBookThrottle({
+          venue,
+          assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
+          from: days[0],
+          to: days[days.length - 1],
+        }),
       });
-      const out = demux(res.lines);
-      if (res.forged > 0) {
-        // Almost always a dependency writing to stdout: the harness takes
-        // console away from the strategy before loading it, but a library that
-        // reaches the descriptor another way still lands on the channel.
+      // Measured from EVENTS, keyed by market-day — the same fact the queue
+      // records, produced by the same decoder. See fetchDay's bboKeys.
+      if (loaded.bboKeys?.length) {
+        const acc = bboApplied.get(day) ?? new Set();
+        for (const k of loaded.bboKeys) acc.add(k);
+        bboApplied.set(day, acc);
+      }
+      if (loaded.markets.length === 0) {
+        process.stderr.write(`  ${day}: ${loaded.reason}\n`);
+        missing.push({
+          day,
+          reason: loaded.reason ?? 'no markets',
+          ...(loaded.unusable?.length
+            ? {
+              partial: false,
+              markets: loaded.unusable.length,
+              dropped: loaded.unusable.slice(0, 10),
+              reasons: [...new Set(loaded.unusable.map((u) => u.why))],
+            }
+            : {}),
+        });
+        continue;
+      }
+      if (loaded.unusable?.length) {
+        const why = `${loaded.unusable.length} market(s) dropped: ${loaded.unusable[0].why}`;
+        process.stderr.write(`  ${day}: ${why}\n`);
+        missing.push({
+          day, partial: true, markets: loaded.unusable.length, reason: why,
+          // Same bound the queue applies — see MAX_DROPPED_LISTED there.
+          dropped: loaded.unusable.slice(0, 10),
+          ...(loaded.unusable.length > 10
+            ? { dropped_truncated: loaded.unusable.length - 10 } : {}),
+          reasons: [...new Set(loaded.unusable.map((u) => u.why))],
+        });
+      }
+      markets.push(...loaded.markets);
+    }
+    if (markets.length === 0) throw new Error('no market-days could be read from that archive');
+    // SESSION IS ONE STREAM ACROSS THE RANGE, so it is ordered once over every
+    // day — the same thing fetchMarketDays does for the queue. Ordering it a day
+    // at a time leaves the stream day-major, which is chronological only by
+    // accident and stops being so as soon as two assets are in scope. Session
+    // shares one Portfolio across every market, so this is part of the ANSWER,
+    // not of the log.
+    if ((manifest.mode ?? 'market') === 'session') {
+      sortMarketsForReplay(markets, { mode: 'session' });
+    }
+    // ONE ASSET ON ONE UTC DAY — the unit the queue bills in. `markets` is one
+    // entry per market, and a day of BTC 15-minute markets is ninety-six of them,
+    // so counting entries reported a run as being a hundred times bigger than the
+    // customer is charged for and disagreed with the queue's own coverage.
+    const marketDaysScanned = countMarketDays(markets);
+
+    const jobDir = await mkdtemp(path.join(tmpdir(), 'ot-run-'));
+    try {
+      const src = path.join(jobDir, 'src');
+      await mkdir(src, { recursive: true });
+      for (const f of checked.files) {
+        const dest = path.resolve(src, f.name);
+        await mkdir(path.dirname(dest), { recursive: true });
+        await writeFile(dest, f.content);
+      }
+      // The SDK has to be resolvable exactly as it is in the image, or the
+      // documented `import … from "outcometick"` fails locally and works remotely.
+      if (languageId === 'nodejs') {
+        const { cp } = await import('node:fs/promises');
+        await cp(path.join(RUNNER, 'harness/node/sdk'),
+          path.join(jobDir, 'node_modules', 'outcometick'), { recursive: true });
+      }
+
+      const baseJob = {
+        entry: manifest.entry,
+        hooks: Object.fromEntries(manifest.hooks.map((h) => [h, HOOK_NAMES[languageId][h]])),
+        arities: { on_market_open: 3, on_tick: 3, on_book: 3, on_trade: 3, on_settle: 4 },
+        params: manifest.params,
+        mode: manifest.mode,
+        seed: Number(flags.seed ?? 1),
+        feeBps: Number(flags['fee-bps'] ?? 0),
+        limits: LIMITS,
+      };
+      if (languageId === 'python') {
+        process.env.PYTHONPATH = [path.join(RUNNER, 'harness/python'), process.env.PYTHONPATH]
+          .filter(Boolean).join(path.delimiter);
+      }
+
+      if (!flags.json) {
+        process.stdout.write(`\n  ${marketDaysScanned} market-days · ${manifest.language} · local replay\n`);
+      }
+
+      const passes = [];
+      // ONE pass, at whatever delay the manifest asked for — the same shape the
+      // queue runs (runner/worker.mjs). These two have drifted eight times and
+      // every one was "we shared the decoder and nothing else".
+      const delayMs = manifest.latency ?? 0;
+      const steps = [{ label: delayMs ? `+${delayMs} ms` : '0 ms', ms: delayMs }];
+      for (const step of steps) {
+        const outputKey = randomBytes(32).toString('hex');
+        const res = await runHarness({
+          languageId, jobDir, outputKey, markets, eventsDir,
+          job: { ...baseJob, fillDelayMs: step.ms },
+          seriesRows: seriesRows.rowsByName ?? {}, seriesLags, seriesNames,
+        });
+        const out = demux(res.lines);
+        if (res.forged > 0) {
+          // Almost always a dependency writing to stdout: the harness takes
+          // console away from the strategy before loading it, but a library that
+          // reaches the descriptor another way still lands on the channel.
+          const err = new Error(
+            `${res.forged} line(s) on the result channel did not authenticate.`
+            + ' Something in this strategy or its dependencies writes to stdout;'
+            + ' a queued run would count the same bytes as forged and could lose'
+            + ' results. Use ctx.log() for output.',
+          );
+          err.code = 'E_RUNTIME';
+          err.detail = err.message;
+          throw err;
+        }
+        // UNCONDITIONAL. This used to be wrapped in `if (step.ms === 0)`, from
+        // when pass 0 was the report and the rest were a comparison curve whose
+        // failures were survivable. There is one pass now, and its delay is
+        // whatever the manifest asked for — so the guard silently stopped
+        // running the moment anyone wrote `latency: 250`, and a rejected or
+        // over-budget replay became a report: locally successful, marked
+        // `fill_delay_ms: 250`, and refused by the queue.
+        if (res.code === EXIT.rejected || res.code === EXIT.budget) {
+          const r = out.result.rejection ?? { code: 'E_RUNTIME', detail: res.stderr.slice(0, 2000) };
+          const err = new Error(r.detail);
+          err.code = r.code;
+          err.detail = r.detail;
+          throw err;
+        }
+        if (res.code !== EXIT.ok) throw new Error(res.stderr.slice(0, 2000) || `harness exited ${res.code}`);
+        passes.push({ delayMs: step.ms, ...out, ok: res.code === EXIT.ok });
+      }
+
+      const base = passes[0];
+      // A SHORT REPLAY MUST FAIL EVEN WHEN NOTHING REPORTED AN ERROR.
+      //
+      // The backpressure bug produced exactly that shape: every write "succeeded",
+      // the harness exited 0, and 2 of 289 markets came back as a clean, complete
+      // looking report. Fixing the writer closes the cause we found; counting what
+      // came back is what catches the next one, whatever it turns out to be.
+      //
+      // `markets_run` is incremented by the harness only after a market is fully
+      // replayed, so on a clean exit it equals what was fed. A rejected or
+      // over-budget run never reaches here — those exit non-zero and are raised
+      // above with the sandbox's own reason, which says more than this count.
+      if (base.result.marketsRun < markets.length) {
         const err = new Error(
-          `${res.forged} line(s) on the result channel did not authenticate.`
-          + ' Something in this strategy or its dependencies writes to stdout;'
-          + ' a queued run would count the same bytes as forged and could lose'
-          + ' results. Use ctx.log() for output.',
+          `only ${base.result.marketsRun} of ${markets.length} market(s) were replayed —`
+          + ' the report would be incomplete, so none was written.'
+          + ' This usually means the feed to the runner was cut short.',
         );
         err.code = 'E_RUNTIME';
         err.detail = err.message;
         throw err;
       }
-      // UNCONDITIONAL. This used to be wrapped in `if (step.ms === 0)`, from
-      // when pass 0 was the report and the rest were a comparison curve whose
-      // failures were survivable. There is one pass now, and its delay is
-      // whatever the manifest asked for — so the guard silently stopped
-      // running the moment anyone wrote `latency: 250`, and a rejected or
-      // over-budget replay became a report: locally successful, marked
-      // `fill_delay_ms: 250`, and refused by the queue.
-      if (res.code === EXIT.rejected || res.code === EXIT.budget) {
-        const r = out.result.rejection ?? { code: 'E_RUNTIME', detail: res.stderr.slice(0, 2000) };
-        const err = new Error(r.detail);
-        err.code = r.code;
-        err.detail = r.detail;
-        throw err;
+      const marketMeta = new Map(markets.map((m) => [m.market.market_id, {
+        market_id: m.market.market_id,
+        asset: m.market.asset,
+        interval: m.market.interval,
+        outcome: m.market.outcome,
+        up_px: m.up_px,
+        down_px: m.down_px,
+        stream: m.stream,
+      }]));
+
+      const report = buildReport({
+        runId: `local_${days[0]}`,
+        submittedAt: 0,
+        manifest,
+        // Local runs have no stored submission to hash, and saying null is
+        // truthful: this report is not tied to a submission at all.
+        sourceSha256: null,
+        scope: {
+          venue,
+          assets: assets.length ? assets : [...new Set(markets.map((m) => m.market.asset).filter(Boolean))],
+          from: days[0],
+          to: days[days.length - 1],
+          marketDays: marketDaysScanned,
+          archivedDayCount: days.length,
+        },
+        scanned: {
+          markets: base.result.marketsRun,
+          market_days: marketDaysScanned,
+          events: base.result.eventsSeen,
+        },
+        trades: base.trades,
+        fillStats: fillStats(base.fills),
+        marketSummaries: [...marketMeta.values()],
+        marketMeta,
+        feesPaid: base.result.feesPaid,
+        fillDelayMs: delayMs,
+        sweep: null,
+        crosschecks: base.result.crosschecks,
+        seed: Number(flags.seed ?? 1),
+        coverage: buildCoverage({
+          marketDaysScanned,
+          // NOT backfilled from `scanned`. Filling it in that way meant the
+          // headline always said "asked for N, scanned N" — so a day that was
+          // entirely unusable was recorded in `missing` and simultaneously denied
+          // at the top of the same file. A local run does not know what was asked
+          // for; null says that, and saying it is the point.
+          marketDaysRequested: null,
+          marketsReportedByRunner: base.result.marketsRun,
+          missing,
+          // Always empty here: a manifest that declares one is refused above,
+          // because a local replay cannot supply it.
+          referenceDeclared: [],
+          streams: countStreams([...marketMeta.values()]),
+          droppedRows: base.malformed ?? 0,
+          ...bboCoverage({ venue, datasets: manifest.datasets, markets, applied: bboApplied }),
+          local: true,
+          source: path.resolve(dataRoot),
+        }),
+        budget: base.result.budget,
+      });
+
+      if (flags.json) {
+        process.stdout.write(`${JSON.stringify(report)}\n`);
+      } else {
+        const m = report.metrics;
+        const money = (v) => (v == null ? '—' : `${v < 0 ? '-' : '+'}$${Math.abs(v).toLocaleString()}`);
+        process.stdout.write(`\n  net pnl        ${money(m.net_pnl)}\n`);
+        process.stdout.write(`  trades         ${m.trades}\n`);
+        process.stdout.write(`  win rate       ${m.win_rate == null ? '—' : `${(m.win_rate * 100).toFixed(1)}%`}\n`);
+        process.stdout.write(`  brier          ${m.brier_score ?? '—'}\n`);
+        process.stdout.write(`  edge/contract  ${m.edge_per_contract == null ? '—' : `${(m.edge_per_contract * 100).toFixed(1)}¢`}\n`);
+        process.stdout.write(`  fees           ${money(m.fees)}\n`);
+        if (report.slippage.pnl_lost_to_slippage != null) {
+          process.stdout.write(`  lost to slip   ${money(report.slippage.pnl_lost_to_slippage)}\n`);
+        }
+        process.stdout.write('\n  This is a LOCAL replay: no container, your own privileges, sample data.\n');
       }
-      if (res.code !== EXIT.ok) throw new Error(res.stderr.slice(0, 2000) || `harness exited ${res.code}`);
-      passes.push({ delayMs: step.ms, ...out, ok: res.code === EXIT.ok });
+
+      const outFile = flags.out ?? `${path.basename(path.resolve(dir))}-local.zip`;
+      const zip = await buildArchive({
+        runId: report.run_id,
+        report,
+        trades: base.trades,
+        fills: base.fills,
+        logs: base.logs,
+        source: checked.files,
+      });
+      await writeFile(outFile, zip);
+      if (!flags.json) process.stdout.write(`  archive        ${outFile} (${(zip.length / 1024).toFixed(0)} KB)\n\n`);
+      return 0;
+    } finally {
+      await rm(jobDir, { recursive: true, force: true });
     }
-
-    const base = passes[0];
-    // A SHORT REPLAY MUST FAIL EVEN WHEN NOTHING REPORTED AN ERROR.
-    //
-    // The backpressure bug produced exactly that shape: every write "succeeded",
-    // the harness exited 0, and 2 of 289 markets came back as a clean, complete
-    // looking report. Fixing the writer closes the cause we found; counting what
-    // came back is what catches the next one, whatever it turns out to be.
-    //
-    // `markets_run` is incremented by the harness only after a market is fully
-    // replayed, so on a clean exit it equals what was fed. A rejected or
-    // over-budget run never reaches here — those exit non-zero and are raised
-    // above with the sandbox's own reason, which says more than this count.
-    if (base.result.marketsRun < markets.length) {
-      const err = new Error(
-        `only ${base.result.marketsRun} of ${markets.length} market(s) were replayed —`
-        + ' the report would be incomplete, so none was written.'
-        + ' This usually means the feed to the runner was cut short.',
-      );
-      err.code = 'E_RUNTIME';
-      err.detail = err.message;
-      throw err;
-    }
-    const marketMeta = new Map(markets.map((m) => [m.market.market_id, {
-      market_id: m.market.market_id,
-      asset: m.market.asset,
-      interval: m.market.interval,
-      outcome: m.market.outcome,
-      up_px: m.up_px,
-      down_px: m.down_px,
-      stream: m.stream,
-    }]));
-
-    const report = buildReport({
-      runId: `local_${days[0]}`,
-      submittedAt: 0,
-      manifest,
-      // Local runs have no stored submission to hash, and saying null is
-      // truthful: this report is not tied to a submission at all.
-      sourceSha256: null,
-      scope: {
-        venue,
-        assets: assets.length ? assets : [...new Set(markets.map((m) => m.market.asset).filter(Boolean))],
-        from: days[0],
-        to: days[days.length - 1],
-        marketDays: marketDaysScanned,
-        archivedDayCount: days.length,
-      },
-      scanned: {
-        markets: base.result.marketsRun,
-        market_days: marketDaysScanned,
-        events: base.result.eventsSeen,
-      },
-      trades: base.trades,
-      fills: base.fills,
-      marketSummaries: [...marketMeta.values()],
-      marketMeta,
-      feesPaid: base.result.feesPaid,
-      fillDelayMs: delayMs,
-      sweep: null,
-      crosschecks: base.result.crosschecks,
-      seed: Number(flags.seed ?? 1),
-      coverage: buildCoverage({
-        marketDaysScanned,
-        // NOT backfilled from `scanned`. Filling it in that way meant the
-        // headline always said "asked for N, scanned N" — so a day that was
-        // entirely unusable was recorded in `missing` and simultaneously denied
-        // at the top of the same file. A local run does not know what was asked
-        // for; null says that, and saying it is the point.
-        marketDaysRequested: null,
-        marketsReportedByRunner: base.result.marketsRun,
-        missing,
-        // Always empty here: a manifest that declares one is refused above,
-        // because a local replay cannot supply it.
-        referenceDeclared: [],
-        streams: countStreams([...marketMeta.values()]),
-        droppedRows: base.malformed ?? 0,
-        ...bboCoverage({ venue, datasets: manifest.datasets, markets, applied: bboApplied }),
-        local: true,
-        source: path.resolve(dataRoot),
-      }),
-      budget: base.result.budget,
-    });
-
-    if (flags.json) {
-      process.stdout.write(`${JSON.stringify(report)}\n`);
-    } else {
-      const m = report.metrics;
-      const money = (v) => (v == null ? '—' : `${v < 0 ? '-' : '+'}$${Math.abs(v).toLocaleString()}`);
-      process.stdout.write(`\n  net pnl        ${money(m.net_pnl)}\n`);
-      process.stdout.write(`  trades         ${m.trades}\n`);
-      process.stdout.write(`  win rate       ${m.win_rate == null ? '—' : `${(m.win_rate * 100).toFixed(1)}%`}\n`);
-      process.stdout.write(`  brier          ${m.brier_score ?? '—'}\n`);
-      process.stdout.write(`  edge/contract  ${m.edge_per_contract == null ? '—' : `${(m.edge_per_contract * 100).toFixed(1)}¢`}\n`);
-      process.stdout.write(`  fees           ${money(m.fees)}\n`);
-      if (report.slippage.pnl_lost_to_slippage != null) {
-        process.stdout.write(`  lost to slip   ${money(report.slippage.pnl_lost_to_slippage)}\n`);
-      }
-      process.stdout.write('\n  This is a LOCAL replay: no container, your own privileges, sample data.\n');
-    }
-
-    const outFile = flags.out ?? `${path.basename(path.resolve(dir))}-local.zip`;
-    const zip = await buildArchive({
-      runId: report.run_id,
-      report,
-      trades: base.trades,
-      fills: base.fills,
-      logs: base.logs,
-      source: checked.files,
-    });
-    await writeFile(outFile, zip);
-    if (!flags.json) process.stdout.write(`  archive        ${outFile} (${(zip.length / 1024).toFixed(0)} KB)\n\n`);
-    return 0;
   } finally {
-    await rm(jobDir, { recursive: true, force: true });
+    await rm(eventsDir, { recursive: true, force: true });
   }
 }
 

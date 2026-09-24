@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   metrics, brier, edgePerContract, equityCurve, maxDrawdown, worstLosingRun,
   calibration, baselines, slippage, splitByMarket, sweepPanel,
-  buildReport,
+  buildReport, fillStats, slippageAccumulator,
 } from './report.mjs';
 
 const day = (d) => Date.parse(`2026-07-${String(d).padStart(2, '0')}T12:00:00Z`);
@@ -319,7 +319,7 @@ test('the report carries coverage through untouched', () => {
     manifest: { schema: 1, language: 'python@3.14', mode: 'market' },
     scope: { venue: 'polymarket', assets: ['BTC'], from: '2026-07-01', to: '2026-07-01', archivedDayCount: 1 },
     trades: [settled({ px: 0.5, won: true, d: 1 })],
-    fills: [],
+    fillStats: fillStats([]),
     marketSummaries: [],
     coverage,
   });
@@ -331,7 +331,7 @@ test('the report carries coverage through untouched', () => {
 test('a clean cross-check and a missing one look different', () => {
   const base = {
     runId: 'r', submittedAt: 1, manifest: {}, scope: {},
-    trades: [settled({ px: 0.5, won: true, d: 1 })], fills: [], marketSummaries: [],
+    trades: [settled({ px: 0.5, won: true, d: 1 })], fillStats: fillStats([]), marketSummaries: [],
   };
   const none = buildReport(base);
   assert.equal(none.crosscheck.recompute_checks, 0);
@@ -362,7 +362,7 @@ test('the report says which fill delay it was measured at', () => {
     manifest: { schema: 1, language: 'python@3.14', mode: 'market' },
     scope: { venue: 'polymarket', assets: ['BTC'], from: '2026-07-01', to: '2026-07-01', archivedDayCount: 1 },
     trades: [settled({ px: 0.5, won: true, d: 1 })],
-    fills: [],
+    fillStats: fillStats([]),
     marketSummaries: [],
   };
   assert.equal(buildReport({ ...base, fillDelayMs: 250 }).fill_delay_ms, 250);
@@ -455,4 +455,95 @@ test('no trades produces nulls, not zeros pretending to be answers', async () =>
   assert.equal(m.return_on_peak, null);
   assert.equal(m.holding_ratio, null);
   assert.equal(m.peak_capital, 0);
+});
+
+// ---------------------------------------------------------------------------
+// report.json must not grow with the trade count
+// ---------------------------------------------------------------------------
+
+import { downsampleEquity, EQUITY_MAX_POINTS, TRADES_HEAD } from './report.mjs';
+
+test('downsampleEquity keeps both ends and every bucket extreme, and stays under the cap', () => {
+  // A deep, one-point trough in the middle: a stride would step over it and
+  // the drawn curve would show less drawdown than the metric above it.
+  const pts = Array.from({ length: 100_000 }, (_, i) => ({ ts_ms: i, equity: i }));
+  pts[54_321] = { ts_ms: 54_321, equity: -1e6 };
+  pts[77_777] = { ts_ms: 77_777, equity: 1e7 };
+  const out = downsampleEquity(pts);
+  assert.ok(out.length <= EQUITY_MAX_POINTS, `${out.length} points`);
+  assert.equal(out[0], pts[0]);
+  assert.equal(out.at(-1), pts.at(-1));
+  assert.ok(out.includes(pts[54_321]), 'the trough survives');
+  assert.ok(out.includes(pts[77_777]), 'the peak survives');
+  for (let i = 1; i < out.length; i++) assert.ok(out[i].ts_ms > out[i - 1].ts_ms, 'order kept, no duplicates');
+  const short = pts.slice(0, EQUITY_MAX_POINTS);
+  assert.equal(downsampleEquity(short), short, 'a curve under the cap is untouched');
+});
+
+test('the report carries counts and a head, not the full trade and fill lists', () => {
+  const trades = Array.from({ length: 3000 }, (_, i) => settled({ px: 0.5, won: i % 2 === 0, d: 1 + (i % 20), market: `0x${i}` }));
+  const fills = trades.map((t) => ({ ts_ms: t.opened_ms, market_id: t.market_id, side: 'UP', action: 'open',
+    requested: 100, filled: 100, unfilled: 0, avg_px: 0.5, worst_px: 0.5, quoted_px: 0.5, levels_walked: 1, fee: 0, realised: 0 }));
+  const r = buildReport({
+    runId: 'r', submittedAt: 1, manifest: {}, scope: { archivedDayCount: 20 }, trades, fillStats: fillStats(fills), marketSummaries: [],
+  });
+  assert.equal(r.trades, undefined, 'renamed, so an old reader fails loudly instead of summing a preview');
+  assert.equal(r.fills, undefined);
+  assert.equal(r.trades_head.length, TRADES_HEAD);
+  assert.deepEqual(r.trades_head, trades.slice(0, TRADES_HEAD));
+  assert.deepEqual(r.rows, { trades: 3000, fills: 3000, equity_points: 3000 });
+  assert.ok(r.equity.length <= EQUITY_MAX_POINTS);
+  // Aggregates still come from every row, not from the head.
+  assert.equal(r.metrics.trades, 3000);
+  assert.equal(r.slippage.orders, 3000);
+  const full = equityCurve(trades.filter((t) => Number.isFinite(t.pnl)));
+  assert.equal(r.equity.at(-1).equity, Number(full.at(-1).equity.toFixed(2)), 'curve ends where the full one does');
+});
+
+test('a report over 400k trades builds without blowing the argument limit', () => {
+  // Math.min(...rows) threw RangeError here long before memory ran out.
+  const trades = Array.from({ length: 400_000 }, (_, i) => settled({ px: 0.5, won: i % 2 === 0, d: 1 + (i % 28) }));
+  const r = buildReport({ runId: 'r', submittedAt: 1, manifest: {}, scope: { archivedDayCount: 28 }, trades, fillStats: fillStats([]), marketSummaries: [] });
+  assert.equal(r.rows.trades, 400_000);
+  assert.ok(Number.isFinite(r.metrics.holding_ratio));
+});
+
+test('the streaming slippage panel equals the array version, bit for bit', () => {
+  // The worker now feeds fills one at a time from disk. The panel it builds
+  // must be the one the array version built — same sums in the same order.
+  const reference = (fills) => {
+    const attempted = fills.filter((f) => f.action === 'open');
+    if (!attempted.length) return null;
+    const add = (xs) => xs.reduce((a, b) => a + b, 0);
+    const slips = attempted.filter((f) => f.filled > 0 && f.quoted_px != null && f.avg_px != null)
+      .map((f) => (f.avg_px - f.quoted_px) * 100).sort((a, b) => a - b);
+    const at = (q) => (slips.length ? slips[Math.min(slips.length - 1, Math.floor(q * slips.length))] : null);
+    const cost = add(attempted.filter((f) => f.filled > 0 && f.quoted_px != null && f.avg_px != null)
+      .map((f) => (f.avg_px - f.quoted_px) * f.filled));
+    const r = (x, d) => (Number.isFinite(x) ? Number(x.toFixed(d)) : null);
+    return {
+      orders: attempted.length,
+      fills_at_quote: r(attempted.filter((f) => f.filled > 0 && f.levels_walked === 1).length / attempted.length, 4),
+      partial_fills: r(attempted.filter((f) => f.filled > 0 && f.levels_walked > 1).length / attempted.length, 4),
+      unfilled: r(attempted.filter((f) => f.filled === 0).length / attempted.length, 4),
+      median_slippage_cents: r(at(0.5), 2),
+      worst_1pct_slippage_cents: r(at(0.99), 2),
+      pnl_lost_to_slippage: r(-cost, 2),
+      unfilled_size_ratio: r(add(attempted.map((f) => f.unfilled)) / add(attempted.map((f) => f.requested)), 4),
+    };
+  };
+  let seed = 3;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const fills = Array.from({ length: 5000 }, () => {
+    const requested = Math.ceil(rnd() * 50);
+    const filled = rnd() < 0.1 ? 0 : Math.ceil(rnd() * requested);
+    return {
+      action: rnd() < 0.8 ? 'open' : 'reduce', requested, filled, unfilled: requested - filled,
+      levels_walked: 1 + Math.floor(rnd() * 3), quoted_px: rnd() < 0.05 ? null : rnd(), avg_px: rnd(),
+    };
+  });
+  const acc = slippageAccumulator();
+  for (const f of fills) acc.add(f);
+  assert.deepEqual(acc.result(), reference(fills));
+  assert.deepEqual(fillStats(fills), { count: 5000, slippage: reference(fills) });
 });

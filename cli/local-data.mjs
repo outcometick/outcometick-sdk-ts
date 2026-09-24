@@ -23,10 +23,11 @@ import {
   archiveDatasetsForDay, fileMatchesRun, normalizeIntervals, settlementPathsFor, orderedFeed,
 } from '../api/lib/backtest-datasets.mjs';
 import {
-  indexMarkets, eventsFromRow, finaliseMarket, parseRow, buildSlugIndex, marketUnusable,
+  indexMarkets, parseRow, buildSlugIndex,
   sortMarketsForReplay,
   makeBookThrottle,
 } from '../runner/events.mjs';
+import { spoolDay } from '../runner/spool-day.mjs';
 
 /**
  * Every file under a directory, as archive-relative paths.
@@ -114,7 +115,7 @@ export function dayOfPath(rel) {
  * Returns the same shape fetchMarketDays does, so `ot run` and the worker feed
  * the harness identically.
  */
-export async function loadLocalDay({ root, day, venue, assets, datasets, intervals, throttle = null }) {
+export async function loadLocalDay({ root, day, venue, assets, datasets, intervals, throttle = null, eventsDir }) {
   // Day-scoped, and degrading datasets gated by their capture window — the
   // same call the queue makes, because `ot run` and the worker have drifted
   // apart nine times and every one of them was a rule computed twice.
@@ -162,65 +163,16 @@ export async function loadLocalDay({ root, day, venue, assets, datasets, interva
   const feed = orderedFeed([...wanted, ...settlementPathsFor(markets.values(),
     all.filter((rel) => dayOfPath(rel) === day), { venue, assets, already: wanted })]);
 
-  const byMarket = new Map();
-  const bboSeen = new Set();  // '<ASSET>|<interval>' that produced a usable bound
-  for (const rel of feed) {
-    if (classifyPath(rel).dataset === 'markets') continue;
-    for await (const row of readRows(root, rel)) {
-      for (const [id, ev] of eventsFromRow(rel, row, markets, bySlug, throttle)) {
-        if (!markets.has(id)) continue;
-        // Same fact, same source as the queue: an EVENT, not a file. See
-        // fetchDay's bboKeys.
-        if (ev.bbo) {
-          const mk = markets.get(id);
-          if (mk?.asset) bboSeen.add(`${String(mk.asset).toUpperCase()}|${mk.interval ?? 'none'}`);
-        }
-        let list = byMarket.get(id);
-        if (!list) { list = []; byMarket.set(id, list); }
-        list.push(ev);
-      }
-    }
-  }
+  // THE SAME SPOOL THE QUEUE USES — see spoolDay. This used to collect every
+  // event of the day in memory before replaying any of it; one day of Predict
+  // BTC is ~480k full-ladder snapshots, ~12KB each once parsed, and `ot run`
+  // died of a 4GB heap on the public sample. Each market's events go to their
+  // own file under `eventsDir`; `ot run` reads them back one market at a time.
+  const { out, unusable, bboSeen } = await spoolDay({
+    day, markets, bySlug, throttle, eventsDir,
+    feed: feed.map((rel) => ({ path: rel, bytes: 0, rows: () => readRows(root, rel) })),
+  });
 
-  const out = [];
-  const unusable = [];
-  // EVERY market in the metadata, exactly as the worker does. Iterating only
-  // the ones that produced events skipped the emptiest case — a market that
-  // exists in the archive and decodes to nothing — which is precisely the gap
-  // this is here to expose, and skipping it locally would put the divergence
-  // back after it had just been removed.
-  for (const marketId of markets.keys()) {
-    const market = markets.get(marketId);
-    const events = byMarket.get(marketId) ?? [];
-    const { events: inWindow, up_px, down_px } = market
-      ? finaliseMarket(events, market)
-      : { events: [], up_px: null, down_px: null };
-    // THE SAME predicate the queue applies, not a local copy of it. A rule that
-    // lives in one reader and not the other is how `ot run` ends up replaying a
-    // market the queue drops — and a market-making strategy, which never reads
-    // the settlement price, is precisely the case that would never notice.
-    const why = marketUnusable(market, inWindow);
-    if (why) {
-      unusable.push({ market_id: marketId, asset: market?.asset ?? null, day, why });
-      continue;
-    }
-    out.push({
-      market: {
-        market_id: market.market_id,
-        asset: market.asset,
-        interval: market.interval,
-        strike: market.strike,
-        outcome: market.outcome,
-        open_ts_ms: market.open_ts_ms,
-        close_ts_ms: market.close_ts_ms,
-      },
-      events: inWindow,
-      stream: market.stream,
-      day,
-      up_px,
-      down_px,
-    });
-  }
   return {
     // THE SAME ORDER THE QUEUE FEEDS — see sortMarketsForReplay. A local replay
     // that emitted its logs in a different order than the queue would break the
@@ -231,7 +183,7 @@ export async function loadLocalDay({ root, day, venue, assets, datasets, interva
     // records — coverage states which days really read the top-of-book stream,
     // and it has to answer that the same way on both sides.
     inputs: feed,
-    bboKeys: [...bboSeen].sort(),
+    bboKeys: [...bboSeen].filter(Boolean).sort(),
     unusable,
     reason: out.length === 0 && unusable.length
       ? `${unusable.length} market(s) unusable: ${unusable[0].why}`
