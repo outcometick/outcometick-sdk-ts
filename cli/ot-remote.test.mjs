@@ -350,8 +350,10 @@ test('ot submit refuses a --from before the backtest window, before uploading an
       'submit', dir, '--assets', 'btc', '--from', '2026-08-01', '--to', '2026-08-30', '--api', api.url,
     ]);
     assert.equal(code, 1);
-    assert.match(stderr, /most recent 35 archived days only: 2026-08-23\.\.2026-09-26/);
-    assert.match(stderr, /--from 2026-08-23/);
+    // Says what happened, what the window is, and what to change.
+    assert.match(stderr, /E_SCOPE — outside the backtest window/);
+    assert.match(stderr, /most recent 35 archived days \(polymarket: 2026-08-23\.\.2026-09-26\)/);
+    assert.match(stderr, /--from 2026-08-01 is earlier\. Use --from 2026-08-23 or later, or --days 35/);
     // Asked the window for the venue being submitted, and did nothing else.
     assert.deepEqual(api.seen.map((r) => `${r.method} ${r.url}`),
       ['GET /v1/backtest/capacity?venue=polymarket']);
@@ -401,6 +403,68 @@ test('an E_SCOPE refusal is printed as the range problem, not as a validator bug
     assert.doesNotMatch(stderr, /bug on our side/);
   } finally {
     await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('ot submit --days longer than the window is refused locally, naming the window and the fix', async () => {
+  const dir = await submissionDir(BASE_MANIFEST);
+  const api = await stubApi({
+    'GET /v1/backtest/capacity': (req, res) => json(res, 200, {
+      first_complete_day: '2026-08-23', last_day: '2026-09-26', backtest_window_days: 35, archive_days: 35,
+    }),
+  });
+  try {
+    const { code, stderr } = await ot(['submit', dir, '--assets', 'btc', '--days', '60', '--api', api.url]);
+    assert.equal(code, 1);
+    assert.match(stderr, /E_SCOPE — outside the backtest window/);
+    assert.match(stderr, /2026-08-23\.\.2026-09-26/);
+    assert.match(stderr, /--days 60 is more than that\. Use --days 35 or fewer/);
+    assert.deepEqual(api.seen.map((r) => r.method), ['GET'], 'nothing may be submitted');
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('ot submit --days sends a count, which the server anchors', async () => {
+  const dir = await submissionDir(BASE_MANIFEST);
+  let body = null;
+  const api = await stubApi({
+    'GET /v1/backtest/capacity': (req, res) => json(res, 200, {
+      first_complete_day: '2026-08-23', last_day: '2026-09-26', backtest_window_days: 35, archive_days: 35,
+    }),
+    'POST /v1/backtest/submit': (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        body = JSON.parse(raw);
+        json(res, 202, { run_id: 'run_d', quote: { venue: 'polymarket', assets: ['BTC'], marketDays: 30 } });
+      });
+    },
+  });
+  try {
+    const { code, stdout } = await ot(['submit', dir, '--assets', 'btc', '--days', '30', '--api', api.url]);
+    assert.equal(code, 0, stdout);
+    assert.equal(body.days, 30);
+    assert.equal(body.from, undefined, 'the browser/CLI must never anchor a window itself');
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('ot submit without a range, or with a bad --days, says how to ask', async () => {
+  const dir = await submissionDir(BASE_MANIFEST);
+  try {
+    const none = await ot(['submit', dir, '--assets', 'btc', '--api', 'http://127.0.0.1:9']);
+    assert.notEqual(none.code, 0);
+    assert.match(none.stderr, /--days <n>.*or --from <day> --to <day>/);
+    assert.match(none.stderr, /ot help/);
+    const bad = await ot(['submit', dir, '--assets', 'btc', '--days', '2.5', '--api', 'http://127.0.0.1:9']);
+    assert.notEqual(bad.code, 0);
+    assert.match(bad.stderr, /--days must be a whole number/);
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

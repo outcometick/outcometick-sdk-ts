@@ -3,7 +3,7 @@
 //
 //   ot check .                                          validate, free, no data
 //   ot run . --data ./polymarket-data-samples           replay locally
-//   ot submit . --assets btc,eth --from … --to …        send it to the queue
+//   ot submit . --assets btc,eth --days 30              send it to the queue
 //
 // The one thing this file must get right is that `ot check` runs the SAME
 // validator the queue runs. The docs promise "if it passes locally it will not
@@ -21,7 +21,9 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import process from 'node:process';
 
-import { SDK_VERSION, LIMITS, BacktestRejection } from '../api/lib/backtest-contract.mjs';
+import {
+  SDK_VERSION, LIMITS, BacktestRejection, MAX_BACKTEST_DAYS,
+} from '../api/lib/backtest-contract.mjs';
 import { checkSubmission, MANIFEST_NAME } from '../api/lib/backtest-manifest.mjs';
 import { analyzeSource } from '../runner/analyze/index.mjs';
 
@@ -41,11 +43,15 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
       archive held on the worker, so a local replay would hand your strategy
       empty ones. Your own CSV series work locally.
 
+  ot submit <dir> --assets btc,eth --days <n> [--venue polymarket]
   ot submit <dir> --assets btc,eth --from <day> --to <day> [--venue polymarket]
       Send it to the queue. Needs OT_BACKTEST_KEY.
-      Only the most recent archived days can be backtested (the window moves
-      forward daily); --from earlier than that is refused before anything is
-      uploaded. The current window: GET /v1/backtest/capacity?venue=<venue>.
+      --days <n>          the most recent n archived days
+      Only the most recent archived days can be backtested (currently ${MAX_BACKTEST_DAYS}; the
+      window moves forward daily). A --from earlier than the window, or --days
+      longer than it, is refused (E_SCOPE) before anything is uploaded, with
+      the current window in the message. To see it:
+          curl https://outcometick.com/v1/backtest/capacity?venue=polymarket
       --email <address>   have the finished report emailed to you. Without it
                           the run is only reachable from 'ot status', which
                           means remembering the id — and a queued run outlives

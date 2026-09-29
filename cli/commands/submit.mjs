@@ -19,13 +19,24 @@ export async function cmdSubmit({ dir, flags }) {
 
   const assets = (flags.assets ?? '').split(',').map((a) => a.trim()).filter(Boolean);
   if (assets.length === 0) throw new Error('--assets is required, e.g. --assets btc,eth');
-  if (!flags.from && !flags.range) throw new Error('--from and --to are required, or --range "30 days"');
+  if (!flags.from && !flags.range && !flags.days) {
+    throw new Error('give a range: --days <n> (the most recent n archived days) or --from <day> --to <day>.'
+      + ' Backtests cover only the most recent archived days — see `ot help`.');
+  }
+  let days = null;
+  if (flags.days != null) {
+    days = Number(flags.days);
+    if (!/^\d+$/.test(String(flags.days)) || days < 1) {
+      throw new Error(`--days must be a whole number of days, got ${JSON.stringify(flags.days)}`);
+    }
+  }
 
   const files = await readSubmission(dir);
   const scope = {
     venue: flags.venue ?? 'polymarket',
     assets,
-    ...(flags.range ? { range: flags.range } : { from: flags.from, to: flags.to }),
+    ...(days != null ? { days }
+      : flags.range ? { range: flags.range } : { from: flags.from, to: flags.to }),
   };
 
   // Locally first. The rejection codes are identical either way, so a customer
@@ -37,16 +48,23 @@ export async function cmdSubmit({ dir, flags }) {
   // for rather than written down here. Advisory only: the server refuses the
   // same thing, and a capacity endpoint that cannot be reached is not a reason
   // to stop a submission it would have accepted.
-  if (scope.from) {
+  if (scope.from || scope.days != null) {
     const cap = await get(api, `/v1/backtest/capacity?venue=${encodeURIComponent(scope.venue)}`)
       .catch(() => null);
     const first = cap?.status === 200 ? cap.json?.first_complete_day : null;
     const last = cap?.json?.last_day ?? '…';
-    if (first && String(scope.from) < first) {
-      const n = cap.json?.backtest_window_days;
-      process.stderr.write(`\n  ${scope.from} is outside the backtest window.\n`
-        + `  Backtests cover the most recent ${n ?? ''} archived days only: ${first}..${last} on ${scope.venue}.\n`
-        + `  Use --from ${first} or later.\n\n`);
+    const held = cap?.json?.archive_days;
+    const n = cap?.json?.backtest_window_days ?? held;
+    const window = `  Backtests cover only the most recent ${n ?? ''} archived days`
+      + ` (${scope.venue}: ${first}..${last}). The window moves forward as days are archived.\n`;
+    if (first && scope.from && String(scope.from) < first) {
+      process.stderr.write(`\n  E_SCOPE — outside the backtest window.\n${window}`
+        + `  --from ${scope.from} is earlier. Use --from ${first} or later, or --days ${held ?? n} for all of it.\n\n`);
+      return 1;
+    }
+    if (first && scope.days != null && Number.isInteger(held) && scope.days > held) {
+      process.stderr.write(`\n  E_SCOPE — outside the backtest window.\n${window}`
+        + `  --days ${scope.days} is more than that. Use --days ${held} or fewer.\n\n`);
       return 1;
     }
   }
@@ -122,8 +140,8 @@ export async function cmdSubmit({ dir, flags }) {
   if (status === 422 && json?.code === 'E_SCOPE') {
     // The range, not the code: `ot check` never sees a range, so this is not
     // the "passed locally" contradiction below. Most often it is the moving
-    // date window — the server's message names it.
-    process.stderr.write(`\n  ${json.code}\n  ${json.detail}\n\n`);
+    // date window — the server's message names it and says what to change.
+    process.stderr.write(`\n  ${json.code} — the requested scope cannot be run.\n  ${json.detail}\n\n`);
     return 1;
   }
   if (status === 422 && json?.code) {

@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 9d6438cf5fc09aaf300f94b7208855eb374e7d63.
+  Generated from monorepo revision 1007b41be56ff3e933622ab514e74ce1f9df1663.
 -->
 
 # outcometick
@@ -19,10 +19,17 @@ npm i -g outcometick
 
 ot check .                                           # validate, free, no data
 ot run . --data ./polymarket-data-samples            # replay locally
-ot submit . --assets btc,eth --from … --to …         # send it to the queue
+ot submit . --assets btc,eth --days 30               # send it to the queue
 ot status <run_id>                                   # where it got to
 ot fetch  <run_id>                                   # download the report
 ```
+
+**Breaking in 2.0:** backtests cover only the most recent 35 archived
+days, and the window moves forward as days are archived. A `--from` before the
+window, or `--days` longer than it, is refused with `E_SCOPE` before anything
+is uploaded, and the message names the current window. Use `--days <n>` for the
+most recent n days; the current dates are at
+`https://outcometick.com/v1/backtest/capacity?venue=polymarket`.
 
 ## Writing a strategy
 
