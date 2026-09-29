@@ -43,6 +43,9 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
 
   ot submit <dir> --assets btc,eth --from <day> --to <day> [--venue polymarket]
       Send it to the queue. Needs OT_BACKTEST_KEY.
+      Only the most recent archived days can be backtested (the window moves
+      forward daily); --from earlier than that is refused before anything is
+      uploaded. The current window: GET /v1/backtest/capacity?venue=<venue>.
       --email <address>   have the finished report emailed to you. Without it
                           the run is only reachable from 'ot status', which
                           means remembering the id — and a queued run outlives

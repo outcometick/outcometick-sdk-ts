@@ -55,10 +55,27 @@ export const FIRST_BACKTEST_DAY = Object.freeze({
 });
 
 /**
+ * How many of the most recent archived days a backtest may use, per venue.
+ *
+ * A DISK DECISION, not a data one (owner 2026-09-28: no more spend on the
+ * backtest box). Every sellable day has to sit in the worker's decoded cache —
+ * a cold day is a fetch that runs out of budget and refunds — and the cache is
+ * the only thing on that disk that grows. Measured 2026-09-28: ~1.37 GB/day
+ * polymarket + ~0.34 GB/day predict, ~76 GB usable ⇒ ~44 days at the average,
+ * ~38 at the peak. 35 leaves room for volume growth.
+ *
+ * Anchored on the last ARCHIVED day, like the subscription's rolling window.
+ * The prewarm job deletes cached days that fell out of it, so raising this
+ * means re-warming (and checking the disk) first.
+ */
+export const BACKTEST_WINDOW_DAYS = 35;
+
+/**
  * The days a backtest may actually be sold on a venue.
  *
  * Both floors apply: a day has to be complete AND has to be one the archive
- * can attribute a settlement stream to.
+ * can attribute a settlement stream to. Then only the most recent
+ * BACKTEST_WINDOW_DAYS of those.
  */
 export function backtestDayList(days, venue) {
   const v = String(venue ?? '').toLowerCase();
@@ -66,7 +83,7 @@ export function backtestDayList(days, venue) {
     FIRST_COMPLETE_DAY[v] ?? PRODUCT_FIRST_COMPLETE_DAY,
     FIRST_BACKTEST_DAY[v] ?? FIRST_BACKTEST_DAY.polymarket,
   ].sort().pop();
-  return completeDayList(days, floor);
+  return completeDayList(days, floor).slice(-BACKTEST_WINDOW_DAYS);
 }
 
 /**

@@ -855,7 +855,11 @@ export function marketUnusable(market, inWindow) {
   if (!OUTCOMES.includes(market.outcome)) {
     return 'outcome could not be read';
   }
-  if (!inWindow || inWindow.length === 0) return 'no events inside the market window';
+  // Trades do not count towards "has events". A day is decoded with trades
+  // whether or not the run declared them (decodeDatasetsFor), so the verdict —
+  // and the reason a customer reads in coverage — must not depend on them.
+  // Only the wording can change: a market with ticks is usable either way.
+  if (!inWindow || !inWindow.some((e) => e.kind !== 'trade')) return 'no events inside the market window';
   // Book rows alone make the window non-empty, so without this a day whose
   // settlement file was missing came back as scanned and billable while
   // `on_tick` never fired.

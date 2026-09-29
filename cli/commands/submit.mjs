@@ -11,7 +11,7 @@
 // one thing and charged another.
 
 import { readSubmission, validate } from '../ot.mjs';
-import { readKey, post, DEFAULT_API } from '../api-client.mjs';
+import { readKey, get, post, DEFAULT_API } from '../api-client.mjs';
 
 export async function cmdSubmit({ dir, flags }) {
   const api = flags.api ?? DEFAULT_API;
@@ -31,6 +31,25 @@ export async function cmdSubmit({ dir, flags }) {
   // Locally first. The rejection codes are identical either way, so a customer
   // who fixes what `ot check` said will not be told something different here.
   const checked = await validate(files);
+
+  // THE DATE WINDOW, before anything is uploaded. Only the most recent archived
+  // days can be backtested, and the window moves every day — so it is asked
+  // for rather than written down here. Advisory only: the server refuses the
+  // same thing, and a capacity endpoint that cannot be reached is not a reason
+  // to stop a submission it would have accepted.
+  if (scope.from) {
+    const cap = await get(api, `/v1/backtest/capacity?venue=${encodeURIComponent(scope.venue)}`)
+      .catch(() => null);
+    const first = cap?.status === 200 ? cap.json?.first_complete_day : null;
+    const last = cap?.json?.last_day ?? '…';
+    if (first && String(scope.from) < first) {
+      const n = cap.json?.backtest_window_days;
+      process.stderr.write(`\n  ${scope.from} is outside the backtest window.\n`
+        + `  Backtests cover the most recent ${n ?? ''} archived days only: ${first}..${last} on ${scope.venue}.\n`
+        + `  Use --from ${first} or later.\n\n`);
+      return 1;
+    }
+  }
 
   // Series go straight to R2, the same way the web editor sends them.
   //
@@ -98,6 +117,13 @@ export async function cmdSubmit({ dir, flags }) {
   }
   if (status === 401) {
     process.stderr.write('\n  OT_BACKTEST_KEY was not accepted.\n\n');
+    return 1;
+  }
+  if (status === 422 && json?.code === 'E_SCOPE') {
+    // The range, not the code: `ot check` never sees a range, so this is not
+    // the "passed locally" contradiction below. Most often it is the moving
+    // date window — the server's message names it.
+    process.stderr.write(`\n  ${json.code}\n  ${json.detail}\n\n`);
     return 1;
   }
   if (status === 422 && json?.code) {

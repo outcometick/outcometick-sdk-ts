@@ -39,11 +39,25 @@ function marketDayKey(m) {
 }
 
 /**
+ * Is this stored event line a trade?
+ *
+ * By prefix, not by parsing: a cached polymarket BTC day is ~1.4M lines and
+ * parsing each one is the 9.5s/day the decoded cache exists to remove. It holds
+ * because spoolDay writes `JSON.stringify(event)` and eventsFromRow builds every
+ * event with `kind` as its FIRST key — pinned by a test in trades-superset.test.mjs.
+ */
+export const isTradeLine = (line) => line.startsWith('{"kind":"trade"');
+
+/**
  * One market's event lines, read back from the file spoolDay wrote. Gunzipped
  * as they are read; only this market is ever resident. Shared by the worker's
  * job stream and `ot run`.
+ *
+ * `dropTrades`: the day was decoded with trades the run did not declare (see
+ * decodeDatasetsFor) — leave them out, so the strategy is fed exactly what a
+ * decode of its own declaration would have produced.
  */
-export async function readEventLines(file) {
+export async function readEventLines(file, { dropTrades = false } = {}) {
   const raw = createReadStream(file);
   let input = raw;
   if (file.endsWith('.gz')) {
@@ -59,7 +73,7 @@ export async function readEventLines(file) {
   const rl = createInterface({ input, crlfDelay: Infinity });
   for await (const line of rl) {
     const t = line.trim();
-    if (t) lines.push(t);
+    if (t && !(dropTrades && isTradeLine(t))) lines.push(t);
   }
   return lines;
 }

@@ -9,13 +9,13 @@
 // ignored it" is how a strategy silently gets fed something other than what it
 // asked for.
 
-import { FIRST_COMPLETE_DAY } from './coverage-window.mjs';
+import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs';
 
 /** Manifest schema version. Field meanings never change within a version. */
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '1.6.7';
+export const SDK_VERSION = '1.6.8';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -589,9 +589,11 @@ export const LIMITS = Object.freeze({
  * submission the queue will refuse.
  *
  * Raising it is a hardware decision, not a config one: there is one worker
- * slot and a run holds it for its whole life.
+ * slot and a run holds it for its whole life. It equals the sellable window
+ * (`BACKTEST_WINDOW_DAYS`): a run cannot cover days outside that window, so a
+ * larger number here would only be a limit nobody can reach.
  */
-export const MAX_BACKTEST_DAYS = 90;
+export const MAX_BACKTEST_DAYS = BACKTEST_WINDOW_DAYS;
 
 /**
  * The clamp on the REPLAY BUDGET's input — not a limit on what may be run.

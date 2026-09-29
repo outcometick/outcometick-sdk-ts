@@ -331,3 +331,76 @@ test('ot submit fails loudly when a series cannot be staged', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// The date window: only the most recent archived days can be backtested.
+
+test('ot submit refuses a --from before the backtest window, before uploading anything', async () => {
+  const dir = await submissionDir(
+    { ...BASE_MANIFEST, series: [{ name: 'px', file: 'px.csv' }] },
+    { 'px.csv': 'ts_ms,value\n1750000000000,1.5\n' },
+  );
+  const api = await stubApi({
+    'GET /v1/backtest/capacity': (req, res) => json(res, 200, {
+      first_complete_day: '2026-08-23', last_day: '2026-09-26', backtest_window_days: 35,
+    }),
+  });
+  try {
+    const { code, stderr } = await ot([
+      'submit', dir, '--assets', 'btc', '--from', '2026-08-01', '--to', '2026-08-30', '--api', api.url,
+    ]);
+    assert.equal(code, 1);
+    assert.match(stderr, /most recent 35 archived days only: 2026-08-23\.\.2026-09-26/);
+    assert.match(stderr, /--from 2026-08-23/);
+    // Asked the window for the venue being submitted, and did nothing else.
+    assert.deepEqual(api.seen.map((r) => `${r.method} ${r.url}`),
+      ['GET /v1/backtest/capacity?venue=polymarket']);
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('ot submit inside the window goes through', async () => {
+  const dir = await submissionDir(BASE_MANIFEST);
+  let submitted = false;
+  const api = await stubApi({
+    'GET /v1/backtest/capacity': (req, res) => json(res, 200, {
+      first_complete_day: '2026-08-23', last_day: '2026-09-26', backtest_window_days: 35,
+    }),
+    'POST /v1/backtest/submit': (req, res) => {
+      submitted = true;
+      json(res, 202, { run_id: 'run_ok', quote: { venue: 'polymarket', assets: ['BTC'], marketDays: 2 } });
+    },
+  });
+  try {
+    const { code, stdout } = await ot([
+      'submit', dir, '--assets', 'btc', '--from', '2026-08-23', '--to', '2026-08-24', '--api', api.url,
+    ]);
+    assert.equal(code, 0, stdout);
+    assert.ok(submitted);
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an E_SCOPE refusal is printed as the range problem, not as a validator bug', async () => {
+  const dir = await submissionDir(BASE_MANIFEST);
+  const api = await stubApi({
+    'POST /v1/backtest/submit': (req, res) => json(res, 422, {
+      code: 'E_SCOPE', detail: 'backtests cover the most recent 35 archived days only: 2026-08-23..2026-09-26 on polymarket.',
+    }),
+  });
+  try {
+    const { code, stderr } = await ot([
+      'submit', dir, '--assets', 'btc', '--from', '2026-08-01', '--to', '2026-08-30', '--api', api.url,
+    ]);
+    assert.equal(code, 1);
+    assert.match(stderr, /most recent 35 archived days/);
+    assert.doesNotMatch(stderr, /bug on our side/);
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -302,6 +302,51 @@ export function archiveDatasetsForDay({ datasets, venue, day, from, to }) {
 }
 
 /**
+ * The archive datasets a day is DECODED and CACHED as, for a run that asked
+ * for `archiveDatasets`: the request plus the venue's trades.
+ *
+ * The decoded-day cache is keyed on the dataset list, so every subset a
+ * manifest can declare used to be its own cache entry — and the prewarm only
+ * warms shapes that include trades. 54 of the first 69 real customer runs
+ * declared no trades (the CLI docs tell them "ask for less, run faster"), and
+ * every one of them decoded from cold beside a warmed copy of the same day.
+ *
+ * TRADES ALONE, because they are the one stream whose presence changes nothing
+ * else a decoded day holds, and so can be stripped back out exactly — see
+ * `omitsTrades` and the byte-identity test in fetch-data.test.mjs:
+ *  - a trade row becomes one `kind:'trade'` event and nothing more;
+ *  - the throttle only gates the book-delta stream, keyed per market;
+ *  - events are ordered by (ts, kind, snapshot) with a STABLE sort, so taking
+ *    the trades out afterwards leaves the rest in the order a decode without
+ *    them produces;
+ *  - the opening baseline reads book events only, `bboKeys` reads bbo events
+ *    only, and whether a market is usable does not look at trades
+ *    (marketUnusable).
+ * `bbo` and `book` are NOT like this: both change the book the engine and the
+ * baselines are priced on, so a day decoded with them cannot be turned into one
+ * decoded without them by deleting lines.
+ */
+export function decodeDatasetsFor({ archiveDatasets, venue }) {
+  const out = new Set(archiveDatasets);
+  for (const a of ARCHIVE_DATASETS[venue]?.trades ?? []) out.add(a);
+  return [...out].sort();
+}
+
+/**
+ * Did the run leave out trades that `decodeDatasetsFor` decoded anyway? Then
+ * its trade events have to be dropped before they reach the strategy, and the
+ * trade objects' bytes before they reach the report.
+ */
+export function omitsTrades({ archiveDatasets, venue }) {
+  return (ARCHIVE_DATASETS[venue]?.trades ?? []).some((a) => !archiveDatasets.includes(a));
+}
+
+/** Is this archive dataset one of the venue's trade streams? */
+export function isTradeDataset(venue, dataset) {
+  return (ARCHIVE_DATASETS[venue]?.trades ?? []).includes(dataset);
+}
+
+/**
  * The settlement files a day's markets need, beyond what the strategy asked for.
  *
  * ALWAYS FED, like `markets`, and for the same reason: which stream a market
