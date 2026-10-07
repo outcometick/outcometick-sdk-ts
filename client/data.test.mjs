@@ -302,3 +302,57 @@ test('a trailing slash on baseUrl does not produce a doubled path', async () => 
     await api.close();
   }
 });
+
+// ---------------------------------------------------------------- smart money
+
+const smartRedirect = (sha) => (req, res, u) => {
+  res.writeHead(302, {
+    location: `http://127.0.0.1:${req.socket.localPort}/signed-bytes`,
+    'x-outcometick-sha256': sha,
+    'cache-control': 'no-store',
+  }).end();
+};
+
+test('smartDownload follows the redirect itself, verifies the checksum, and never sends the key to R2', async () => {
+  await withApi(async (api, ot) => {
+    const got = await ot.smartDownload('2026-10-08', 'top1000');
+    assert.equal(got.sha256, SHA);
+    assert.equal(got.day, '2026-10-08');
+    assert.equal(got.list, 'top1000');
+    assert.deepEqual(Buffer.from(got.bytes), PAYLOAD);
+    const dl = api.seen.find((s) => s.path === '/v1/smart/download');
+    assert.deepEqual(dl.query, { day: '2026-10-08', list: 'top1000' });
+    assert.equal(dl.auth, 'Bearer ck_test');
+    assert.equal(api.seen.find((s) => s.path === '/signed-bytes').auth, undefined);
+  }, { '/v1/smart/download': smartRedirect(SHA) });
+});
+
+test('smartDownload refuses bytes whose checksum does not match', async () => {
+  await withApi(async (api, ot) => {
+    await assert.rejects(() => ot.smartDownload('2026-10-08'), /checksum mismatch for 2026-10-08\/top100/);
+  }, { '/v1/smart/download': smartRedirect('0'.repeat(64)) });
+});
+
+test('smartDownload checks its arguments before calling out', async () => {
+  await withApi(async (api, ot) => {
+    await assert.rejects(() => ot.smartDownload('2026-10-08', 'all'), /top100' or 'top1000/);
+    await assert.rejects(() => ot.smartDownload(), /needs a day/);
+    assert.equal(api.seen.length, 0);
+  });
+});
+
+test('smart routes: days with the key; coverage and plans public; errors keep the body', async () => {
+  await withApi(async (api, ot) => {
+    assert.deepEqual(await ot.smartCoverage(), { firstDay: '2026-10-08', lastDay: '2026-10-09', days: 2 });
+    assert.equal(api.seen.at(-1).auth, undefined, 'public: no key sent');
+    assert.deepEqual(await ot.smartPlans(), { onSale: false, plans: [] });
+    const err = await ot.smartDays().catch((e) => e);
+    assert.ok(err instanceof OutcometickError);
+    assert.equal(err.status, 503);
+    assert.match(err.detail, /not on sale/);
+  }, {
+    '/v1/public/smart-coverage': (_q, _r, _u, json) => json(200, { firstDay: '2026-10-08', lastDay: '2026-10-09', days: 2 }),
+    '/v1/public/smart-plans': (_q, _r, _u, json) => json(200, { onSale: false, plans: [] }),
+    '/v1/smart/days': (_q, _r, _u, json) => json(503, { error: 'smart-money is not on sale yet' }),
+  });
+});

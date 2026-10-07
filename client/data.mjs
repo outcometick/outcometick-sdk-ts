@@ -203,12 +203,19 @@ export class DataClient {
 
     if (!date || !name) throw new Error('download needs a file row, or a date and a name');
 
-    const { res, url } = await this._get(
-      `/v1/dl/${encodeURIComponent(date)}/${encodeURIComponent(name)}`,
-      { redirect: 'manual' },
+    const { bytes, sha256 } = await this._downloadVia(
+      `/v1/dl/${encodeURIComponent(date)}/${encodeURIComponent(name)}`, null,
+      isRow ? (fileOrDate.sha256 ?? null) : null, `${date}/${name}`, { verify, saveTo },
     );
+    return { bytes, sha256, name, date };
+  }
 
-    let expected = isRow ? (fileOrDate.sha256 ?? null) : null;
+  /**
+   * GET a route that answers 302 to a signed URL, fetch the bytes, verify them.
+   * Shared by the archive and smart-money downloads.
+   */
+  async _downloadVia(path, query, expected, label, { verify = true, saveTo = null } = {}) {
+    const { res, url } = await this._get(path, { query, redirect: 'manual' });
     let bytesRes = res;
 
     if (res.status >= 300 && res.status < 400) {
@@ -235,13 +242,42 @@ export class DataClient {
     if (verify && expected) {
       const got = createHash('sha256').update(bytes).digest('hex');
       if (got !== expected) {
-        throw new Error(`checksum mismatch for ${date}/${name}\n`
+        throw new Error(`checksum mismatch for ${label}\n`
           + `  expected ${expected}\n  got      ${got}`);
       }
     }
 
     if (saveTo) await writeFile(saveTo, bytes);
-    return { bytes, sha256: expected, name, date };
+    return { bytes, sha256: expected };
+  }
+
+  // ---------- smart money -----------------------------------------------
+  //
+  // A separate subscription with its OWN key (a data key gets 403 here, and a
+  // smart-money key gets 403 on everything above). Daily files of the trades
+  // made by the top-ranked Polymarket traders: list top100, or top1000 on the
+  // Top 1000 plan. Until it is on sale these answer 503.
+
+  /** The days this smart-money key may download, newest first, each list's status. */
+  async smartDays() {
+    return this._json('/v1/smart/days');
+  }
+
+  /**
+   * Download one day's smart-money file (a zstd-compressed CSV), verified
+   * against the sha256 the server sends with the redirect.
+   *
+   * @param day   'YYYY-MM-DD' — take it from smartDays(), not from the calendar
+   * @param list  'top100' | 'top1000'
+   * @returns {Promise<{bytes: Uint8Array, sha256: string|null, day: string, list: string}>}
+   */
+  async smartDownload(day, list = 'top100', { verify = true, saveTo = null } = {}) {
+    if (!day) throw new Error('smartDownload needs a day');
+    if (list !== 'top100' && list !== 'top1000') throw new Error("list must be 'top100' or 'top1000'");
+    const { bytes, sha256 } = await this._downloadVia(
+      '/v1/smart/download', { day, list }, null, `${day}/${list}`, { verify, saveTo },
+    );
+    return { bytes, sha256, day, list };
   }
 
   // ---------- public, no key needed -------------------------------------
@@ -254,6 +290,16 @@ export class DataClient {
   /** Plans and live prices. Public. */
   async plans() {
     return this._json('/v1/public/plans', { auth: false });
+  }
+
+  /** How many smart-money days are published, and from when. Public. */
+  async smartCoverage() {
+    return this._json('/v1/public/smart-coverage', { auth: false });
+  }
+
+  /** Smart-money plans and prices (USD), and whether it is on sale. Public. */
+  async smartPlans() {
+    return this._json('/v1/public/smart-plans', { auth: false });
   }
 
   /** Liveness. Public. */

@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 1007b41be56ff3e933622ab514e74ce1f9df1663.
+  Generated from monorepo revision ea8198ba3b54eade145409e1fbea5395ea1bb3f7.
 -->
 
 # outcometick
@@ -116,6 +116,21 @@ parses the values as durations never meets a token.
 Downloads are checksum-verified: `/v1/dl` redirects to storage with the sha256
 in a header, and the client follows that redirect itself so the checksum is not
 thrown away.
+
+### Smart-money trade history (coming soon)
+
+A separate subscription with its own key: daily files of the trades made by the
+top-ranked Polymarket traders. Until it is on sale these calls answer 503.
+
+```ts
+const smart = new DataClient({ key: process.env.OT_SMART_KEY });
+const { days } = await smart.smartDays();                  // newest first
+const day = days.find((d) => d.lists.top100?.status === "published")?.day;
+if (day) await smart.smartDownload(day, "top100", { saveTo: "top100.csv.zst" });  // verified
+```
+
+What the lists are and what each column means:
+https://outcometick.com/polymarket-smart-money-data
 
 ---
 

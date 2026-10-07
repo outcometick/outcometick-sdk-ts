@@ -123,6 +123,35 @@ export interface DownloadOptions {
   saveTo?: string;
 }
 
+/** One list's state on one day, as /v1/smart/days reports it. */
+export type SmartListState =
+  | { status: 'published'; rows: number; bytes: number; sha256: string }
+  | { status: 'stopped'; reason: string | null }
+  | { status: 'missing' };
+
+export interface SmartDaysResult {
+  /** 'smart100' | 'smart1000' */
+  plan: string;
+  /** The lists this plan may download. */
+  lists: Array<'top100' | 'top1000'>;
+  window: { from: string; to: string } | null;
+  /** Newest first, every calendar day in the window. */
+  days: Array<{ day: string; lists: Partial<Record<'top100' | 'top1000', SmartListState>> }>;
+}
+
+export interface SmartDownloadResult {
+  bytes: Uint8Array;
+  sha256: string | null;
+  day: string;
+  list: 'top100' | 'top1000';
+}
+
+export interface SmartCoverage {
+  firstDay: string | null;
+  lastDay: string | null;
+  days: number;
+}
+
 export interface DataClientOptions {
   /** Defaults to process.env.OT_KEY. */
   key?: string | null;
@@ -157,6 +186,15 @@ export declare class DataClient {
   coverage(): Promise<unknown>;
   plans(): Promise<unknown>;
   health(): Promise<unknown>;
+
+  /** Smart money (its own key): the days this key may download. */
+  smartDays(): Promise<SmartDaysResult>;
+  /** Smart money: one day's zstd CSV, checksum-verified. */
+  smartDownload(day: string, list?: 'top100' | 'top1000', options?: DownloadOptions): Promise<SmartDownloadResult>;
+  /** Public: how many smart-money days are published. */
+  smartCoverage(): Promise<SmartCoverage>;
+  /** Public: smart-money plans (USD) and whether it is on sale. */
+  smartPlans(): Promise<{ onSale: boolean; plans: Array<{ planId: string; plan: string; usd: number; passUsd: number | null; interval: string }> }>;
 }
 
 export default DataClient;

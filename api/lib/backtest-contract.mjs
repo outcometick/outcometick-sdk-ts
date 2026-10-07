@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.0.0';
+export const SDK_VERSION = '2.0.1';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -647,17 +647,36 @@ export const MAX_REPLAY_MS = 6_480_000;   // 108 minutes
  * REGARDLESS OF THE STRATEGY, and seventeen paying customers' runs died on it
  * before anyone noticed.
  *
- * The values carry ~33% over the measured floor: the real customer strategy
- * that exposed this ran at 141 s/market-day against a 134.6 floor, so the
- * strategy itself was 5% of the cost. MEASURE AGAIN AFTER ANY CADENCE OR
- * DECODER CHANGE — both of the surprises above came from a capture change that
- * nobody thought to re-measure against. Emitting predict book events as deltas
- * is worth about 2× (measured: 4.2× the bytes, 5.3× the parse, 5.7× the apply)
- * and would bring predict's two back down.
+ * THE EMPTY-STRATEGY FLOOR WAS THE WRONG BASE FOR THE MARGIN. Re-sized
+ * 2026-10-07 from what completed paid runs actually recorded (`scanned.wall_ms`
+ * over `market_days`, an upper bound since it includes the fetch):
+ *
+ *   polymarket python   110–135 s   real days carry 5.6–6.9M events, not 5.58M,
+ *                                   at 16–19 µs/event — the old 120 s sat at or
+ *                                   UNDER that with the simplest template
+ *   polymarket nodejs    49 s       one sample on a 5.58M day; ≈61 s at 6.9M
+ *   predict    nodejs   38–63 s     a 30-day run used 98% of its 55 s budget
+ *   predict    python  134–143 s
+ *
+ * and the worker is a VPS whose CPU slows under neighbours without showing up
+ * as steal: run_ffd32e (2026-10-06, polymarket/python, the template strategy)
+ * replayed at 27.5 µs/event and timed out, while the same source on
+ * overlapping days twenty minutes later ran at 18.4 — 45% slower. So each rate
+ * is at least 25% over the worst completed run and ~50% over a typical one,
+ * which absorbs a slowdown of that size. The exact values are picked so every
+ * published ceiling factors into a scope a client can actually quote (a
+ * ceiling of 74 = 2 × 37 cannot be reached inside a 35-day window).
+ * predict/python keeps 180 (26% over its worst) because 35 is the backtest
+ * window and anything lower stops a single-shape run from covering it.
+ *
+ * MEASURE AGAIN AFTER ANY CADENCE OR DECODER CHANGE — the surprises above came
+ * from a capture change that nobody thought to re-measure against. Emitting
+ * predict book events as deltas is worth about 2× (measured: 4.2× the bytes,
+ * 5.3× the parse, 5.7× the apply) and would bring predict's two back down.
  */
 export const REPLAY_MS_PER_MARKET_DAY = Object.freeze({
-  polymarket: Object.freeze({ nodejs: 65_000, python: 120_000 }),
-  predict: Object.freeze({ nodejs: 55_000, python: 180_000 }),
+  polymarket: Object.freeze({ nodejs: 84_000, python: 175_000 }),
+  predict: Object.freeze({ nodejs: 80_000, python: 180_000 }),
 });
 
 /**
@@ -666,9 +685,7 @@ export const REPLAY_MS_PER_MARKET_DAY = Object.freeze({
  * Fail-closed, because the two failures are not symmetric: too much budget
  * costs queue time on a run that was going to finish anyway, while too little
  * sells a run that cannot produce a report and refunds it after the customer
- * has waited. `polymarket/python` is the one value here that was not measured
- * — it is the measured python/nodejs ratio (3.4×) applied to polymarket's
- * rate, and it should be measured before anything is built on it.
+ * has waited.
  */
 export function replayMsPerMarketDay({ venue, language } = {}) {
   const rates = (byVenue) => Object.values(byVenue);
