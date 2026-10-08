@@ -92,7 +92,7 @@ export async function readEventLines(file, { dropTrades = false } = {}) {
  * `feed` is [{ path, bytes, rows: () => AsyncIterable<row> }], in read order.
  * Writes `<day>-<market>.jsonl.gz` into `eventsDir` for every usable market.
  */
-export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDir, feed }) {
+export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDir, feed, pause = null }) {
   // SPOOLED TO DISK, not accumulated in memory.
   //
   // One day of one asset is about two million events once the book, its deltas
@@ -167,6 +167,10 @@ export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDi
   // succeeded — never appeared in coverage either. The market with no data at
   // all was the one market we said nothing about.
   for (const marketId of markets.keys()) {
+    // A checkpoint for the prewarm: this half reads, sorts and gzips every
+    // market of the day after the archive is fully read, so a gate on the
+    // archive bytes alone would not cover it.
+    if (pause) await pause();
     const market = markets.get(marketId);
     const part = partOf(marketId);
     // Read back ONE market and sort it. The spool is a concatenation of

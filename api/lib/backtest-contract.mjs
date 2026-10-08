@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.0.1';
+export const SDK_VERSION = '2.0.2';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -669,13 +669,20 @@ export const MAX_REPLAY_MS = 6_480_000;   // 108 minutes
  * predict/python keeps 180 (26% over its worst) because 35 is the backtest
  * window and anything lower stops a single-shape run from covering it.
  *
+ * polymarket/python RAISED AGAIN to 210 s on 2026-10-08: the same customer's
+ * template-cheap strategy replayed at ~31 µs/event for hours (≈195 s on a
+ * 6.3M-event day) with no prewarm running and a warm cache — the host, not
+ * the code — and 175 s killed three runs. 210 covers 31 µs on a 6.8M day. Its
+ * ceiling drops 36 → 30 market-days; no customer run has ever asked for more
+ * than 30. The 108-minute ceiling is unchanged on purpose (one worker slot).
+ *
  * MEASURE AGAIN AFTER ANY CADENCE OR DECODER CHANGE — the surprises above came
  * from a capture change that nobody thought to re-measure against. Emitting
  * predict book events as deltas is worth about 2× (measured: 4.2× the bytes,
  * 5.3× the parse, 5.7× the apply) and would bring predict's two back down.
  */
 export const REPLAY_MS_PER_MARKET_DAY = Object.freeze({
-  polymarket: Object.freeze({ nodejs: 84_000, python: 175_000 }),
+  polymarket: Object.freeze({ nodejs: 84_000, python: 210_000 }),
   predict: Object.freeze({ nodejs: 80_000, python: 180_000 }),
 });
 

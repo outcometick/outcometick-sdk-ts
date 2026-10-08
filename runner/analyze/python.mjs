@@ -25,10 +25,12 @@ export const PYTHON = process.env.OT_PYTHON || 'python3';
  * Analyse a Python submission.
  *
  * @param {{name:string, content:string}[]} files
- * @param {{deps?:string[], timeoutMs?:number}} opts
- * @returns {Promise<{imports:string[]}>}
+ * @param {{deps?:string[], timeoutMs?:number, entry?:{file:string,className:string}, hookMethods?:string[]}} opts
+ *   `entry` and `hookMethods` say where the runner passes the context; without
+ *   them no ctx.ref/ctx.ext call is reported.
+ * @returns {Promise<{imports:string[], feeds:{kind:string,name:string,file:string,line:number}[]}>}
  */
-export function analyzePythonSubmission(files, { deps = [], timeoutMs = 10_000 } = {}) {
+export function analyzePythonSubmission(files, { deps = [], timeoutMs = 10_000, entry = null, hookMethods = [] } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(PYTHON, [SCRIPT], {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -73,13 +75,13 @@ export function analyzePythonSubmission(files, { deps = [], timeoutMs = 10_000 }
         return;
       }
       if (verdict.ok) {
-        resolve({ imports: verdict.imports ?? [] });
+        resolve({ imports: verdict.imports ?? [], feeds: verdict.feeds ?? [] });
         return;
       }
       const { code, detail, ...extra } = verdict;
       reject(new BacktestRejection(code, detail, extra));
     });
 
-    child.stdin.end(JSON.stringify({ files, deps }));
+    child.stdin.end(JSON.stringify({ files, deps, entry, hookMethods }));
   });
 }

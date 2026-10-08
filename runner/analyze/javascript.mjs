@@ -188,7 +188,13 @@ function memberPath(node) {
  * An exemption that is itself the attack is not an exemption.
  */
 function collectBindings(ast) {
-  const bound = new Set();
+  return new Set(bindingCounts(ast).keys());
+}
+
+/** How many times each name is bound in the file — collectBindings, counted. */
+function bindingCounts(ast) {
+  const counts = new Map();
+  const bound = { add: (n) => counts.set(n, (counts.get(n) ?? 0) + 1) };
   const addPattern = (p) => {
     if (!p) return;
     switch (p.type) {
@@ -202,7 +208,7 @@ function collectBindings(ast) {
   };
   walk(ast, (n) => {
     if (n.type === 'VariableDeclarator') addPattern(n.id);
-    else if (n.type === 'ClassDeclaration') { if (n.id) bound.add(n.id.name); }
+    else if (n.type === 'ClassDeclaration' || n.type === 'ClassExpression') { if (n.id) bound.add(n.id.name); }
     // A function declaration binds its own name AND its parameters. Missing the
     // parameters made `function f(Date) { return Date + 1 }` read as a wall-clock
     // access — a false positive, which is the expensive kind here.
@@ -220,7 +226,113 @@ function collectBindings(ast) {
       for (const p of n.value.params) addPattern(p);
     }
   });
-  return bound;
+  return counts;
+}
+
+/**
+ * Every `ctx.ref(...)` / `ctx.ext(...)` whose argument is known here.
+ *
+ * Only in the entry class's own declared hook methods — the one place the
+ * runner is known to pass the context — on the hook's first parameter, and
+ * only if that parameter is never rebound in the method: a helper with a
+ * `.ref` method of its own must not be mistaken for the context. Known means a constant string, or a top-level `const` bound to one
+ * and bound nowhere else in the file. Anything less certain is skipped — what
+ * this reports can reject a submission.
+ */
+function feedCalls(ast, name, entryClass, hookMethods) {
+  const counts = bindingCounts(ast);
+  const consts = new Map();
+  for (const stmt of ast.body) {
+    const decl = stmt.type === 'ExportNamedDeclaration' ? stmt.declaration : stmt;
+    if (decl?.type !== 'VariableDeclaration' || decl.kind !== 'const') continue;
+    for (const d of decl.declarations) {
+      if (d.id.type !== 'Identifier' || counts.get(d.id.name) !== 1) continue;
+      const v = foldString(d.init);
+      if (v != null) consts.set(d.id.name, v);
+    }
+  }
+  const found = [];
+  const hooks = new Set(hookMethods);
+  // The runner takes the module's EXPORT of that name. Only a class that is
+  // the sole binding of the name, and that no `export { X as S }` can replace,
+  // is certainly the one run.
+  if (counts.get(entryClass) !== 1) return found;
+  let aliased = false;
+  walk(ast, (n) => {
+    if (n.type === 'ExportSpecifier' && n.exported?.name === entryClass && n.local?.name !== entryClass) aliased = true;
+  });
+  if (aliased) return found;
+  const entry = ast.body
+    .map((stmt) => (stmt.type === 'ExportNamedDeclaration' || stmt.type === 'ExportDefaultDeclaration'
+      ? stmt.declaration : stmt))
+    .find((d) => d && (d.type === 'ClassDeclaration' || d.type === 'ClassExpression') && d.id?.name === entryClass);
+  if (!entry) return found;
+  // `this.onTick = ...` anywhere replaces the method the runner would call.
+  const assignedProps = new Set();
+  walk(ast, (n) => {
+    if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression') {
+      const p = n.left.computed ? foldString(n.left.property) : n.left.property.name;
+      if (p != null) assignedProps.add(p);
+    }
+  });
+  // Every spelling of a member name counts: `onTick`, `"onTick"`, `["onTick"]`.
+  // A computed key that cannot be folded could be any name, so the class is
+  // skipped outright.
+  const memberCount = new Map();
+  for (const m of entry.body.body) {
+    if (!m.key) continue;
+    const k = m.computed ? foldString(m.key)
+      : m.key.type === 'Identifier' ? m.key.name
+        : m.key.type === 'Literal' ? String(m.key.value) : null;
+    if (k == null) {
+      if (m.computed) return found;
+      continue;
+    }
+    memberCount.set(k, (memberCount.get(k) ?? 0) + 1);
+  }
+  for (const m of entry.body.body) {
+    if (m.type !== 'MethodDefinition' || m.kind !== 'method' || m.static || m.computed) continue;
+    if (m.key.type !== 'Identifier' || !hooks.has(m.key.name)) continue;
+    // Only a hook whose definition is certainly the one dispatched.
+    if (memberCount.get(m.key.name) !== 1 || assignedProps.has(m.key.name)) continue;
+    const ctxParam = m.value.params[0];
+    if (ctxParam?.type !== 'Identifier') continue;
+    const ctxName = ctxParam.name;
+    if (bindingCounts(m.value).get(ctxName) !== 1) continue;
+    // A declaration count does not see `ctx = other`; any assignment to the
+    // name, plain or destructuring, and the method is skipped.
+    let reassigned = false;
+    const hits = (p) => {
+      if (!p) return false;
+      switch (p.type) {
+        case 'Identifier': return p.name === ctxName;
+        case 'ObjectPattern': return p.properties.some((x) => hits(x.value ?? x.argument));
+        case 'ArrayPattern': return p.elements.some(hits);
+        case 'AssignmentPattern': return hits(p.left);
+        case 'RestElement': return hits(p.argument);
+        default: return false;
+      }
+    };
+    walk(m.value.body, (n) => {
+      if ((n.type === 'AssignmentExpression' && hits(n.left))
+        || (n.type === 'UpdateExpression' && hits(n.argument))
+        || ((n.type === 'ForInStatement' || n.type === 'ForOfStatement') && hits(n.left))) reassigned = true;
+    });
+    if (reassigned) continue;
+    walk(m.value.body, (n) => {
+      if (n.type !== 'CallExpression' || n.callee.type !== 'MemberExpression') return;
+      const { object, property, computed } = n.callee;
+      const method = computed ? foldString(property) : property.name;
+      if ((method !== 'ref' && method !== 'ext')) return;
+      if (object.type !== 'Identifier' || object.name !== ctxName) return;
+      if (n.arguments.length !== 1) return;
+      const arg = n.arguments[0];
+      const value = arg.type === 'Identifier' ? consts.get(arg.name) ?? null : foldString(arg);
+      if (value == null) return;
+      found.push({ kind: method, name: value, file: name, line: n.loc?.start?.line ?? null });
+    });
+  }
+  return found.sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
 }
 
 /**
@@ -229,10 +341,10 @@ function collectBindings(ast) {
  * @param {string} source
  * @param {string} name       file name, for the error message
  * @param {string[]} allowedDeps  package names the manifest declared
- * @returns {{imports: string[]}}
+ * @returns {{imports: string[], feeds: {kind: string, name: string, file: string, line: number|null}[]}}
  * @throws {BacktestRejection}
  */
-export function analyzeJavaScript(source, name, allowedDeps = []) {
+export function analyzeJavaScript(source, name, allowedDeps = [], { entryClass = null, hookMethods = [] } = {}) {
   let ast;
   try {
     ast = parse(source, { ecmaVersion: 2023, sourceType: 'module', locations: true });
@@ -347,7 +459,7 @@ export function analyzeJavaScript(source, name, allowedDeps = []) {
     }
   });
 
-  return { imports };
+  return { imports, feeds: entryClass ? feedCalls(ast, name, entryClass, hookMethods) : [] };
 }
 
 /**
@@ -358,12 +470,15 @@ export function analyzeJavaScript(source, name, allowedDeps = []) {
  * credits are held. Catching it here keeps the "a rejection costs nothing"
  * promise true.
  */
-export function analyzeJavaScriptSubmission(files, { deps = [] } = {}) {
+export function analyzeJavaScriptSubmission(files, { deps = [], entry = null, hookMethods = [] } = {}) {
   const names = new Set(files.map((f) => f.name));
   const all = [];
+  const feeds = [];
   for (const f of files) {
     if (!/\.(mjs|js)$/.test(f.name)) continue;
-    const { imports } = analyzeJavaScript(f.content, f.name, deps);
+    const { imports, feeds: fileFeeds } = analyzeJavaScript(f.content, f.name, deps,
+      entry && f.name === entry.file ? { entryClass: entry.className, hookMethods } : {});
+    feeds.push(...fileFeeds);
     for (const spec of imports) {
       if (!String(spec).startsWith('.')) continue;
       const resolved = spec.replace(/^\.\//, '');
@@ -376,5 +491,5 @@ export function analyzeJavaScriptSubmission(files, { deps = [] } = {}) {
     }
     all.push(...imports);
   }
-  return { imports: [...new Set(all)] };
+  return { imports: [...new Set(all)], feeds };
 }

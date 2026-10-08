@@ -13,7 +13,7 @@ submit. A false positive here breaks that promise.
 Reads a JSON job on stdin and writes a JSON verdict on stdout:
 
     {"files": [{"name": "strategy.py", "content": "..."}], "deps": ["numpy"]}
-    -> {"ok": true, "imports": ["numpy"]}
+    -> {"ok": true, "imports": ["numpy"], "feeds": [{"kind": "ref", "name": "...", "file": "...", "line": 9}]}
     -> {"ok": false, "code": "E_IMPORT", "detail": "...", "file": "...", "line": 3}
 """
 
@@ -177,7 +177,109 @@ def check_import(module, name, line, deps, relative_ok):
     )
 
 
-def analyze_source(source, name, deps):
+def binding_counts(root):
+    """How many times each name is bound anywhere under `root`."""
+    binds = {}
+
+    def bind(n):
+        if n:
+            binds[n] = binds.get(n, 0) + 1
+
+    for node in ast.walk(root):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bind(node.id)
+        elif isinstance(node, ast.arg):
+            bind(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bind(node.name)
+        elif isinstance(node, ast.alias):
+            bind((node.asname or node.name).split(".")[0])
+        # The bindings that are plain strings rather than Name nodes.
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            bind(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            bind(node.rest)
+        elif type(node).__name__ in ("TypeVar", "ParamSpec", "TypeVarTuple"):
+            bind(node.name)
+    return binds
+
+
+def feed_calls(tree, name, entry, hook_methods):
+    """Every `ctx.ref(...)` / `ctx.ext(...)` whose argument is known here.
+
+    Only in the entry class's own declared hook methods -- the one place the
+    runner is known to pass the context -- on the hook's context parameter,
+    and only if that parameter is never rebound in the method: a helper with a
+    `.ref` method of its own must not be mistaken for the context. Known means a string literal, or a module-level constant bound to
+    one and bound nowhere else in the file. Anything less certain is skipped --
+    what this reports can reject a submission.
+    """
+    binds = binding_counts(tree)
+    consts = {}
+    for stmt in tree.body:
+        target = value = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            target, value = stmt.targets[0].id, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            target, value = stmt.target.id, stmt.value
+        if target and binds.get(target) == 1 and isinstance(value, ast.Constant) and isinstance(value.value, str):
+            consts[target] = value.value
+
+    found = []
+    if not entry or name != entry.get("file"):
+        return found
+    class_name = entry.get("className")
+    # The runner takes the module's FINAL binding of the name: a second
+    # `class S` (or any rebinding) and the one read here may not be the one run.
+    if binds.get(class_name) != 1:
+        return found
+    # `self.on_tick = ...` anywhere replaces the method the runner would call.
+    assigned_attrs = {n.attr for n in ast.walk(tree)
+                      if isinstance(n, ast.Attribute) and isinstance(n.ctx, (ast.Store, ast.Del))}
+    for cls in tree.body:
+        if not (isinstance(cls, ast.ClassDef) and cls.name == class_name):
+            continue
+        defined = {}
+        for member in cls.body:
+            for n in ast.walk(member) if isinstance(member, (ast.Assign, ast.AnnAssign, ast.AugAssign)) else [member]:
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    defined[n.id] = defined.get(n.id, 0) + 1
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined[member.name] = defined.get(member.name, 0) + 1
+        for fn in cls.body:
+            if not (isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name in hook_methods):
+                continue
+            # Only a hook whose definition is certainly the one dispatched.
+            if fn.decorator_list or defined.get(fn.name) != 1 or fn.name in assigned_attrs:
+                continue
+            params = fn.args.posonlyargs + fn.args.args
+            if len(params) < 2:
+                continue
+            ctx_name = params[1].arg
+            if binding_counts(fn).get(ctx_name) != 1:
+                continue
+            for node in ast.walk(fn):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("ref", "ext")
+                        and isinstance(node.func.value, ast.Name) and node.func.value.id == ctx_name):
+                    continue
+                if len(node.args) != 1 or node.keywords:
+                    continue
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    value = arg.value
+                elif isinstance(arg, ast.Name) and arg.id in consts:
+                    value = consts[arg.id]
+                else:
+                    continue
+                found.append({"kind": node.func.attr, "name": value, "file": name, "line": node.lineno})
+    # Source order: the first undeclared call in the file is the one a
+    # rejection should point at.
+    found.sort(key=lambda f: f["line"])
+    return found
+
+
+def analyze_source(source, name, deps, entry=None, hook_methods=()):
     try:
         tree = ast.parse(source, filename=name)
     except SyntaxError as err:
@@ -294,7 +396,7 @@ def analyze_source(source, name, deps):
                     node.lineno,
                 )
 
-    return imports
+    return imports, feed_calls(tree, name, entry, set(hook_methods))
 
 
 def main():
@@ -306,15 +408,19 @@ def main():
 
     files = job.get("files") or []
     deps = set(job.get("deps") or [])
+    entry = job.get("entry")
+    hook_methods = job.get("hookMethods") or []
     names = {f.get("name") for f in files}
     all_imports = []
+    all_feeds = []
 
     try:
         for f in files:
             name = f.get("name") or ""
             if not name.endswith(".py"):
                 continue
-            imports = analyze_source(f.get("content") or "", name, deps)
+            imports, feeds = analyze_source(f.get("content") or "", name, deps, entry, hook_methods)
+            all_feeds.extend(feeds)
             for spec in imports:
                 if not spec.startswith("."):
                     continue
@@ -332,7 +438,7 @@ def main():
         print(json.dumps(r.payload))
         return 1
 
-    print(json.dumps({"ok": True, "imports": sorted(set(all_imports))}))
+    print(json.dumps({"ok": True, "imports": sorted(set(all_imports)), "feeds": all_feeds}))
     return 0
 
 

@@ -346,3 +346,121 @@ test('a local named Object is the local, not the global', () => {
     'export function f(Object) { return Object.anything; }', 'x.mjs',
   ));
 });
+
+// ---------------------------------------------------------------------------
+// ctx.ref / ctx.ext names the analyser can read (checked against the manifest
+// by analyzeSource — see index.test.mjs)
+// ---------------------------------------------------------------------------
+
+const ENTRY = { entryClass: 'S', hookMethods: ['onMarketOpen', 'onTick', 'onBook', 'onTrade', 'onSettle'] };
+
+test('feeds: literals, templates and top-level consts are reported with their line', () => {
+  const { feeds } = analyzeJavaScript(`import { Strategy } from "outcometick";
+const FEED = "binance:btcusdt:spot:1s";
+export const SIG = \`my_signal\`;
+export default class S extends Strategy {
+  onMarketOpen(ctx, market) { this.openPx = ctx.ref(FEED).last.close; }
+  onTick(ctx, tick) {
+    const a = ctx.ref("binance:" + "ethusdt:spot:1m");
+    const b = ctx["ext"](SIG);
+    return null;
+  }
+}`, 'strategy.mjs', [], ENTRY);
+  assert.deepEqual(feeds, [
+    { kind: 'ref', name: 'binance:btcusdt:spot:1s', file: 'strategy.mjs', line: 5 },
+    { kind: 'ref', name: 'binance:ethusdt:spot:1m', file: 'strategy.mjs', line: 7 },
+    { kind: 'ext', name: 'my_signal', file: 'strategy.mjs', line: 8 },
+  ]);
+});
+
+test('feeds: anything not certain is skipped, never guessed', () => {
+  const { feeds } = analyzeJavaScript(`import { Strategy } from "outcometick";
+const FEED = "binance:btcusdt:spot:1s";
+let LOOSE = "a";
+export default class S extends Strategy {
+  onTick(ctx, tick) {
+    const FEED = "shadowed";
+    const name = "binance:" + tick.market_id;
+    ctx.ref(FEED);
+    ctx.ref(LOOSE);
+    ctx.ref(name);
+    ctx.ref(\`binance:\${name}\`);
+    this.helper.ref("not-a-ctx-call");
+    ctx.ref("x", "y");
+    return null;
+  }
+}`, 'strategy.mjs', [], ENTRY);
+  assert.deepEqual(feeds, []);
+});
+
+test('feeds: only the entry file, the entry class and its declared hooks are inspected', () => {
+  const files = [
+    { name: 'strategy.mjs', content: `import { Strategy } from "outcometick";
+import { Base, Helper } from "./util.mjs";
+class Local { onTick(ctx) { return ctx.ref("a class in the entry file that is not the entry"); } }
+export default class S extends Base {
+  onTick(ctx) { return new Helper().onLookup({ ref: (n) => n }); }
+  onBook(ctx) { return ctx.ref("binance:btcusdt:spot:1s"); }
+}` },
+    { name: 'util.mjs', content: `export class Base { onMarketOpen(ctx) { this.x = ctx.ref("inherited, not certain"); } }
+export class Helper { onLookup(cache) { return cache.ref("local"); } onTick(ctx) { return ctx.ref("helper"); } }` },
+  ];
+  const entry = { file: 'strategy.mjs', className: 'S' };
+  assert.deepEqual(analyzeJavaScriptSubmission(files, { entry, hookMethods: ['onTick', 'onMarketOpen'] }).feeds, []);
+  assert.deepEqual(analyzeJavaScriptSubmission(files, { entry, hookMethods: ['onTick', 'onBook'] }).feeds,
+    [{ kind: 'ref', name: 'binance:btcusdt:spot:1s', file: 'strategy.mjs', line: 6 }]);
+  assert.deepEqual(analyzeJavaScriptSubmission(files).feeds, []);
+});
+
+test('feeds: a receiver that is not the hook context is never inspected', () => {
+  const { feeds } = analyzeJavaScript(`import { Strategy } from "outcometick";
+const FEED = "unused";
+const Helper = class FEED { static read(c) { return c.ext("x"); } };
+export default class S extends Strategy {
+  onTick(ctx, tick) {
+    const helper = { ref: (n) => n, ext: (n) => n };
+    helper.ref("local");
+    helper.ext("signal");
+    return null;
+  }
+  onBook(ctx, book) {
+    ctx = { ref: () => null };
+    ctx.ref("rebound");
+    return null;
+  }
+  onTrade(c, t) { return [1].map((c) => c.ref("shadowed by the arrow")); }
+  onSettle(ctx, m, o) { [ctx] = [{ ext: () => null }]; return ctx.ext("destructured"); }
+  notAHook(ctx) { return ctx.ref("not a hook"); }
+}`, 'strategy.mjs', [], ENTRY);
+  assert.deepEqual(feeds, []);
+});
+
+test('feeds: a hook that may not be the one dispatched is not inspected', () => {
+  const opts = { entryClass: 'S', hookMethods: ['onTick', 'onBook', 'onTrade'] };
+  const none = (src) => assert.deepEqual(analyzeJavaScript(src, 'strategy.mjs', [], opts).feeds, []);
+  // The export named S is another class.
+  none(`import { Strategy } from "outcometick";
+class S extends Strategy { onTick(ctx) { return ctx.ref("not the export"); } }
+class Live extends Strategy { onTick(ctx) { return null; } }
+export { Live as S };`);
+  // Duplicate hook, instance override, same-named field.
+  none(`import { Strategy } from "outcometick";
+export class S extends Strategy {
+  constructor() { super(); this.onTrade = () => null; }
+  onTick(ctx) { return ctx.ref("replaced below"); }
+  onTick(ctx) { return null; }
+  onBook = null;
+  onBook(ctx) { return ctx.ref("field"); }
+  onTrade(ctx) { return ctx.ref("instance override"); }
+}`);
+});
+
+test('feeds: every spelling of a member name counts as a redefinition', () => {
+  const opts = { entryClass: 'S', hookMethods: ['onTick', 'onBook'] };
+  const none = (src) => assert.deepEqual(analyzeJavaScript(src, 'strategy.mjs', [], opts).feeds, []);
+  none(`export class S { onTick(ctx) { return ctx.ref("unused"); } "onTick"(ctx) { return null; } }`);
+  none(`export class S { onTick(ctx) { return ctx.ref("unused"); } ["on" + "Tick"](ctx) { return null; } }`);
+  // A computed name nobody can fold could be the hook.
+  none(`const k = ["onBook", "x"][Math.floor(0.5)];
+export class S { onBook(ctx) { return ctx.ref("unused"); } [k](ctx) { return null; } }`);
+});

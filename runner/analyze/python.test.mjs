@@ -318,3 +318,160 @@ class Demo(Strategy):
   ];
   await rejects('E_IMPORT', files);
 });
+
+// ---------------------------------------------------------------------------
+// ctx.ref / ctx.ext names the analyser can read (checked against the manifest
+// by analyzeSource — see index.test.mjs)
+// ---------------------------------------------------------------------------
+
+const ENTRY = { entry: { file: 'strategy.py', className: 'S' },
+  hookMethods: ['on_market_open', 'on_tick', 'on_book', 'on_trade', 'on_settle'] };
+
+test('feeds: literals and module constants are reported with their line', async () => {
+  const { feeds } = await analyzePythonSubmission(py(`from outcometick import Strategy
+FEED = "binance:btcusdt:spot:1s"
+SIG: str = "my_signal"
+
+
+class S(Strategy):
+    def on_market_open(self, ctx, market):
+        self.open_px = ctx.ref(FEED).last.close
+
+    def on_tick(self, ctx, tick):
+        a = ctx.ref("binance:ethusdt:spot:1m")
+        b = ctx.ext(SIG)
+        return None
+`), ENTRY);
+  assert.deepEqual(feeds, [
+    { kind: 'ref', name: 'binance:btcusdt:spot:1s', file: 'strategy.py', line: 8 },
+    { kind: 'ref', name: 'binance:ethusdt:spot:1m', file: 'strategy.py', line: 11 },
+    { kind: 'ext', name: 'my_signal', file: 'strategy.py', line: 12 },
+  ]);
+});
+
+test('feeds: anything not certain is skipped, never guessed', async () => {
+  const { feeds } = await analyzePythonSubmission(py(`from outcometick import Strategy
+FEED = "binance:btcusdt:spot:1s"
+OTHER = "a"
+
+
+class S(Strategy):
+    def on_tick(self, ctx, tick, FEED=None):
+        global OTHER
+        OTHER = "b"
+        name = "binance:" + tick.market_id
+        ctx.ref(FEED)
+        ctx.ref(OTHER)
+        ctx.ref(name)
+        ctx.ref(f"binance:{name}")
+        self.helper.ref("not-a-ctx-call")
+        ctx.ref("x", "y")
+        return None
+`), ENTRY);
+  assert.deepEqual(feeds, []);
+});
+
+test('feeds: a receiver that is not the hook context, or a shadowed constant, is never inspected', async () => {
+  const { feeds } = await analyzePythonSubmission(py(`from outcometick import Strategy
+FEED = "unused"
+ALIAS = "unused-too"
+
+
+def helper(ctx):
+    return ctx.ref("only-a-helper-says-this")
+
+
+class S(Strategy):
+    def on_tick(self, ctx, tick):
+        helper = Helper()
+        helper.ref("local")
+        helper.ext("signal")
+        match tick.market_id:
+            case FEED:
+                ctx.ext(FEED)
+        return None
+
+    def on_book(self, ctx, book):
+        try:
+            pass
+        except Exception as ALIAS:
+            ctx.ref(ALIAS)
+        return None
+
+    def on_trade(self, ctx, trade):
+        ctx = self.other
+        ctx.ref("rebound")
+        return None
+
+    def on_settle(self, ctx, market, outcome):
+        return [ctx.ref("x") for ctx in []]
+
+    def not_a_hook(self, ctx):
+        return ctx.ref("not a hook")
+`), ENTRY);
+  assert.deepEqual(feeds, []);
+});
+
+test('feeds: only the entry class and only its declared hooks are inspected', async () => {
+  const src = `from outcometick import Strategy
+
+
+class Helper:
+    def on_lookup(self, cache):
+        return cache.ref("local")
+
+    def on_tick(self, ctx, tick):
+        return ctx.ref("helper-class, same hook name")
+
+
+class S(Strategy):
+    def on_tick(self, ctx, tick):
+        return Helper().on_lookup(MyCache())
+
+    def on_book(self, ctx, book):
+        return ctx.ref("binance:btcusdt:spot:1s")
+`;
+  // on_book is not a declared hook here: the runner never calls it with a context.
+  const { feeds } = await analyzePythonSubmission(py(src),
+    { entry: { file: 'strategy.py', className: 'S' }, hookMethods: ['on_tick'] });
+  assert.deepEqual(feeds, []);
+  const declared = await analyzePythonSubmission(py(src),
+    { entry: { file: 'strategy.py', className: 'S' }, hookMethods: ['on_tick', 'on_book'] });
+  assert.deepEqual(declared.feeds.map((f) => f.line), [17]);
+  // No entry, nothing reported.
+  assert.deepEqual((await analyzePythonSubmission(py(src))).feeds, []);
+});
+
+test('feeds: a hook that may not be the one dispatched is not inspected', async () => {
+  const entry = { file: 'strategy.py', className: 'S' };
+  const hookMethods = ['on_tick', 'on_book', 'on_trade', 'on_settle'];
+  const none = async (src) => assert.deepEqual((await analyzePythonSubmission(py(src), { entry, hookMethods })).feeds, []);
+  // A later `class S` is the one the runner takes.
+  await none(`from outcometick import Strategy
+class S(Strategy):
+    def on_tick(self, ctx, tick):
+        return ctx.ref("old class")
+class S(Strategy):
+    def on_tick(self, ctx, tick):
+        return None
+`);
+  // Duplicate hook, instance override, class attribute, decorator.
+  await none(`from outcometick import Strategy
+import functools
+class S(Strategy):
+    on_book = None
+    def __init__(self):
+        self.on_trade = lambda ctx, t: None
+    def on_tick(self, ctx, tick):
+        return ctx.ref("replaced below")
+    def on_tick(self, ctx, tick):
+        return None
+    def on_book(self, ctx, book):
+        return ctx.ref("class attribute wins? not certain")
+    def on_trade(self, ctx, trade):
+        return ctx.ref("instance override")
+    @functools.cache
+    def on_settle(self, ctx, market, outcome):
+        return ctx.ref("decorated")
+`);
+});
