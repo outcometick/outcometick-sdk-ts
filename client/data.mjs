@@ -256,7 +256,7 @@ export class DataClient {
   // A separate subscription with its OWN key (a data key gets 403 here, and a
   // smart-money key gets 403 on everything above). Daily files of the trades
   // made by the top-ranked Polymarket traders: list top100, or top1000 on the
-  // Top 1000 plan. Until it is on sale these answer 503.
+  // Top 1000 plan. While it is not on sale these answer 503.
 
   /** The days this smart-money key may download, newest first, each list's status. */
   async smartDays() {

@@ -155,12 +155,12 @@ export async function cmdRun({ dir, flags }) {
   const dataRoot = flags.data;
   if (!dataRoot) {
     throw new Error('--data is required: point it at an unpacked sample archive\n'
-      + '  curl -L https://github.com/Ligengxin96/polymarket-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz');
+      + '  curl -L https://github.com/outcometick/polymarket-tick-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz');
   }
   if (!await looksLikeArchive(dataRoot)) {
     throw new Error(`${path.resolve(dataRoot)} does not look like an archive — no recognisable data files under it\n`
       + '  the sample archive is a release download, not the git repository:\n'
-      + '  curl -L https://github.com/Ligengxin96/polymarket-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz');
+      + '  curl -L https://github.com/outcometick/polymarket-tick-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz');
   }
 
   const files = await readSubmission(dir);

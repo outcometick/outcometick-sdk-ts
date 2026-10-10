@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 241418274f8c5ed7527dcb3dc96f28abc893b2e5.
+  Generated from monorepo revision 54d381c06862108cc51dcfa7c7b5278f8316f574.
 -->
 
 # outcometick
@@ -70,7 +70,7 @@ ship in this package rather than being reimplemented client-side.
 It is the same engine, the same report and the same archive format the queue
 uses, against a local copy of the archive:
 
-    curl -L https://github.com/Ligengxin96/polymarket-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz
+    curl -L https://github.com/outcometick/polymarket-tick-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz
 
 It is **not** the sandbox. Locally your strategy runs as you, with your
 privileges, on your machine — which is fine, because it is your code. On our
@@ -117,10 +117,10 @@ Downloads are checksum-verified: `/v1/dl` redirects to storage with the sha256
 in a header, and the client follows that redirect itself so the checksum is not
 thrown away.
 
-### Smart-money trade history (coming soon)
+### Smart-money trade history
 
 A separate subscription with its own key: daily files of the trades made by the
-top-ranked Polymarket traders. Until it is on sale these calls answer 503.
+top-ranked Polymarket traders.
 
 ```ts
 const smart = new DataClient({ key: process.env.OT_SMART_KEY });

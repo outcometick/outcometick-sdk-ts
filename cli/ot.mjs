@@ -63,12 +63,17 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
   ot fetch <run_id> [--out <file>]
       Download a finished run's archive. Needs OT_BACKTEST_KEY.
 
+  ot mcp
+      Serve the API to an AI coding tool over MCP (stdio). Reads OT_KEY for
+      data tools and OT_BACKTEST_KEY for run status; never submits a run.
+          claude mcp add outcometick -e OT_KEY=ck_… -- npx -y -p outcometick ot mcp
+
   Common:
       --json          machine-readable output
       --api <url>     API base (default https://outcometick.com)
 
   Free sample data:
-      curl -L https://github.com/Ligengxin96/polymarket-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz
+      curl -L https://github.com/outcometick/polymarket-tick-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz
 `;
 
 /** Parse argv into {command, dir, flags}. */
@@ -228,6 +233,10 @@ async function main(argv) {
     if (command === 'status') {
       const { cmdStatus } = await import('./commands/status.mjs');
       return await cmdStatus(parsed);
+    }
+    if (command === 'mcp') {
+      const { cmdMcp } = await import('./mcp.mjs');
+      return await cmdMcp(parsed);
     }
     if (command === 'fetch') {
       const { cmdFetch } = await import('./commands/fetch.mjs');
