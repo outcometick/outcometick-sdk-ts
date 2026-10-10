@@ -197,4 +197,36 @@ export declare class DataClient {
   smartPlans(): Promise<{ onSale: boolean; plans: Array<{ planId: string; plan: string; usd: number; passUsd: number | null; interval: string }> }>;
 }
 
+/** One price level, spelled as the archive wrote it. */
+export interface BookLevel {
+  price: string;
+  size: string;
+}
+
+/** A token's rebuilt ladder, best level first on each side. */
+export interface BookLadder {
+  bids: BookLevel[];
+  asks: BookLevel[];
+}
+
+/**
+ * Rebuilds a Polymarket order book, per outcome token, from the archive's
+ * `book`, `price_change` and `best_bid_ask` rows fed in receipt order
+ * (`recv_ms`). A snapshot replaces the token's ladder, a change sets a level to
+ * an absolute size (0 removes it), and levels crossed by the newest best bid or
+ * ask are dropped. That cannot restore what dropped frames added or resized:
+ * until the next snapshot a level, at the top too, can be missing or carry an
+ * old size. Other row types are ignored.
+ */
+export declare class OrderBook {
+  constructor();
+  /** Apply one archive row: the parsed object, or the JSONL line. */
+  apply(row: object | string): this;
+  /** Token ids seen so far. */
+  assets(): string[];
+  ladder(assetId: string): BookLadder;
+  /** The best level of the rebuilt ladder — not the market's latest best bid/ask (read best_bid_ask rows for that). */
+  best(assetId: string): { bid: BookLevel | null; ask: BookLevel | null };
+}
+
 export default DataClient;

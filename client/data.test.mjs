@@ -15,7 +15,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { DataClient, OutcometickError, NO_VALUE } from './data.mjs';
+import { DataClient, OutcometickError, NO_VALUE, OrderBook } from './data.mjs';
 
 const PAYLOAD = gzipSync(Buffer.from('ts_ms,value\n1755000000000,65000\n'));
 const SHA = createHash('sha256').update(PAYLOAD).digest('hex');
@@ -356,3 +356,99 @@ test('smart routes: days with the key; coverage and plans public; errors keep th
     '/v1/smart/days': (_q, _r, _u, json) => json(503, { error: 'smart-money is not on sale yet' }),
   });
 });
+
+// ---------- OrderBook ---------------------------------------------------
+// Rows shaped like the archive's (envelope + payload verbatim). Mirrored case
+// for case in test_data.py, and client/order-book-parity.test.mjs feeds both
+// implementations the same generated stream.
+
+const bookRow = (asset_id, bids, asks, recv_ms = 1) => ({
+  slug: 'btc-updown-5m-1', asset_id, event_type: 'book', event_ts_ms: recv_ms, recv_ms,
+  payload: { event_type: 'book', asset_id, market: '0xm', timestamp: String(recv_ms), hash: 'h',
+    bids: bids.map(([price, size]) => ({ price, size })), asks: asks.map(([price, size]) => ({ price, size })) },
+});
+const changeRow = (items, recv_ms = 2) => ({
+  slug: 'btc-updown-5m-1', asset_id: null, event_type: 'price_change', event_ts_ms: recv_ms, recv_ms,
+  payload: { event_type: 'price_change', market: '0xm', timestamp: String(recv_ms),
+    price_changes: items.map(([asset_id, side, price, size, best_bid, best_ask]) => ({ asset_id, side, price, size, hash: 'h', best_bid, best_ask })) },
+});
+const bboRow = (asset_id, best_bid, best_ask, recv_ms = 3) => ({
+  slug: 'btc-updown-5m-1', asset_id, event_type: 'best_bid_ask', event_ts_ms: recv_ms, recv_ms,
+  payload: { event_type: 'best_bid_ask', asset_id, market: '0xm', best_bid, best_ask, spread: '0.01', timestamp: String(recv_ms) },
+});
+const flat = (side) => side.map((l) => [l.price, l.size]);
+
+test('OrderBook: a snapshot sets the ladder, best level first, as the archive spelled it', () => {
+  const b = new OrderBook().apply(bookRow('A', [['0.48', '5'], ['0.50', '10'], ['0.49', '0']], [['0.53', '2'], ['0.52', '7']]));
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.50', '10'], ['0.48', '5']]);
+  assert.deepEqual(flat(b.ladder('A').asks), [['0.52', '7'], ['0.53', '2']]);
+  assert.deepEqual(b.best('A'), { bid: { price: '0.50', size: '10' }, ask: { price: '0.52', size: '7' } });
+  assert.deepEqual(b.assets(), ['A']);
+});
+
+test('OrderBook: price_change sets absolute sizes, 0 removes, and "0.5" is the same level as "0.50"', () => {
+  const b = new OrderBook().apply(bookRow('A', [['0.50', '10'], ['0.48', '5']], [['0.52', '7']]));
+  b.apply(changeRow([['A', 'BUY', '0.5', '12', '0.5', '0.52'], ['A', 'BUY', '0.48', '0', '0.5', '0.52'], ['A', 'SELL', '0.55', '3', '0.5', '0.52']]));
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.5', '12']]);
+  assert.deepEqual(flat(b.ladder('A').asks), [['0.52', '7'], ['0.55', '3']]);
+});
+
+test('OrderBook: a ghost left by a missed removal is pruned by the best prices a later row carries', () => {
+  const b = new OrderBook().apply(bookRow('A', [['0.50', '10'], ['0.49', '4']], [['0.52', '7'], ['0.53', '1']]));
+  // The removals of 0.50 (bid) and 0.52 (ask) were never stored; the next stored
+  // change elsewhere says the best is now 0.49 / 0.53.
+  b.apply(changeRow([['A', 'BUY', '0.47', '6', '0.49', '0.53']]));
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.49', '4'], ['0.47', '6']]);
+  assert.deepEqual(flat(b.ladder('A').asks), [['0.53', '1']]);
+});
+
+test('OrderBook: best_bid_ask prunes only crossed levels and never adds one', () => {
+  const b = new OrderBook().apply(bookRow('A', [['0.50', '10'], ['0.49', '4']], [['0.52', '7']]));
+  b.apply(bboRow('A', '0.49', '0.51'));
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.49', '4']]);
+  assert.deepEqual(flat(b.ladder('A').asks), [['0.52', '7']], 'a better ask it has no size for is not invented');
+});
+
+test('OrderBook: a best price that is missing or outside [0, 1] prunes nothing', () => {
+  const b = new OrderBook().apply(bookRow('A', [['0.50', '10']], [['0.52', '7']]));
+  b.apply(bboRow('A', '', null));
+  b.apply(bboRow('A', '1.5', 'abc'));
+  b.apply(bboRow('A', true, '-0.1'));
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.50', '10']]);
+  assert.deepEqual(flat(b.ladder('A').asks), [['0.52', '7']]);
+});
+
+test('OrderBook: blank strings, containers and non-decimal spellings are not numbers — they neither prune nor remove', () => {
+  const b = new OrderBook().apply(bookRow('A', [['0.50', '10'], ['0.49', '4']], [['0.52', '7']]));
+  for (const junk of [' ', [], {}, '0x0', 'Infinity', '1e400', ' 0.5', '1_0']) b.apply(bboRow('A', junk, junk));
+  b.apply(changeRow([['A', 'BUY', '0.50', ' ', 'x', 'x'], ['A', 'BUY', ' ', '0', 'x', 'x'], ['A', 'SELL', '0.52', [], 'x', 'x']]));
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.50', '10'], ['0.49', '4']]);
+  assert.deepEqual(flat(b.ladder('A').asks), [['0.52', '7']]);
+  b.apply(bboRow('A', '5e-1', 1));
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.50', '10'], ['0.49', '4']], 'a bid AT the best is kept');
+});
+
+test('OrderBook: tokens are kept apart, and each is pruned by its own last item', () => {
+  const b = new OrderBook().apply(bookRow('A', [['0.50', '1']], [])).apply(bookRow('B', [['0.50', '2']], []));
+  b.apply(changeRow([['A', 'BUY', '0.40', '1', '0.45', '0.6'], ['B', 'BUY', '0.30', '1', '0.5', '0.6']]));
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.40', '1']]);
+  assert.deepEqual(flat(b.ladder('B').bids), [['0.50', '2'], ['0.30', '1']]);
+});
+
+test('OrderBook: a snapshot replaces the token ladder whole; JSONL lines, legacy changes and other types work', () => {
+  const b = new OrderBook().apply(JSON.stringify(bookRow('A', [['0.50', '10']], [['0.52', '7']])));
+  b.apply({ asset_id: 'A', event_type: 'price_change', payload: { changes: [{ side: 'BUY', price: '0.51', size: '3' }] } });
+  assert.deepEqual(flat(b.ladder('A').bids), [['0.51', '3'], ['0.50', '10']]);
+  b.apply({ asset_id: 'A', event_type: 'last_trade_price', payload: { price: '0.9', size: '1' } });
+  b.apply(bookRow('A', [['0.45', '1']], []));
+  assert.deepEqual(b.ladder('A'), { bids: [{ price: '0.45', size: '1' }], asks: [] });
+  assert.deepEqual(new OrderBook().ladder('nope'), { bids: [], asks: [] });
+  assert.deepEqual(new OrderBook().best('nope'), { bid: null, ask: null });
+});
+
+test('OrderBook: ladder() hands out copies', () => {
+  const b = new OrderBook().apply(bookRow('A', [['0.50', '10']], []));
+  b.ladder('A').bids[0].size = '999';
+  assert.equal(b.ladder('A').bids[0].size, '10');
+});
+
