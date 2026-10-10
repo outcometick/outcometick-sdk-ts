@@ -55,7 +55,7 @@ async function stubApi(routes) {
 
 const DONE_RUN = {
   run_id: 'run_abc',
-  status: 'done',
+  status: 'complete',
   language: 'python@3.14',
   mode: 'market',
   venue: 'polymarket',
@@ -87,7 +87,7 @@ test('ot status prints the run, and the refund alongside what was spent', async 
     const { code, stdout } = await ot(['status', 'run_abc', '--api', api.url]);
     assert.equal(code, 0);
     assert.match(stdout, /run_abc/);
-    assert.match(stdout, /status\s+done/);
+    assert.match(stdout, /status\s+complete/);
     // Both halves of the money. A partial run bills for the market-days it
     // actually read; printing only the spend makes a refund look like an
     // overcharge.
@@ -467,4 +467,41 @@ test('ot submit without a range, or with a bad --days, says how to ask', async (
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('ot status shows a run the queue gave up on as fully refunded, not held', async () => {
+  // leaseRun's attempts-exhausted branch fails the run and refunds it in full
+  // but writes no credits_spent; the API returns that null as it is.
+  const api = await stubApi({
+    'GET /v1/backtest/run/run_gaveup': (req, res) => json(res, 200, {
+      ...DONE_RUN, run_id: 'run_gaveup', status: 'failed', credits_held: 7, credits_spent: null,
+      report: null, archive_available: false,
+      rejection: { code: 'E_BUDGET', detail: 'run did not complete after 4 attempts' },
+    }),
+  });
+  try {
+    const { code, stdout } = await ot(['status', 'run_gaveup', '--api', api.url]);
+    assert.equal(code, 0);
+    assert.match(stdout, /0 spent \(7 returned\)/);
+    assert.doesNotMatch(stdout, /held/);
+  } finally {
+    await api.close();
+  }
+});
+
+// Only in the monorepo: the published package carries neither the server nor
+// its database module. This is the check that was missing when the table said
+// done/expired and the server said complete/cancelled — the stub above had the
+// same wrong names, so every test passed while every finished run showed its
+// credits as "held".
+const DB = fileURLToPath(new URL('../api/lib/backtest-db.mjs', import.meta.url));
+test('ot status knows every run status the server writes', (await import('node:fs')).existsSync(DB) ? {} : { skip: 'not in the monorepo' }, async () => {
+  const { STATUS_LINE, SETTLED } = await import('./commands/status.mjs');
+  const { TERMINAL_STATES } = await import('../api/lib/backtest-db.mjs');
+  assert.deepEqual([...SETTLED].sort(), [...TERMINAL_STATES].sort(), 'SETTLED must be exactly the server\'s terminal states');
+  const src = await readFile(DB, 'utf8');
+  const written = new Set([...src.matchAll(/status\s*=\s*'([a-z]+)'/g)].map((m) => m[1]));
+  assert.ok(written.size >= 6, `only found ${[...written]} — the scan is broken`);
+  for (const st of written) assert.ok(st in STATUS_LINE, `the server writes status "${st}", which ot status has no line for`);
+  for (const st of Object.keys(STATUS_LINE)) assert.ok(written.has(st) || TERMINAL_STATES.includes(st), `ot status describes "${st}", which the server never writes`);
 });

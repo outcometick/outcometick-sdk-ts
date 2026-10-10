@@ -10,19 +10,25 @@
 
 import { readKey, get } from '../api-client.mjs';
 
-const STATUS_LINE = {
+// The server's own run statuses (api/lib/backtest-db.mjs). These were once
+// written from memory as done/expired — names the server never sends — so
+// every finished run printed its credits as still "held". cli/ot-remote.test.mjs
+// now checks this table against the server's list in the monorepo.
+export const STATUS_LINE = {
   staging: 'staging — the submission is still being stored',
   queued: 'queued — waiting for a worker',
+  leased: 'leased — a worker has picked it up',
   running: 'running',
-  done: 'done',
+  complete: 'complete',
   failed: 'failed',
   rejected: 'rejected',
-  expired: 'expired — the archive is past its retention window',
+  cancelled: 'cancelled',
 };
 
-// Statuses in which the ledger has settled, so spent-vs-returned is a fact
-// rather than a guess. Anything not listed still holds the credits.
-const SETTLED = new Set(['done', 'failed', 'rejected', 'expired']);
+// Statuses in which the ledger has settled (the server's TERMINAL_STATES), so
+// spent-vs-returned is a fact rather than a guess. Anything else still holds
+// the credits.
+export const SETTLED = new Set(['complete', 'failed', 'rejected', 'cancelled']);
 
 function ms(v) {
   return v == null ? '—' : new Date(v).toISOString().replace('T', ' ').slice(0, 19);
@@ -75,10 +81,15 @@ export async function cmdStatus({ dir, flags }) {
   // held - spent in that state prints "0 spent (100 returned)" at a moment when
   // the customer's balance is still 100 short, which is the opposite of
   // reassuring.
-  if (SETTLED.has(json.status) && json.credits_spent != null) {
+  // A run that ended WITHOUT a report may carry no credits_spent at all: the
+  // queue's give-up path (attempts exhausted, api/lib/backtest-db.mjs leaseRun)
+  // refunds in full but leaves the field null. Every such run was refunded, so
+  // it is 0 spent — printing "held" told those customers the opposite.
+  const spent = json.credits_spent ?? (SETTLED.has(json.status) && json.status !== 'complete' ? 0 : null);
+  if (SETTLED.has(json.status) && spent != null) {
     const held = json.credits_held ?? 0;
-    const returned = held - json.credits_spent;
-    process.stdout.write(`  credits     ${json.credits_spent} spent`);
+    const returned = held - spent;
+    process.stdout.write(`  credits     ${spent} spent`);
     process.stdout.write(returned > 0 ? ` (${returned} returned)\n` : '\n');
   } else if (json.credits_held != null) {
     process.stdout.write(`  credits     ${json.credits_held} held\n`);
