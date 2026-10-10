@@ -16,7 +16,7 @@ export const ASSETS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'BNB', 'HYPE', 'ZEC']
 /** Datasets, as a customer would name them. */
 export const DATASETS = {
   prices: 'Settlement feed, tick by tick (instantaneous Chainlink stream)',
-  twap30s: 'TWAP 30s settlement stream — settled 5-minute markets before they moved to the 60s lookback; still archived daily',
+  twap30s: 'TWAP 30s settlement stream — settled 5-minute markets before they moved to the 60s lookback; archived daily through 2026-10-19 (UTC)',
   twap60s: 'TWAP 60s settlement stream — settles both 5-minute and 15-minute markets',
   book: 'Full-depth order-book snapshots',
   best_bid_ask: 'Top of book, unthrottled — the same best bid/ask price_change carries, at every update rather than the capture cadence; prices only, no sizes, so depth still needs book or price_change',
@@ -46,7 +46,7 @@ export const DATASETS = {
  */
 export const DATASETS_ZH = {
   prices: '结算价流，逐 tick（Chainlink 瞬时流）',
-  twap30s: 'TWAP 30 秒结算流——5 分钟市场改用 60 秒回看之前的结算线，至今仍逐日归档',
+  twap30s: 'TWAP 30 秒结算流——5 分钟市场改用 60 秒回看之前的结算线，逐日归档至 2026-10-19（UTC）',
   twap60s: 'TWAP 60 秒结算流——5 分钟与 15 分钟市场都判定在它上面',
   book: '全深度盘口快照',
   best_bid_ask: '盘口顶部，未抽稀——与 price_change 携带的是同一个最优买卖价，但每次更新都出一行，而不是按采集节奏；只有价格没有挂单量，深度仍需 book 或 price_change',
