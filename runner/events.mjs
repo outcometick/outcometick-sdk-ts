@@ -167,10 +167,20 @@ function polymarketRecord(row) {
     open_ts_ms: openMs,
     close_ts_ms: closeMs,
     stream: resolveSettlementStream(row),
-    token_ids: Array.isArray(row.token_ids) ? row.token_ids.map(String) : [],
+    // null (not []) marks a Polymarket market whose [Up, Down] pair is
+    // unusable — marketUnusable drops it. Predict records keep [] (their book
+    // rows are not attributed through token ids).
+    token_ids: upDownPair(row.token_ids),
     fee: feeOf(row),
     raw: row,
   };
+}
+
+/** Exactly two distinct ids, as strings, or null. */
+function upDownPair(ids) {
+  if (!Array.isArray(ids) || ids.length !== 2) return null;
+  const [up, down] = ids.map(String);
+  return up !== down ? [up, down] : null;
 }
 
 /** One Predict markets row -> the normalised record. */
@@ -883,6 +893,16 @@ export function marketUnusable(market, inWindow) {
   // meant the local runner kept the market, and a single-asset run — which has
   // nothing to merge — replayed it out of the cache anyway.
   if (!market.asset) return 'market has no asset';
+  // WHICH TOKEN IS UP? Book, bbo, price_change and trade rows of a Polymarket
+  // market are attributed by indexOf into its token_ids (sideOfToken), so
+  // without two distinct ids EVERY one of them is dropped while the ticks
+  // still flow — the day would run against an empty book and be billed in
+  // full. polymarketRecord sets token_ids to null in exactly that case
+  // (Predict records carry [] and are untouched). Polymarket Protocol V2 (new
+  // markets from ~2026-11-02) is where a drifted id field would land here.
+  // Verified 2026-10-11: all 357,503 archived markets have two distinct ids,
+  // so no cached verdict changes and the decoder version stays.
+  if (market.token_ids === null) return 'market has no usable [Up, Down] token ids';
   if (market.stream == null) return 'settlement stream could not be resolved';
   if (!OUTCOMES.includes(market.outcome)) {
     return 'outcome could not be read';
