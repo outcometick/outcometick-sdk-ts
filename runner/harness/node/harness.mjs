@@ -96,13 +96,20 @@ globalThis.console = Object.freeze(Object.fromEntries(
  * report that means nothing. Freezing makes every such write throw (modules
  * are strict); a strategy that patches built-ins fails with the error saying so.
  *
- * Object.prototype and Function.prototype cannot simply be frozen: ordinary
- * library code assigns an own `toString` (decimal.js does `P.toString = …` on
- * a plain object), and assigning a property that is frozen further up the
- * chain throws — the "override mistake". So, as SES does, their data
- * properties become accessors whose setter defines an own property on the
- * object being written to, and refuses only a write to the prototype itself.
- * Everything else is frozen as is.
+ * Nothing can simply be frozen, because of two ordinary library patterns.
+ * Assigning an own `toString` on an object (decimal.js does `P.toString = …`)
+ * throws when the property is frozen further up the chain — the "override
+ * mistake". And polyfills write a built-in back to itself
+ * (`Number.isFinite = Number.isFinite || …` — danfojs-node's bundled mathjs),
+ * which throws on a frozen property even though nothing changes. So, as SES
+ * does, the writable data properties of Object.prototype, Function.prototype,
+ * every constructor (its statics), Math and Reflect become accessors: a write
+ * to another object defines that object's own property, a write of the SAME
+ * value to the built-in itself is a no-op, and only a write that would change
+ * it throws. The other prototypes (Array, String, Map… — the engine's hot
+ * path, where an accessor per method lookup doubled replay time) are frozen
+ * plainly; the allowlisted packages load and run under this, verified in the
+ * image (runner/sandbox.test.mjs).
  */
 {
   const { defineProperty, getOwnPropertyDescriptors, freeze, getPrototypeOf } = Object;
@@ -118,15 +125,16 @@ globalThis.console = Object.freeze(Object.fromEntries(
         enumerable: d.enumerable,
         get() { return value; },
         set(v) {
-          if (this === proto) throw new TypeError(`Cannot assign to read only property '${String(key)}' of a built-in prototype`);
+          if (this === proto) {
+            if (v === value) return;
+            throw new TypeError(`Cannot assign to read only property '${String(key)}' of a built-in`);
+          }
           defineProperty(this, key, { value: v, writable: true, enumerable: true, configurable: true });
         },
       });
     }
     freeze(proto);
   };
-  tame(Object.prototype);
-  tame(Function.prototype);
   const arrayIter = getPrototypeOf([][Symbol.iterator]());
   const generator = getPrototypeOf(function* g() {});
   const typedArray = getPrototypeOf(Float64Array);
@@ -141,8 +149,13 @@ globalThis.console = Object.freeze(Object.fromEntries(
     Symbol, Symbol.prototype, BigInt, BigInt.prototype, Promise, Promise.prototype,
     typedArray, typedArray.prototype, Float64Array, Float64Array.prototype,
     Uint8Array, Uint8Array.prototype, Buffer, Buffer.prototype,
+    Object.prototype, Function.prototype,
     Math, Object, Reflect,
-  ]) freeze(target);
+  ]) {
+    if (typeof target === 'function' || target === Object.prototype || target === Function.prototype
+        || target === Math || target === Reflect) tame(target);
+    else freeze(target);
+  }
   // The names engine code looks up at call time. JSON keeps a writable
   // property set (its parse is captured below, and nothing else is used for
   // output), but the binding is fixed like the rest.

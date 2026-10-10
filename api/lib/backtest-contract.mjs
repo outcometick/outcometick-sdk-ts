@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.3.0';
+export const SDK_VERSION = '2.3.1';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -26,6 +26,12 @@ export const SDK_VERSION = '2.3.0';
  * runs the old harness under the new worker — and the failure is silent. The
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
+ *
+ * 1.21.1: no protocol change. The Node harness's built-in lock tames only
+ * Object.prototype, Function.prototype, constructor statics, Math and Reflect
+ * (polyfill-tolerant accessors) and freezes the other prototypes plainly —
+ * danfojs-node's bundled mathjs writes `Number.isFinite = Number.isFinite || …`
+ * and failed to load under 1.21.0; a full taming doubled replay time.
  *
  * 1.21.0: protocol change, worker first. Resting (gtc) orders: the job carries
  * a `resting` policy (restingPolicyFor), fill rows carry liquidity / order id /
@@ -79,7 +85,7 @@ export const SDK_VERSION = '2.3.0';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.21.0';
+export const SANDBOX_IMAGE_TAG = '1.21.1';
 
 // ---------------------------------------------------------------------------
 // Languages
