@@ -34,6 +34,47 @@ export const contractValue = (side, outcome) => {
 const EPS = 1e-9;
 
 /**
+ * Polymarket's taker fee, as archived on each market (`raw.feeSchedule`).
+ *
+ * The venue charges the taker `C × rate × p × (1 − p)` in USDC, rounded to
+ * five decimals, and nothing to the maker. Every fill this engine simulates is
+ * a taker fill, so every fill pays it.
+ *
+ * AN ESTIMATE, AND SAID SO IN THE REPORT. The venue applies the formula per
+ * MATCH — one taker order against one maker order — and rounds each. The
+ * archive keeps book LEVELS, and a level aggregates any number of maker orders
+ * whose individual sizes are gone, so the fee here is computed and rounded per
+ * level taken. Same formula, same price, same size; the rounding granularity is
+ * the part that cannot be reproduced.
+ *
+ * MUST MATCH `FEE_MODEL_PM` / `fee_for` in otengine.py.
+ */
+export const FEE_MODEL_PM = 'polymarket-taker-v1';
+
+/** Round a fee to the venue's five decimals, ties toward +Infinity. */
+export const roundFee = (x) => Math.round(x * 1e5) / 1e5;
+
+/**
+ * The fee for one match result under a run's fee policy.
+ *
+ * `policy` is `{mode:'venue'}` (each market's own schedule) or
+ * `{mode:'bps', bps}` (a flat rate on notional, the override). `marketFee` is
+ * the market's normalised schedule: `{model:FEE_MODEL_PM, rate}`, `{model:'none'}`
+ * when the venue charges nothing, or null when we could not read one — which is
+ * charged nothing and COUNTED, never guessed at.
+ */
+export function feeFor(policy, marketFee, res) {
+  if (policy?.mode === 'bps') {
+    const bps = typeof policy.bps === 'number' && Number.isFinite(policy.bps) ? policy.bps : 0;
+    return (res.notional * bps) / 10_000;
+  }
+  if (!marketFee || marketFee.model !== FEE_MODEL_PM) return 0;
+  let total = 0;
+  for (const f of res.fills) total += roundFee(f.size * marketFee.rate * f.px * (1 - f.px));
+  return total;
+}
+
+/**
  * One side of one market, plus the round trip currently in progress.
  *
  * The open position (`size`/`cost`) and the round trip (`entrySize`/
@@ -77,14 +118,19 @@ class Leg {
  */
 export class Portfolio {
   /**
-   * @param {{feeBps?:number}} opts
-   *   feeBps applies to notional on entry and on exit. It is a RUN-level
+   * @param {{feeBps?:number, fees?:object}} opts
+   *   `fees` is the run's fee policy (see feeFor); `feeBps` is the legacy flat
+   *   rate on notional, used only when no policy is given. Either is a RUN-level
    *   setting, not a strategy param: what a venue charges is not something a
    *   strategy gets to assume, and a strategy that set it to zero would be
    *   reporting its own fee holiday.
    */
-  constructor({ feeBps = 0 } = {}) {
-    this.feeBps = Number(feeBps) || 0;
+  constructor({ feeBps = 0, fees = null } = {}) {
+    // `fees` is the run's policy. Absent, the legacy run-level `feeBps` is the
+    // policy — what every caller passed before venue fees existed.
+    this.feePolicy = fees ?? { mode: 'bps', bps: Number(feeBps) || 0 };
+    /** @type {Map<string, object|null>} each market's normalised fee schedule */
+    this.marketFees = new Map();
     /** @type {Map<string,{UP:Leg,DOWN:Leg}>} */
     this.legs = new Map();
     this.trades = [];
@@ -103,6 +149,20 @@ export class Portfolio {
       this.legs.set(marketId, l);
     }
     return l;
+  }
+
+  /**
+   * Record a market's fee schedule before any of its orders execute.
+   *
+   * COPIED, never kept by reference: the same object reaches the strategy as
+   * `market.fee`, and a strategy that wrote `market.fee.rate = 0` in
+   * on_market_open would otherwise have traded fee-free while the report still
+   * said it paid the venue's rate. MUST MATCH set_market_fee in otengine.py.
+   */
+  setMarketFee(marketId, fee) {
+    this.marketFees.set(marketId, fee && typeof fee === 'object'
+      ? Object.freeze({ model: fee.model, rate: fee.rate })
+      : null);
   }
 
   sizeOf(marketId, side) { return this.#legs(marketId)[side]?.size ?? 0; }
@@ -233,7 +293,7 @@ export class Portfolio {
       return res;
     }
 
-    const fee = (res.notional * this.feeBps) / 10_000;
+    const fee = feeFor(this.feePolicy, this.marketFees.get(marketId) ?? null, res);
     this.feesPaid += fee;
     let realised = 0;
 

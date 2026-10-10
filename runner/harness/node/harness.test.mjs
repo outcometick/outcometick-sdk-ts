@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHANNEL, EXIT, parseTrade, parseFill, parseResult, parseOutputLine } from '../protocol.mjs';
+import { sessionLines } from '../../session-feed.mjs';
 
 const HARNESS = path.join(path.dirname(fileURLToPath(import.meta.url)), 'harness.mjs');
 
@@ -65,6 +66,22 @@ async function runHarness({ strategy, job = {}, events = EVENTS, markets = null 
     ...jobRest,
   };
   const marketList = markets ?? [{ market: MARKET, stream: 'prices' }];
+  // The stream exactly as the worker writes it: per-market framing, or the
+  // merged session stream (runner/session-feed.mjs).
+  const stdinLines = [JSON.stringify(full)];
+  const eventsOf = (m) => (m.events === 'MISSING' ? [] : (Array.isArray(m.events) ? m.events : events));
+  if (full.mode === 'session') {
+    for await (const line of sessionLines(marketList, {
+      linesOf: async (m) => eventsOf(m).map((e) => JSON.stringify(e)),
+      headerOf: (m) => ({ market: m.market, stream: m.stream }),
+    })) stdinLines.push(line);
+  } else {
+    for (const m of marketList) {
+      const evs = eventsOf(m);
+      stdinLines.push(JSON.stringify({ market: m.market, stream: m.stream, n: evs.length }));
+      for (const e of evs) stdinLines.push(JSON.stringify(e));
+    }
+  }
 
   const lines = [];
   let forged = 0;
@@ -88,12 +105,7 @@ async function runHarness({ strategy, job = {}, events = EVENTS, markets = null 
     child.on('close', (c) => resolve({ code: c, stderr }));
     // The job and the events go in on stdin, exactly as the worker sends them.
     child.stdin.on('error', () => {});
-    child.stdin.write(`${JSON.stringify(full)}\n`);
-    for (const m of marketList) {
-      const evs = m.events === 'MISSING' ? [] : events;
-      child.stdin.write(`${JSON.stringify({ market: m.market, stream: m.stream, n: evs.length })}\n`);
-      for (const e of evs) child.stdin.write(`${JSON.stringify(e)}\n`);
-    }
+    for (const line of stdinLines) child.stdin.write(`${line}\n`);
     child.stdin.end();
   });
 
@@ -104,7 +116,7 @@ async function runHarness({ strategy, job = {}, events = EVENTS, markets = null 
   const logs = pick(CHANNEL.log).join('\n');
 
   await rm(dir, { recursive: true, force: true });
-  return { ...code, result, trades, fills, logs, forged };
+  return { ...code, result, trades, fills, logs, forged, lines };
 }
 
 const BUY_ONCE = `export class S {
@@ -334,6 +346,26 @@ test('session mode carries one instance and one portfolio across markets', async
   });
   assert.equal(r.code, EXIT.ok, r.stderr);
   assert.match(r.logs, /seen=2/, 'session mode is exactly the mode where state survives');
+});
+
+test('session mode writes each market\'s rows when it settles, not all at the end', async () => {
+  // Memory, not cosmetics: a session holds one portfolio for the whole range,
+  // and keeping every trade and fill until the run ends lets a long session run
+  // the sandbox out of memory before anything is written.
+  const second = { ...MARKET, market_id: '0xm2', open_ts_ms: 20_000, close_ts_ms: 30_000 };
+  const r = await runHarness({
+    strategy: BUY_ONCE,
+    job: { mode: 'session' },
+    markets: [
+      { market: MARKET, stream: 'prices' },
+      { market: second, stream: 'prices', events: [book(20_000), tick(20_001, 65100)] },
+    ],
+  });
+  assert.equal(r.code, EXIT.ok, r.stderr);
+  const firstFill = r.lines.findIndex((l) => l.channel === CHANNEL.fill);
+  const secondDone = r.lines.findIndex((l) => l.channel === CHANNEL.progress && JSON.parse(l.payload).n === 2);
+  assert.ok(firstFill >= 0 && secondDone >= 0, 'nothing to order');
+  assert.ok(firstFill < secondDone, 'the first market\'s fill waited for the second market to finish');
 });
 
 // ---------------------------------------------------------------------------

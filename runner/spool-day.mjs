@@ -226,6 +226,10 @@ export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDi
         outcome: market.outcome,
         open_ts_ms: market.open_ts_ms,
         close_ts_ms: market.close_ts_ms,
+        // Polymarket only — a Predict record has no `fee` key, so its decoded
+        // days are unchanged and its cache stays warm. The engine reads it to
+        // charge the venue's taker fee (feeFor in engine/portfolio.mjs).
+        ...(market.fee !== undefined ? { fee: market.fee } : {}),
       },
       eventsFile: file,
       stream: market.stream,

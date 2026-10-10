@@ -16,7 +16,7 @@ import { readSync, writeSync } from 'node:fs';
 import { createHmac } from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { replayMarket, makeLogBudget, BudgetMonitor, RunAbort } from '../../engine/replay.mjs';
+import { MarketReplay, makeLogBudget, BudgetMonitor, RunAbort } from '../../engine/replay.mjs';
 import { Book as BookCls } from '../../engine/book.mjs';
 import { buildFeeds } from '../../engine/feed.mjs';
 import { Portfolio } from '../../engine/portfolio.mjs';
@@ -371,42 +371,13 @@ async function main() {
   // Session mode shares one portfolio and one instance across every market;
   // market mode gets a fresh instance per market, which is what lets a run be
   // sharded at all.
-  const shared = job.mode === 'session' ? new Portfolio({ feeBps: job.feeBps ?? 0 }) : null;
+  const fees = feePolicy(job);
+  const session = job.mode === 'session';
+  const shared = session ? new Portfolio({ fees }) : null;
   let sharedInstance = null;
 
-  // Markets stream in, one at a time, for as long as the worker sends them.
-  for (;;) {
-    const header = nextLine();
-    if (header == null) break;
-    let entry;
-    try {
-      entry = parseJson(header);
-    } catch (err) {
-      logsOut.write(`[runner] malformed market header: ${err.message}\n`);
-      break;
-    }
-
-    // The market's events, pulled ONE AT A TIME as the replay loop asks for
-    // them. Nothing here holds more than the current row, which is the whole
-    // point — see syncLineReader above.
-    let seenEvents = 0;
-    // The book as the ENGINE sees it, advanced by the same class.
-    //
-    // Three things were wrong with reading the last book event instead. A
-    // Polymarket snapshot carries one side, so the other came back null. Its
-    // ask ladder is published descending while Predict's is ascending, so
-    // element zero was the worst offer on one venue. And a `price_change`
-    // after the last snapshot moved the price for the engine but not for this
-    // number. Advancing a real Book removes all three, and removes a second
-    // implementation with them.
-    const summaryBook = new BookCls();
-    // The first book state that quotes BOTH sides — the same rule the worker
-    // applies, so the two do not report different numbers for one run. Locking
-    // each side as it appears would mix prices from two instants, and the
-    // favourite is the dearer of the pair.
-    let openQuotes = null;
-    const remaining = { n: entry.n ?? 0 };
-
+  /** What the loop tracks for one open market, besides the replay itself. */
+  const newMarket = (entry) => {
     // Reference feeds and user series arrive INTERLEAVED in the same stream,
     // in event time, and are appended to a growing array as they pass.
     //
@@ -423,7 +394,208 @@ async function main() {
       if (!a) { a = []; feedRows.set(name, a); }
       return a;
     };
+    return {
+      entry,
+      replay: null,
+      before: null,
+      seen: 0,
+      // The book as the ENGINE sees it, advanced by the same class.
+      //
+      // Three things were wrong with reading the last book event instead. A
+      // Polymarket snapshot carries one side, so the other came back null. Its
+      // ask ladder is published descending while Predict's is ascending, so
+      // element zero was the worst offer on one venue. And a `price_change`
+      // after the last snapshot moved the price for the engine but not for this
+      // number. Advancing a real Book removes all three, and removes a second
+      // implementation with them.
+      summaryBook: new BookCls(),
+      // The first book state that quotes BOTH sides — the same rule the worker
+      // applies, so the two do not report different numbers for one run.
+      // Locking each side as it appears would mix prices from two instants, and
+      // the favourite is the dearer of the pair.
+      openQuotes: null,
+      rowsFor,
+    };
+  };
 
+  /**
+   * Account for one line of a market's stream. False for a feed row, which is
+   * consumed here and never handed to a hook: it is not a market event.
+   */
+  const observe = (m, ev) => {
+    if (ev.kind === 'ref' || ev.kind === 'ext') {
+      const row = projectRow(ev, Object.keys(ev).filter((k) => k !== 'kind' && k !== 'name'));
+      m.rowsFor(ev.name).push(row);
+      return false;
+    }
+    m.seen += 1;
+    if (ev.kind === 'book') {
+      if (ev.snapshot) m.summaryBook.snapshot(ev.ts_ms, ev.levels);
+      else if (ev.side && ev.ladder) {
+        m.summaryBook.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+      }
+      if (m.openQuotes === null) {
+        const up = m.summaryBook.best('UP');
+        const down = m.summaryBook.best('DOWN');
+        if (up != null && down != null) m.openQuotes = { up, down };
+      }
+    }
+    return true;
+  };
+
+  /** Build a market's replay and open it (on_market_open). */
+  const start = (m) => {
+    const { entry } = m;
+    const pf = shared ?? new Portfolio({ fees });
+    let instance;
+    if (shared) {
+      sharedInstance ??= new Klass();
+      instance = sharedInstance;
+    } else {
+      instance = new Klass();
+    }
+    // A fresh copy per instance. Sharing one object across markets let a
+    // strategy that wrote to ctx.p in market 1 change its own behaviour in
+    // market 2 — which is exactly the cross-market state that per-market
+    // reset exists to prevent, and it would break sharding silently.
+    instance.p = { ...(job.params ?? {}) };
+    m.before = { trades: pf.trades.length, fills: pf.fills.length };
+    // The arrays are shared with the stream, so the feeds see each row the
+    // moment the replay passes its timestamp — and not before.
+    const references = buildFeeds(entry.references ?? [], Object.fromEntries(
+      (entry.references ?? []).map((n) => [n, m.rowsFor(n)]),
+    ), entry.lags ?? {});
+    const series = buildFeeds(entry.series ?? [], Object.fromEntries(
+      (entry.series ?? []).map((n) => [n, m.rowsFor(n)]),
+    ), entry.lags ?? {});
+    m.replay = new MarketReplay({
+      market: entry.market,
+      strategy: instance,
+      hooks: job.hooks,
+      portfolio: pf,
+      // ONE allowance for the whole run, handed to every market. Per-market
+      // was the old shape and the reason ctx.log was an export channel.
+      logBudget,
+      fillDelayMs: job.fillDelayMs ?? 0,
+      budget: monitor,
+      seed: job.seed ?? 1,
+      references,
+      series,
+    });
+    m.replay.open();
+  };
+
+  /** Book-keeping once a market has been replayed and settled. */
+  const finished = (m, out) => {
+    const { entry } = m;
+    result.markets_run += 1;
+    result.events_seen += m.seen;
+    // Acknowledge the market-day AFTER it is replayed, so the panel a
+    // customer is watching counts finished work rather than queued bytes.
+    emit(CHANNEL.progress, stringify({ n: result.markets_run }));
+    if (out.logTruncated && !result.log_truncated) {
+      result.log_truncated = true;
+      // SAID IN THE LOG ITSELF, once, where someone reading it will see it.
+      // A log that just stops looks like a strategy that stopped calling
+      // ctx.log — and the reader goes hunting for a bug in their own code.
+      logsOut.write('[runner] log budget spent — the rest of this run\'s'
+        + ' ctx.log output was dropped. ctx.log is for reading, not for'
+        + ' exporting; see the SDK docs for the limit.\n');
+    }
+    // OPENING TIME FIRST, then a short id.
+    //
+    // The prefix used to be the full 64-character condition hash, which
+    // identifies a market to the venue and to nobody reading a log: there is
+    // no way to tell from it which market this was, or when. The opening
+    // time is the thing a person actually navigates by — it is what the
+    // venue puts in the slug — and eight characters of the hash still
+    // separate the several strikes that open at the same instant.
+    //
+    // MUST MATCH THE PYTHON HARNESS. Two log formats from one archive is the
+    // kind of divergence the conformance suite exists to catch.
+    // A market with no opening time keeps the id alone rather than gaining a
+    // leading space — every consumer of this file splits on whitespace, and
+    // a blank first field shifts all of them by one.
+    const shortId = String(entry.market.market_id ?? '').slice(0, 10);
+    // READABLE, because ctx.log already puts the EVENT time on every line as
+    // epoch millis. Two bare 13-digit numbers side by side are two numbers
+    // nobody can tell apart — and the one this prefix exists for is the one
+    // that would be mistaken for the other.
+    //
+    // UTC, to the minute: the market schedule is published in UTC and a
+    // market-day is a UTC day, so a local rendering would file a row under a
+    // different date than the archive does.
+    const openedAt = entry.market.open_ts_ms == null
+      ? null
+      : new Date(entry.market.open_ts_ms).toISOString().slice(0, 16).replace('T', ' ');
+    const prefix = openedAt == null ? shortId : `${openedAt} ${shortId}`;
+    for (const line of out.logs) logsOut.write(`${prefix} ${line}\n`);
+    for (const c of out.crosschecks) result.crosschecks.push(c);
+
+    // Tracked as the stream went past rather than scanned afterwards: there
+    // is no array left to scan, which is the point. The worker prices the
+    // report's baselines from its OWN copy anyway; this is informational.
+    result.market_summaries.push({
+      market_id: entry.market.market_id,
+      asset: entry.market.asset ?? null,
+      interval: entry.market.interval ?? null,
+      outcome: entry.market.outcome ?? null,
+      up_px: m.openQuotes?.up ?? null,
+      down_px: m.openQuotes?.down ?? null,
+      stream: entry.stream ?? null,
+    });
+    if (!shared) {
+      flush(m.replay.pf, m.before, emit, entry.market.market_id);
+      result.fees_paid += m.replay.pf.feesPaid;
+    } else {
+      // Session: everything the shared portfolio has written so far goes out
+      // now, and the arrays are emptied. Its positions and running fee total
+      // are untouched — only the append-only logs are drained — so a long
+      // session holds one market's worth of rows, not the whole run's.
+      flush(shared, { trades: 0, fills: 0 }, emit, true);
+    }
+  };
+
+  const rejected = (m, err) => {
+    const id = m?.entry?.market?.market_id ?? '?';
+    if (err instanceof RunAbort) {
+      result.rejection = { code: err.code, detail: `${id}: ${err.detail}` };
+      // A budget breach kills the shard, and a strategy that throws is not
+      // going to stop throwing on the next market. Either way the run is
+      // over and nothing is billed.
+      if (shared) flush(shared, { trades: 0, fills: 0 }, emit, true);
+      else if (m?.replay) flush(m.replay.pf, m.before, emit, id);
+      return finish(err.code === 'E_BUDGET' ? EXIT.budget : EXIT.rejected);
+    }
+    result.rejection = { code: 'E_RUNTIME', detail: `${id}: ${err?.message ?? err}` };
+    return finish(EXIT.rejected);
+  };
+
+  if (session) {
+    const code = runSession({ nextLine, newMarket, observe, start, finished, rejected, logsOut });
+    if (code != null) return code;
+    flush(shared, { trades: 0, fills: 0 }, emit, null);
+    result.fees_paid = shared.feesPaid;
+    return finish(EXIT.ok);
+  }
+
+  // Markets stream in, one at a time, for as long as the worker sends them.
+  for (;;) {
+    const header = nextLine();
+    if (header == null) break;
+    let entry;
+    try {
+      entry = parseJson(header);
+    } catch (err) {
+      logsOut.write(`[runner] malformed market header: ${err.message}\n`);
+      break;
+    }
+    const m = newMarket(entry);
+    const remaining = { n: entry.n ?? 0 };
+
+    // The market's events, pulled ONE AT A TIME as the replay loop asks for
+    // them. Nothing here holds more than the current row, which is the whole
+    // point — see syncLineReader above.
     function* eventStream() {
       while (remaining.n > 0) {
         remaining.n -= 1;
@@ -437,36 +609,9 @@ async function main() {
           // worker reconciles what it sent against what came back.
           continue;
         }
-        // Consumed here, never handed to a hook: these are not market events.
-        if (ev.kind === 'ref' || ev.kind === 'ext') {
-          const row = projectRow(ev, Object.keys(ev).filter((k) => k !== 'kind' && k !== 'name'));
-          rowsFor(ev.name).push(row);
-          continue;
-        }
-        seenEvents += 1;
-        if (ev.kind === 'book') {
-          if (ev.snapshot) summaryBook.snapshot(ev.ts_ms, ev.levels);
-          else if (ev.side && ev.ladder) {
-            summaryBook.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
-          }
-          if (openQuotes === null) {
-            const up = summaryBook.best('UP');
-            const down = summaryBook.best('DOWN');
-            if (up != null && down != null) openQuotes = { up, down };
-          }
-        }
-        yield ev;
+        if (observe(m, ev)) yield ev;
       }
     }
-
-    // The arrays are shared with the stream above, so the feeds see each row
-    // the moment the replay passes its timestamp — and not before.
-    const references = buildFeeds(entry.references ?? [], Object.fromEntries(
-      (entry.references ?? []).map((n) => [n, rowsFor(n)]),
-    ), entry.lags ?? {});
-    const series = buildFeeds(entry.series ?? [], Object.fromEntries(
-      (entry.series ?? []).map((n) => [n, rowsFor(n)]),
-    ), entry.lags ?? {});
 
     /** Drain whatever the replay did not consume, so the stream stays framed. */
     const drainRest = () => {
@@ -476,124 +621,112 @@ async function main() {
       }
     };
 
-    const pf = shared ?? new Portfolio({ feeBps: job.feeBps ?? 0 });
-    let instance;
-    if (shared) {
-      sharedInstance ??= new Klass();
-      instance = sharedInstance;
-    } else {
-      instance = new Klass();
-    }
-    // A fresh copy per instance. Sharing one object across markets let a
-    // strategy that wrote to ctx.p in market 1 change its own behaviour in
-    // market 2 — which is exactly the cross-market state that per-market
-    // reset exists to prevent, and it would break sharding silently.
-    instance.p = { ...(job.params ?? {}) };
-
-    const before = { trades: pf.trades.length, fills: pf.fills.length };
-
+    let out;
     try {
-      const out = replayMarket({
-        market: entry.market,
-        events: eventStream(),
-        strategy: instance,
-        hooks: job.hooks,
-        portfolio: pf,
-        // ONE allowance for the whole run, handed to every market. Per-market
-        // was the old shape and the reason ctx.log was an export channel.
-        logBudget,
-        fillDelayMs: job.fillDelayMs ?? 0,
-        logLimit: job.limits?.logLinesPerMarketDay ?? 10_000,
-        budget: monitor,
-        seed: job.seed ?? 1,
-        feeBps: job.feeBps ?? 0,
-        references,
-        series,
-      });
-
-      drainRest();
-      result.markets_run += 1;
-      result.events_seen += seenEvents;
-      // Acknowledge the market-day AFTER it is replayed, so the panel a
-      // customer is watching counts finished work rather than queued bytes.
-      emit(CHANNEL.progress, stringify({ n: result.markets_run }));
-      if (out.logTruncated && !result.log_truncated) {
-        result.log_truncated = true;
-        // SAID IN THE LOG ITSELF, once, where someone reading it will see it.
-        // A log that just stops looks like a strategy that stopped calling
-        // ctx.log — and the reader goes hunting for a bug in their own code.
-        logsOut.write('[runner] log budget spent — the rest of this run\'s'
-          + ' ctx.log output was dropped. ctx.log is for reading, not for'
-          + ' exporting; see the SDK docs for the limit.\n');
+      start(m);
+      for (const ev of eventStream()) {
+        if (!m.replay.step(ev)) break;
       }
-      // OPENING TIME FIRST, then a short id.
-      //
-      // The prefix used to be the full 64-character condition hash, which
-      // identifies a market to the venue and to nobody reading a log: there is
-      // no way to tell from it which market this was, or when. The opening
-      // time is the thing a person actually navigates by — it is what the
-      // venue puts in the slug — and eight characters of the hash still
-      // separate the several strikes that open at the same instant.
-      //
-      // MUST MATCH THE PYTHON HARNESS. Two log formats from one archive is the
-      // kind of divergence the conformance suite exists to catch.
-      // A market with no opening time keeps the id alone rather than gaining a
-      // leading space — every consumer of this file splits on whitespace, and
-      // a blank first field shifts all of them by one.
-      const shortId = String(entry.market.market_id ?? '').slice(0, 10);
-      // READABLE, because ctx.log already puts the EVENT time on every line as
-      // epoch millis. Two bare 13-digit numbers side by side are two numbers
-      // nobody can tell apart — and the one this prefix exists for is the one
-      // that would be mistaken for the other.
-      //
-      // UTC, to the minute: the market schedule is published in UTC and a
-      // market-day is a UTC day, so a local rendering would file a row under a
-      // different date than the archive does.
-      const openedAt = entry.market.open_ts_ms == null
-        ? null
-        : new Date(entry.market.open_ts_ms).toISOString().slice(0, 16).replace('T', ' ');
-      const prefix = openedAt == null ? shortId : `${openedAt} ${shortId}`;
-      for (const line of out.logs) logsOut.write(`${prefix} ${line}\n`);
-      for (const c of out.crosschecks) result.crosschecks.push(c);
-
-      // Tracked as the stream went past rather than scanned afterwards: there
-      // is no array left to scan, which is the point. The worker prices the
-      // report's baselines from its OWN copy anyway; this is informational.
-      result.market_summaries.push({
-        market_id: entry.market.market_id,
-        asset: entry.market.asset ?? null,
-        interval: entry.market.interval ?? null,
-        outcome: entry.market.outcome ?? null,
-        up_px: openQuotes?.up ?? null,
-        down_px: openQuotes?.down ?? null,
-        stream: entry.stream ?? null,
-      });
+      out = m.replay.close();
     } catch (err) {
       drainRest();
-      if (err instanceof RunAbort) {
-        result.rejection = { code: err.code, detail: `${entry.market.market_id}: ${err.detail}` };
-        // A budget breach kills the shard, and a strategy that throws is not
-        // going to stop throwing on the next market. Either way the run is
-        // over and nothing is billed.
-        flush(pf, before, emit, entry.market.market_id);
-        return finish(err.code === 'E_BUDGET' ? EXIT.budget : EXIT.rejected);
-      }
-      result.rejection = { code: 'E_RUNTIME', detail: `${entry.market.market_id}: ${err?.message ?? err}` };
-      return finish(EXIT.rejected);
+      return rejected(m, err);
     }
-
-    if (!shared) {
-      flush(pf, before, emit, entry.market.market_id);
-      result.fees_paid += pf.feesPaid;
-    }
-  }
-
-  if (shared) {
-    flush(shared, { trades: 0, fills: 0 }, emit, null);
-    result.fees_paid = shared.feesPaid;
+    drainRest();
+    finished(m, out);
   }
 
   return finish(EXIT.ok);
+}
+
+/**
+ * The session stream: every open market replayed from ONE time order.
+ *
+ * Lines are `{"open":{i, market, stream, references?, series?, lags?}}`,
+ * `{"i":k,"e":<event>}` and `{"close":k}`, written by runner/session-feed.mjs.
+ * Feeding whole markets one after another — what session mode used to do — let
+ * the shared instance carry 00:15 of a 00:00–00:15 market back into a market
+ * that opened at 00:05. MUST MATCH _run_session in otharness.py.
+ *
+ * Returns an exit code if the run ended early, null when the stream ended.
+ */
+function runSession({ nextLine, newMarket, observe, start, finished, rejected, logsOut }) {
+  const active = new Map();
+  // Before ANY hook runs at instant `ts` — an opening, an event, a closing —
+  // every other open market settles what it had scheduled strictly earlier,
+  // against its own book as it stands. The same "strictly before" rule a
+  // market applies to its own events, extended across the shared portfolio:
+  // a hook at `ts` sees every fill that had already happened anywhere, and
+  // nothing that had not.
+  const settleEarlier = (except, ts) => {
+    if (typeof ts !== 'number' || !Number.isFinite(ts)) return;
+    for (const other of active.values()) {
+      if (other !== except && !other.replay.ended) other.replay.drainUntil(ts - 1);
+    }
+  };
+  for (;;) {
+    const line = nextLine();
+    if (line == null) break;
+    let msg;
+    try {
+      msg = parseJson(line);
+    } catch (err) {
+      logsOut.write(`[runner] malformed session line: ${err.message}\n`);
+      break;
+    }
+    if (!msg || typeof msg !== 'object') continue;
+    if (msg.open) {
+      const m = newMarket(msg.open);
+      try {
+        settleEarlier(null, msg.open.market?.open_ts_ms);
+        active.set(msg.open.i, m);
+        start(m);
+      } catch (err) { return rejected(m, err); }
+      continue;
+    }
+    if (msg.close != null) {
+      const m = active.get(msg.close);
+      if (!m) continue;
+      let out;
+      try {
+        // The instant it settles at: its declared close, or the last event it
+        // saw when it has none (MarketReplay.close uses the same).
+        settleEarlier(m, m.replay.declaredClose ?? m.replay.lastTs);
+        active.delete(msg.close);
+        out = m.replay.close();
+      } catch (err) { return rejected(m, err); }
+      finished(m, out);
+      continue;
+    }
+    const m = active.get(msg.i);
+    const ev = msg.e;
+    if (!m || !ev || typeof ev !== 'object') continue;
+    if (!observe(m, ev)) continue;
+    try {
+      settleEarlier(m, ev.ts_ms);
+      m.replay.step(ev);
+    } catch (err) {
+      return rejected(m, err);
+    }
+  }
+  // A stream that ended with markets still open was cut short; close them so
+  // what did happen is reported, and the worker's count catches the rest.
+  for (const m of active.values()) {
+    let out;
+    try { out = m.replay.close(); } catch (err) { return rejected(m, err); }
+    finished(m, out);
+  }
+  return null;
+}
+
+/**
+ * The run's fee policy: `job.fees` when the writer sent one, else the legacy
+ * flat `feeBps`. MUST MATCH fee_policy in otharness.py.
+ */
+function feePolicy(job) {
+  const f = job.fees;
+  if (f && typeof f === 'object' && (f.mode === 'venue' || f.mode === 'bps')) return f;
+  return { mode: 'bps', bps: job.feeBps ?? 0 };
 }
 
 /** Write everything a market added to the two logs. */

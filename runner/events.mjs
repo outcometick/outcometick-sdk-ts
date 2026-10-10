@@ -14,7 +14,7 @@ import { classifyPath } from '../api/lib/data-taxonomy.mjs';
 import { resolveSettlementStream, degradingCoverage, inputKeys } from '../api/lib/backtest-datasets.mjs';
 import { bookThrottleMs } from '../api/lib/backtest-contract.mjs';
 import { Book } from './engine/book.mjs';
-import { OUTCOME_TIE, OUTCOMES } from './engine/portfolio.mjs';
+import { OUTCOME_TIE, OUTCOMES, FEE_MODEL_PM } from './engine/portfolio.mjs';
 
 /**
  * Coerce a field to a number, or null.
@@ -110,6 +110,37 @@ function polymarketOutcome(row) {
   return null;
 }
 
+/**
+ * A Polymarket market's taker fee schedule, normalised — or null.
+ *
+ * Three answers, kept apart because a report has to say which it was:
+ *   `{model:'polymarket-taker-v1', rate}` — the venue charges takers
+ *       C × rate × p × (1 − p) on this market (see feeFor in portfolio.mjs);
+ *   `{model:'none'}` — the market says fees are off: a KNOWN zero;
+ *   null — we could not read a schedule we understand: UNKNOWN, charged
+ *       nothing and counted, never guessed at.
+ *
+ * Read against the archive (2026-09-08 sample: every market carries
+ * `feesEnabled:true, feeSchedule:{rate:0.07, exponent:1, takerOnly:true,
+ * rebateRate:0.2}`). Only `exponent: 1` is the formula the venue documents;
+ * anything else is a curve we have not seen and is unknown. `rebateRate` is
+ * the maker rebate, and this engine never makes.
+ *
+ * MUST MATCH `_fee_of` in client/backtest/decode.py.
+ */
+export function feeOf(row) {
+  const raw = row?.raw;
+  if (!raw || typeof raw !== 'object') return null;
+  if (raw.feesEnabled === false) return { model: 'none' };
+  if (raw.feesEnabled !== true) return null;
+  const s = raw.feeSchedule;
+  if (!s || typeof s !== 'object') return null;
+  const rate = s.rate;
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rate > 1) return null;
+  if (s.exponent !== 1) return null;
+  return { model: FEE_MODEL_PM, rate };
+}
+
 /** One Polymarket markets row -> the normalised record. */
 function polymarketRecord(row) {
   const openMs = num(row.start_sec) == null ? null : num(row.start_sec) * 1000;
@@ -137,6 +168,7 @@ function polymarketRecord(row) {
     close_ts_ms: closeMs,
     stream: resolveSettlementStream(row),
     token_ids: Array.isArray(row.token_ids) ? row.token_ids.map(String) : [],
+    fee: feeOf(row),
     raw: row,
   };
 }

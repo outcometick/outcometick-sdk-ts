@@ -407,35 +407,88 @@ export function makeLogBudget({
   return { bytes, lineChars, spent: 0 };
 }
 
-export function replayMarket({
-  market, events, strategy, hooks,
-  portfolio = null,
-  fillDelayMs = 0,
-  /**
-   * The run's remaining log allowance, SHARED ACROSS MARKETS.
-   *
-   * Passed in rather than created here, because a per-market allowance is what
-   * the old limit was and what made the log channel an export route: 386
-   * markets a day each got their own budget. One object for the whole run is
-   * the fix — the harness makes it once and hands the same one to every market.
-   */
-  logBudget = null,
-  budget = null,
-  references = null,
-  series = null,
-  seed = 1,
-  feeBps = 0,
-}) {
-  const marketId = market.market_id;
-  const pf = portfolio ?? new Portfolio({ feeBps });
-  const book = new Book(marketId);
-  const monitor = budget ?? new BudgetMonitor();
-  // The engine keeps its OWN copy and hands the strategy a different one.
-  // Both halves matter: settlement reads `outcome` from here, so a strategy
-  // that mutated the object it was handed would have forged not just the
-  // cross-check panel but its own PnL — every position settling the way it
-  // said rather than the way the venue did.
-  const engineMarket = { ...market };
+/**
+ * One market's replay, as a state machine: open, step per event, close.
+ *
+ * Market mode drives one of these at a time. Session mode drives every market
+ * that is open at once from ONE time-ordered stream, so a strategy sharing an
+ * instance across markets never sees a later moment of market A before an
+ * earlier moment of market B — feeding whole markets one after another let the
+ * 00:00–00:15 market hand 00:15 to a market that opened at 00:05.
+ *
+ * The rules and their order are exactly what replayMarket has always applied.
+ * MUST MATCH MarketReplay in otreplay.py.
+ */
+export class MarketReplay {
+  constructor({
+    market, strategy, hooks,
+    portfolio = null,
+    fillDelayMs = 0,
+    /**
+     * The run's remaining log allowance, SHARED ACROSS MARKETS.
+     *
+     * Passed in rather than created here, because a per-market allowance is
+     * what the old limit was and what made the log channel an export route: 386
+     * markets a day each got their own budget. One object for the whole run is
+     * the fix — the harness makes it once and hands the same one to every market.
+     */
+    logBudget = null,
+    budget = null,
+    references = null,
+    series = null,
+    seed = 1,
+    feeBps = 0,
+  }) {
+    this.marketId = market.market_id;
+    this.pf = portfolio ?? new Portfolio({ feeBps });
+    this.pf.setMarketFee(this.marketId, market.fee ?? null);
+    this.book = new Book(this.marketId);
+    this.monitor = budget ?? new BudgetMonitor();
+    this.strategy = strategy;
+    this.hooks = hooks;
+    this.fillDelayMs = fillDelayMs;
+    // The engine keeps its OWN copy and hands the strategy a different one.
+    // Both halves matter: settlement reads `outcome` from here, so a strategy
+    // that mutated the object it was handed would have forged not just the
+    // cross-check panel but its own PnL — every position settling the way it
+    // said rather than the way the venue did.
+    this.market = { ...market };
+    const { ctx, control } = createCtx({
+      params: strategy.p ?? {},
+      portfolio: this.pf,
+      marketId: this.marketId,
+      market: this.market,
+      logBudget: logBudget ?? makeLogBudget(),
+      references,
+      series,
+      rng: makeRng(seed),
+    });
+    this.ctx = ctx;
+    this.control = control;
+    control.setBook(this.book);
+
+    // Orders decided at T but matched at T + fillDelayMs, and hold_s expiries.
+    /** @type {Array<{at:number, kind:'order'|'flatten', payload:any}>} */
+    this.pending = [];
+
+    // The market's close, resolved BEFORE any event because replay has to stop
+    // there.
+    //
+    // The settlement feed is a per-DAY stream, and fetch-data hands every row
+    // of it to every market that settles on that stream — so a market closing
+    // at 10:00 was still being shown ticks from 14:00. A strategy could watch
+    // the price that decides its own settlement, hours after its market had
+    // closed, and log it. That is look-ahead in its purest form, and it
+    // survived the pending-order cutoff because that fixed the ORDERS and not
+    // the EVENTS. A market with no close time in the archive has no cutoff to
+    // apply; the last event seen becomes the close, tracked as we go rather
+    // than peeked.
+    this.declaredClose = this.market.close_ts_ms ?? null;
+    this.closeTs = this.declaredClose ?? Number.POSITIVE_INFINITY;
+    this.seen = 0;
+    this.lastTs = 0;
+    this.ended = false;
+  }
 
   /**
    * What a hook is allowed to see about the market, BEFORE it settles.
@@ -451,62 +504,51 @@ export function replayMarket({
    * Only on_settle sees it, which is exactly what the docs say: "on_settle …
    * carrying the official outcome and strike".
    */
-  const preSettleMarket = () => {
-    const { outcome, ...rest } = engineMarket;
+  #preSettleMarket() {
+    const { outcome, ...rest } = this.market;
     return rest;
-  };
-  const { ctx, control } = createCtx({
-    params: strategy.p ?? {},
-    portfolio: pf,
-    marketId,
-    market: engineMarket,
-    logBudget: logBudget ?? makeLogBudget(),
-    references,
-    series,
-    rng: makeRng(seed),
-  });
-  control.setBook(book);
+  }
 
-  // Orders decided at T but matched at T + fillDelayMs, and hold_s expiries.
-  /** @type {Array<{at:number, kind:'order'|'flatten', payload:any}>} */
-  const pending = [];
-  const schedule = (at, kind, payload) => {
+  #schedule(at, kind, payload) {
+    const pending = this.pending;
     let i = pending.length;
     while (i > 0 && pending[i - 1].at > at) i -= 1;
     pending.splice(i, 0, { at, kind, payload });
-  };
+  }
 
-  const drainUntil = (ts) => {
+  /** Execute everything scheduled at or before `ts`, against this book. */
+  drainUntil(ts) {
+    const pending = this.pending;
     while (pending.length && pending[0].at <= ts) {
       const job = pending.shift();
       if (job.kind === 'order') {
-        const res = pf.execute({ book, order: job.payload, ts: job.at, marketId, how: 'exit' });
+        const res = this.pf.execute({ book: this.book, order: job.payload, ts: job.at, marketId: this.marketId, how: 'exit' });
         // hold_s is measured from the FILL, not the decision: a fill that
         // landed late has not been held as long.
         if (res?.filled > 0 && job.payload.hold_s > 0 && !job.payload.reduce_only) {
-          schedule(job.at + job.payload.hold_s * 1000, 'flatten', { side: job.payload.side });
+          this.#schedule(job.at + job.payload.hold_s * 1000, 'flatten', { side: job.payload.side });
         }
       } else {
-        pf.flatten(marketId, book, job.at, 'hold_expired');
+        this.pf.flatten(this.marketId, this.book, job.at, 'hold_expired');
       }
     }
-  };
+  }
 
-  const call = (name, ...args) => {
-    const fn = hooks[name] && strategy[hooks[name]];
+  #call(name, ...args) {
+    const fn = this.hooks[name] && this.strategy[this.hooks[name]];
     if (typeof fn !== 'function') return undefined;
     const t0 = process.hrtime.bigint();
     let out;
     try {
-      out = fn.call(strategy, ctx, ...args);
+      out = fn.call(this.strategy, this.ctx, ...args);
     } catch (err) {
       throw new RunAbort('E_RUNTIME', `${name} threw: ${err?.message ?? err}`);
     }
-    monitor.record(Number(process.hrtime.bigint() - t0) / 1000);
+    this.monitor.record(Number(process.hrtime.bigint() - t0) / 1000);
     return out;
-  };
+  }
 
-  const emit = (out, ts) => {
+  #emit(out, ts) {
     if (out == null) return;
     const list = Array.isArray(out) ? out : [out];
     for (const order of list) {
@@ -526,62 +568,49 @@ export function replayMarket({
           `tif ${JSON.stringify(tif)} is not supported — only "ioc". Resting orders need a`
           + ' queue-position model, and guessing at one inflates returns by multiples.');
       }
-      schedule(ts + fillDelayMs, 'order', order);
+      this.#schedule(ts + this.fillDelayMs, 'order', order);
     }
-  };
-
-  // A fresh copy per call: whatever the strategy does to it reaches nothing.
-  call('on_market_open', preSettleMarket());
-  if (monitor.breached) {
-    throw new RunAbort('E_BUDGET', `per-event budget exceeded: ${JSON.stringify(monitor.summary())}`);
   }
 
-  // `events` is any ITERABLE, not necessarily an array.
-  //
-  // The harness passes a generator that pulls one line off stdin per step, so
-  // the future is not in the process at all — which is what the docs claim and
-  // what was previously only approximately true. Nothing below may index it,
-  // take its length, or look ahead in it.
+  #checkBudget() {
+    if (this.monitor.breached) {
+      throw new RunAbort('E_BUDGET', `per-event budget exceeded: ${JSON.stringify(this.monitor.summary())}`);
+    }
+  }
 
-  // The market's close, resolved BEFORE the loop because the loop has to stop
-  // there.
-  //
-  // The settlement feed is a per-DAY stream, and fetch-data hands every row of
-  // it to every market that settles on that stream — so a market closing at
-  // 10:00 was still being shown ticks from 14:00. A strategy could watch the
-  // price that decides its own settlement, hours after its market had closed,
-  // and log it. That is look-ahead in its purest form, and it survived the
-  // pending-order cutoff because that fixed the ORDERS and not the EVENTS.
-  // A market with no close time in the archive has no cutoff to apply; the
-  // last event seen becomes the close, tracked as we go rather than peeked.
-  const declaredClose = engineMarket.close_ts_ms ?? null;
-  const closeTs = declaredClose ?? Number.POSITIVE_INFINITY;
-  let seen = 0;
-  let lastTs = 0;
+  open() {
+    // A fresh copy per call: whatever the strategy does to it reaches nothing.
+    this.#call('on_market_open', this.#preSettleMarket());
+    this.#checkBudget();
+  }
 
-  for (const ev of events) {
-    seen += 1;
-    lastTs = ev.ts_ms;
-    // Nothing past the close reaches a hook, the book, or the history.
-    if (ev.ts_ms > closeTs) break;
+  /**
+   * Apply one event. False once the market is past its close: nothing past the
+   * close reaches a hook, the book, or the history.
+   */
+  step(ev) {
+    if (this.ended) return false;
+    this.seen += 1;
+    this.lastTs = ev.ts_ms;
+    if (ev.ts_ms > this.closeTs) { this.ended = true; return false; }
     // Everything scheduled strictly BEFORE this event resolves against the book
     // as it stood then — draining after applying the event would fill a delayed
     // order against depth that arrived after it.
-    drainUntil(ev.ts_ms - 1);
-    control.setNow(ev.ts_ms);
+    this.drainUntil(ev.ts_ms - 1);
+    this.control.setNow(ev.ts_ms);
 
     if (ev.kind === 'book') {
       // BEFORE the snapshot test, because a bound carries snapshot:false and
       // would otherwise be applied as a delta with no ladder, no price and no
       // size — which Book.delta rejects by throwing, taking the whole run with
       // it.
-      if (ev.bbo) book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask);
-      else if (ev.snapshot) book.snapshot(ev.ts_ms, ev.levels);
-      else book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+      if (ev.bbo) this.book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask);
+      else if (ev.snapshot) this.book.snapshot(ev.ts_ms, ev.levels);
+      else this.book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
     }
-    drainUntil(ev.ts_ms);
+    this.drainUntil(ev.ts_ms);
 
-    if (ev.kind === 'tick') control.pushTick(ev);
+    if (ev.kind === 'tick') this.control.pushTick(ev);
 
     // A BOUND REFINES THE BOOK SILENTLY. Three reasons it must not reach a hook,
     // and the first one alone is enough:
@@ -600,40 +629,58 @@ export function replayMarket({
     //
     // MUST MATCH otreplay.py. Both engines or neither.
     const hook = ev.bbo ? null : HOOK_FOR[ev.kind];
-    if (hook && hooks[hook]) emit(call(hook, ev), ev.ts_ms);
-
-    if (monitor.breached) {
-      throw new RunAbort('E_BUDGET', `per-event budget exceeded: ${JSON.stringify(monitor.summary())}`);
-    }
+    if (hook && this.hooks[hook]) this.#emit(this.#call(hook, ev), ev.ts_ms);
+    this.#checkBudget();
+    return true;
   }
 
-  // Anything still queued lands AT THE CLOSE — not at its own future
-  // timestamp. Draining to Infinity executed a delayed order stamped after the
-  // market had already closed, producing trade rows with opened_ms later than
-  // closed_ms and letting late fills trade against a book that no longer
-  // existed. An order that had not landed by the close did not land.
-  // With no declared close, the last event seen IS the close — tracked as the
-  // stream went past, because there is no array to look back into.
-  const settleTs = declaredClose ?? lastTs;
-  control.setNow(settleTs);
-  drainUntil(settleTs);
-  // Whatever is still pending never filled. Dropped, not back-dated.
-  pending.length = 0;
+  close() {
+    // Anything still queued lands AT THE CLOSE — not at its own future
+    // timestamp. Draining to Infinity executed a delayed order stamped after the
+    // market had already closed, producing trade rows with opened_ms later than
+    // closed_ms and letting late fills trade against a book that no longer
+    // existed. An order that had not landed by the close did not land.
+    // With no declared close, the last event seen IS the close — tracked as the
+    // stream went past, because there is no array to look back into.
+    const settleTs = this.declaredClose ?? this.lastTs;
+    this.control.setNow(settleTs);
+    this.drainUntil(settleTs);
+    // Whatever is still pending never filled. Dropped, not back-dated.
+    this.pending.length = 0;
 
-  call('on_settle', { ...engineMarket }, engineMarket.outcome);
+    this.#call('on_settle', { ...this.market }, this.market.outcome);
 
-  const settled = engineMarket.outcome ? pf.settle(marketId, engineMarket.outcome, settleTs) : [];
+    const settled = this.market.outcome ? this.pf.settle(this.marketId, this.market.outcome, settleTs) : [];
 
-  return {
-    marketId,
-    asset: engineMarket.asset ?? null,
-    // What the engine PULLED, not what the caller had. With a stream the
-    // latter is unknowable without draining, and not draining is the point.
-    events: seen,
-    settled,
-    logs: control.logs,
-    logTruncated: control.logTruncated,
-    crosschecks: control.crosschecks,
-    budget: monitor.summary(),
-  };
+    return {
+      marketId: this.marketId,
+      asset: this.market.asset ?? null,
+      // What the engine PULLED, not what the caller had. With a stream the
+      // latter is unknowable without draining, and not draining is the point.
+      events: this.seen,
+      settled,
+      logs: this.control.logs,
+      logTruncated: this.control.logTruncated,
+      crosschecks: this.control.crosschecks,
+      budget: this.monitor.summary(),
+    };
+  }
+}
+
+/**
+ * Replay one market start to finish.
+ *
+ * `events` is any ITERABLE, not necessarily an array. The harness passes a
+ * generator that pulls one line off stdin per step, so the future is not in the
+ * process at all — which is what the docs claim and what was previously only
+ * approximately true. Nothing below may index it, take its length, or look
+ * ahead in it.
+ */
+export function replayMarket(args) {
+  const r = new MarketReplay(args);
+  r.open();
+  for (const ev of args.events) {
+    if (!r.step(ev)) break;
+  }
+  return r.close();
 }

@@ -15,7 +15,6 @@ the conformance vectors compare them row for row. In particular:
 from __future__ import annotations
 
 import os
-import select
 import time
 from typing import Any, Callable
 
@@ -44,6 +43,10 @@ def write_all(fd, data, write=os.write):
         try:
             n = write(fd, view)
         except BlockingIOError:
+            # Imported here, not at the top: `select` cannot wait on a pipe on
+            # Windows, and this module is also imported by the pure-Python
+            # local backtest, which never writes to a descriptor at all.
+            import select
             select.select([], [fd], [])
             continue
         if n <= 0:
@@ -321,68 +324,91 @@ class Ctx:
         })
 
 
-def replay_market(*, market: dict, events: list, strategy, hooks: dict,
-                  portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
-                  log_budget: dict | None = None, budget: BudgetMonitor | None = None,
-                  references=None, series=None, seed: int = 1,
-                  fee_bps: float = 0) -> dict:
-    market_id = market["market_id"]
-    # Attribute access for everything a hook is handed: the docs say
-    # `market.strike` and `tick.value`, and they have to be true here.
-    # Pre-settle view: `outcome` is a future fact and is stripped. See the
-    # matching comment in replay.mjs — a strategy that read it in
-    # on_market_open could buy the winning side and the report became
-    # meaningless. Only on_settle sees it.
-    market_rec = Rec({k: v for k, v in market.items() if k != "outcome"})
-    settle_rec = Rec(market)
-    pf = portfolio if portfolio is not None else Portfolio(fee_bps=fee_bps)
-    book = Book(market_id)
-    monitor = budget if budget is not None else BudgetMonitor()
-    ctx = Ctx(getattr(strategy, "p", {}) or {}, pf, market_id,
-              log_budget if log_budget is not None else make_log_budget(),
-              references, series, make_rng(seed))
-    state = _INTERNALS[id(ctx)]
-    state["book"] = book
-    # The engine's own copy of the market, for assert_outcome.
-    state["market"] = dict(market)
-    state["view"] = BookView(book)
+class MarketReplay:
+    """One market's replay, as a state machine: open, step per event, close.
 
-    pending: list[dict] = []
+    market mode drives one of these at a time; session mode drives every market
+    that is open at once from a single time-ordered stream, so a strategy sharing
+    one instance across markets never sees a later moment of market A before an
+    earlier moment of market B. The rules and their order are exactly the ones
+    replay_market has always applied -- MUST MATCH MarketReplay in
+    runner/engine/replay.mjs.
+    """
 
-    def schedule(at: int, kind: str, payload) -> None:
-        i = len(pending)
-        while i > 0 and pending[i - 1]["at"] > at:
+    def __init__(self, *, market: dict, strategy, hooks: dict,
+                 portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
+                 log_budget: dict | None = None, budget: BudgetMonitor | None = None,
+                 references=None, series=None, seed: int = 1,
+                 fee_bps: float = 0) -> None:
+        self.market_id = market["market_id"]
+        self.market = market
+        # Attribute access for everything a hook is handed: the docs say
+        # `market.strike` and `tick.value`, and they have to be true here.
+        # Pre-settle view: `outcome` is a future fact and is stripped. See the
+        # matching comment in replay.mjs -- a strategy that read it in
+        # on_market_open could buy the winning side and the report became
+        # meaningless. Only on_settle sees it.
+        self._market_rec = Rec({k: v for k, v in market.items() if k != "outcome"})
+        self._settle_rec = Rec(market)
+        self.pf = portfolio if portfolio is not None else Portfolio(fee_bps=fee_bps)
+        self.pf.set_market_fee(self.market_id, market.get("fee"))
+        self.book = Book(self.market_id)
+        self.monitor = budget if budget is not None else BudgetMonitor()
+        self.strategy = strategy
+        self.hooks = hooks
+        self.fill_delay_ms = fill_delay_ms
+        self.ctx = Ctx(getattr(strategy, "p", {}) or {}, self.pf, self.market_id,
+                       log_budget if log_budget is not None else make_log_budget(),
+                       references, series, make_rng(seed))
+        self.state = _INTERNALS[id(self.ctx)]
+        self.state["book"] = self.book
+        # The engine's own copy of the market, for assert_outcome.
+        self.state["market"] = dict(market)
+        self.state["view"] = BookView(self.book)
+        self.pending: list[dict] = []
+        # A market with no declared close has no cutoff; the last event seen
+        # becomes the close, tracked as we go rather than peeked.
+        self.declared_close = market.get("close_ts_ms")
+        self.close_ts = self.declared_close if self.declared_close else float("inf")
+        self.seen = 0
+        self.last_ts = 0
+        self.ended = False
+
+    def _schedule(self, at: int, kind: str, payload) -> None:
+        i = len(self.pending)
+        while i > 0 and self.pending[i - 1]["at"] > at:
             i -= 1
-        pending.insert(i, {"at": at, "kind": kind, "payload": payload})
+        self.pending.insert(i, {"at": at, "kind": kind, "payload": payload})
 
-    def drain_until(ts) -> None:
-        while pending and pending[0]["at"] <= ts:
-            job = pending.pop(0)
+    def drain_until(self, ts) -> None:
+        """Execute everything scheduled at or before `ts`, against this book."""
+        while self.pending and self.pending[0]["at"] <= ts:
+            job = self.pending.pop(0)
             if job["kind"] == "order":
                 order = job["payload"]
-                res = pf.execute(book, order, job["at"], market_id, how="exit")
+                res = self.pf.execute(self.book, order, job["at"], self.market_id, how="exit")
                 hold = order.get("hold_s") if isinstance(order, dict) else None
                 if res and res["filled"] > 0 and hold and not order.get("reduce_only"):
-                    schedule(job["at"] + int(hold) * 1000, "flatten", {"side": order.get("side")})
+                    self._schedule(job["at"] + int(hold) * 1000, "flatten", {"side": order.get("side")})
             else:
-                pf.flatten(market_id, book, job["at"], "hold_expired")
+                self.pf.flatten(self.market_id, self.book, job["at"], "hold_expired")
 
-    def call(canonical: str, *args):
-        name = hooks.get(canonical)
-        fn = getattr(strategy, name, None) if name else None
+    def _call(self, canonical: str, *args):
+        name = self.hooks.get(canonical)
+        fn = getattr(self.strategy, name, None) if name else None
         if not callable(fn):
             return None
         t0 = time.perf_counter_ns()
         try:
-            out = fn(ctx, *args)
+            out = fn(self.ctx, *args)
         except RunAbort:
             raise
         except Exception as err:  # noqa: BLE001 - a strategy may raise anything
             raise RunAbort("E_RUNTIME", f"{canonical} threw: {err}") from err
-        monitor.record((time.perf_counter_ns() - t0) / 1000)
+        self.monitor.record((time.perf_counter_ns() - t0) / 1000)
         return out
 
-    def emit(out, ts: int) -> None:
+    def _emit(self, out, ts: int) -> None:
         if out is None:
             return
         orders = out if isinstance(out, list) else [out]
@@ -399,91 +425,113 @@ def replay_market(*, market: dict, events: list, strategy, hooks: dict,
                     f'tif {tif!r} is not supported — only "ioc". Resting orders need a '
                     "queue-position model, and guessing at one inflates returns by multiples.",
                 )
-            schedule(ts + fill_delay_ms, "order", row)
+            self._schedule(ts + self.fill_delay_ms, "order", row)
 
-    call("on_market_open", market_rec)
-    if monitor.breached:
-        raise RunAbort("E_BUDGET", f"per-event budget exceeded: {monitor.summary()}")
+    def _check_budget(self) -> None:
+        if self.monitor.breached:
+            raise RunAbort("E_BUDGET", f"per-event budget exceeded: {self.monitor.summary()}")
 
-    # `events` is any ITERABLE, not necessarily a list — the harness passes a
-    # generator that pulls one line off stdin per step, so the future is not in
-    # the process at all. Nothing below may index it or take its length.
-    #
-    # A market with no declared close has no cutoff; the last event seen becomes
-    # the close, tracked as we go rather than peeked.
-    declared_close = market.get("close_ts_ms")
-    close_ts = declared_close if declared_close else float("inf")
-    seen = 0
-    last_ts = 0
+    def open(self) -> None:
+        self._call("on_market_open", self._market_rec)
+        self._check_budget()
 
-    for ev in events:
-        seen += 1
+    def step(self, ev) -> bool:
+        """Apply one event. False once the market is past its close: nothing
+        past the close reaches a hook, the book, or the history."""
+        if self.ended:
+            return False
+        self.seen += 1
         ts = ev["ts_ms"]
-        last_ts = ts
-        # Nothing past the close reaches a hook, the book, or the history.
-        if ts > close_ts:
-            break
+        self.last_ts = ts
+        if ts > self.close_ts:
+            self.ended = True
+            return False
+        state = self.state
         # Everything scheduled strictly before this event resolves against the
         # book as it stood then.
-        drain_until(ts - 1)
+        self.drain_until(ts - 1)
         state["now"] = ts
 
         if ev.get("kind") == "book":
             # BEFORE the snapshot test, because a bound carries snapshot:false
             # and would otherwise be applied as a delta with no ladder, no price
-            # and no size — which Book.delta rejects by raising, taking the whole
-            # run with it. MUST MATCH the same ordering in runner/engine/replay.mjs.
+            # and no size -- which Book.delta rejects by raising, taking the
+            # whole run with it. MUST MATCH the same ordering in
+            # runner/engine/replay.mjs.
             if ev.get("bbo"):
-                book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"))
+                self.book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"))
             elif ev.get("snapshot"):
-                book.snapshot(ts, ev.get("levels") or {})
+                self.book.snapshot(ts, ev.get("levels") or {})
             else:
-                book.delta(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
-        drain_until(ts)
+                self.book.delta(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
+        self.drain_until(ts)
 
         ev_rec = Rec(ev)
         if ev.get("kind") == "tick":
-            # A separate copy from the one the hook is handed — see the matching
-            # comment in replay.mjs.
+            # A separate copy from the one the hook is handed -- see the
+            # matching comment in replay.mjs.
             state["history"].append(Rec(ev))
 
-        # A bound refines the book silently and never reaches a hook — the event
-        # has no levels/ladder/px/size, the stream is unthrottled, and ctx.book()
-        # is live so the next real event already sees the refined ladder. Full
-        # reasoning in replay.mjs; both engines or neither.
+        # A bound refines the book silently and never reaches a hook -- the
+        # event has no levels/ladder/px/size, the stream is unthrottled, and
+        # ctx.book() is live so the next real event already sees the refined
+        # ladder. Full reasoning in replay.mjs; both engines or neither.
         hook = None if ev.get("bbo") else HOOK_FOR.get(ev.get("kind"))
-        if hook and hooks.get(hook):
-            emit(call(hook, ev_rec), ts)
+        if hook and self.hooks.get(hook):
+            self._emit(self._call(hook, ev_rec), ts)
+        self._check_budget()
+        return True
 
-        if monitor.breached:
-            raise RunAbort("E_BUDGET", f"per-event budget exceeded: {monitor.summary()}")
+    def close(self) -> dict:
+        state = self.state
+        # Queued work lands AT THE CLOSE, never at its own future timestamp --
+        # see the matching comment in replay.mjs. Both engines or neither.
+        settle_ts = self.declared_close if self.declared_close else self.last_ts
+        state["now"] = settle_ts
+        self.drain_until(settle_ts)
+        self.pending.clear()
 
-    # Queued work lands AT THE CLOSE, never at its own future timestamp — see
-    # the matching comment in replay.mjs. Both engines or neither.
-    settle_ts = declared_close if declared_close else last_ts
-    state["now"] = settle_ts
-    drain_until(settle_ts)
-    pending.clear()
+        market = self.market
+        self._call("on_settle", self._settle_rec, market.get("outcome"))
+        settled = self.pf.settle(self.market_id, market["outcome"], settle_ts) if market.get("outcome") else []
 
-    call("on_settle", settle_rec, market.get("outcome"))
-    settled = pf.settle(market_id, market["outcome"], settle_ts) if market.get("outcome") else []
+        view = state.pop("view", None)
+        if view is not None:
+            _BOOKS.pop(id(view), None)
+        _INTERNALS.pop(id(self.ctx), None)
 
-    view = state.pop("view", None)
-    if view is not None:
-        _BOOKS.pop(id(view), None)
-    _INTERNALS.pop(id(ctx), None)
+        return {
+            "market_id": self.market_id,
+            "asset": market.get("asset"),
+            # What the engine PULLED, not what the caller had -- see replay.mjs.
+            "events": self.seen,
+            "settled": settled,
+            "logs": state["logs"],
+            "log_truncated": state["log_truncated"],
+            "crosschecks": state["crosschecks"],
+            "budget": self.monitor.summary(),
+        }
 
-    return {
-        "market_id": market_id,
-        "asset": market.get("asset"),
-        # What the engine PULLED, not what the caller had — see replay.mjs.
-        "events": seen,
-        "settled": settled,
-        "logs": state["logs"],
-        "log_truncated": state["log_truncated"],
-        "crosschecks": state["crosschecks"],
-        "budget": monitor.summary(),
-    }
+
+def replay_market(*, market: dict, events, strategy, hooks: dict,
+                  portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
+                  log_budget: dict | None = None, budget: BudgetMonitor | None = None,
+                  references=None, series=None, seed: int = 1,
+                  fee_bps: float = 0) -> dict:
+    """Replay one market start to finish.
+
+    `events` is any ITERABLE, not necessarily a list -- the harness passes a
+    generator that pulls one line off stdin per step, so the future is not in
+    the process at all. Nothing here may index it or take its length.
+    """
+    r = MarketReplay(market=market, strategy=strategy, hooks=hooks, portfolio=portfolio,
+                     fill_delay_ms=fill_delay_ms, log_budget=log_budget, budget=budget,
+                     references=references, series=series, seed=seed, fee_bps=fee_bps)
+    r.open()
+    for ev in events:
+        if not r.step(ev):
+            break
+    return r.close()
 
 
 def _as_order(order) -> dict:

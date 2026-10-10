@@ -8,7 +8,7 @@
 // Nothing in this module can see the strategy. It reads the trade and fill logs
 // the engine produced, so a report cannot be tuned by the thing it is judging.
 
-import { contractValue } from './portfolio.mjs';
+import { contractValue, FEE_MODEL_PM } from './portfolio.mjs';
 
 /** Entry-price buckets for the calibration panel. */
 export const CALIBRATION_BUCKETS = Object.freeze([
@@ -491,6 +491,42 @@ export function sweepPanel(cells, { xParam, yParam, metric = 'sharpe' }) {
 }
 
 /**
+ * Which fees this report was computed under, and how many markets that
+ * actually applied to.
+ *
+ * NOT DECORATION. Net PnL moves with the fee assumption more than with most
+ * parameter changes, and a report forwarded without this block reads as
+ * "fees included" whatever was used. So it names the mode, the model and its
+ * rounding assumption, and counts the markets the venue schedule could not be
+ * read for — those were charged nothing, and a reader has to be able to see
+ * that rather than infer it.
+ *
+ * `markets` are the market records that were fed (each with its normalised
+ * `fee`, see feeOf in events.mjs). MUST MATCH fee_model_report in
+ * client/backtest/report.py.
+ */
+export function feeModelReport({ policy, markets }) {
+  const venue = policy?.mode !== 'bps';
+  const counts = { charged: 0, known_zero: 0, unknown: 0 };
+  for (const m of markets ?? []) {
+    const fee = m?.fee ?? null;
+    if (fee?.model === FEE_MODEL_PM) counts.charged += 1;
+    else if (fee?.model === 'none') counts.known_zero += 1;
+    else counts.unknown += 1;
+  }
+  return {
+    mode: venue ? 'venue' : 'bps',
+    bps: venue ? null : (Number.isFinite(policy?.bps) ? policy.bps : 0),
+    model: venue ? FEE_MODEL_PM : null,
+    // The venue rounds per MATCH; the archive has book levels, not the maker
+    // orders inside them. See feeFor in portfolio.mjs.
+    rounding: venue ? 'per book level taken, 5 decimals, ties up' : null,
+    estimate: venue,
+    markets: venue ? counts : null,
+  };
+}
+
+/**
  * Assemble the whole report.
  *
  * `coverage` is carried through untouched from the archive: which stream backed
@@ -500,7 +536,7 @@ export function sweepPanel(cells, { xParam, yParam, metric = 'sharpe' }) {
 export function buildReport({
   runId, submittedAt, manifest, scope, sourceSha256 = null,
   trades, fillStats: fillSummary, marketSummaries, marketMeta,
-  feesPaid = 0, fillDelayMs = 0, sweep = null, coverage = null,
+  feesPaid = 0, fillDelayMs = 0, feeModel = null, sweep = null, coverage = null,
   crosschecks = [], budget = null, seed = null, scanned = {},
 }) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
@@ -565,6 +601,7 @@ export function buildReport({
     // nothing else in here would tell a reader whether they are looking at a
     // zero-latency run or a 250ms one.
     fill_delay_ms: fillDelayMs,
+    fee_model: feeModel,
     sweep,
     coverage,
     budget,

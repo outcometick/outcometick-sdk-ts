@@ -25,7 +25,9 @@ import {
   sortMarketsForReplay,
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
-import { buildReport, fillStats } from '../../runner/engine/report.mjs';
+import { buildReport, fillStats, feeModelReport } from '../../runner/engine/report.mjs';
+import { sessionLines } from '../../runner/session-feed.mjs';
+import { feePolicyFor } from '../../api/lib/backtest-datasets.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
 import { createLineWriter } from '../../runner/stdin-writer.mjs';
 import { readEventLines } from '../../runner/spool-day.mjs';
@@ -95,27 +97,36 @@ function runHarness({
     // being a ninth.
     let streamError = null;
     const write = createLineWriter(child.stdin);
+    // Series rows are INTERLEAVED into the same stream in event time, exactly
+    // as the worker sends them — and `lags` travels with them, or a signal that
+    // declared a publication delay would be visible the instant its row was
+    // stamped rather than when it could have existed.
+    // One market read back from its spool file (see spoolDay): the day is
+    // never all in memory, only the markets being fed.
+    const linesOf = async (m) => {
+      const lines = await readEventLines(path.join(eventsDir, m.eventsFile));
+      return seriesNames.length
+        ? mergeReferenceRows(lines, seriesRows, m.market, 'ext', seriesLags)
+        : lines;
+    };
+    const headerOf = (m) => ({
+      market: m.market,
+      stream: m.stream,
+      ...(seriesNames.length ? { series: seriesNames } : {}),
+      ...(Object.keys(seriesLags).length ? { lags: seriesLags } : {}),
+    });
     (async () => {
       await write(JSON.stringify({ ...job, outputKey }));
-      for (const m of markets) {
-        // Series rows are INTERLEAVED into the same stream in event time,
-        // exactly as the worker sends them — and `lags` travels with them, or a
-        // signal that declared a publication delay would be visible the instant
-        // its row was stamped rather than when it could have existed.
-        // One market read back from its spool file (see spoolDay): the day is
-        // never all in memory, only the market being fed.
-        const lines = await readEventLines(path.join(eventsDir, m.eventsFile));
-        const merged = seriesNames.length
-          ? mergeReferenceRows(lines, seriesRows, m.market, 'ext', seriesLags)
-          : lines;
-        await write(JSON.stringify({
-          market: m.market,
-          stream: m.stream,
-          n: merged.length,
-          ...(seriesNames.length ? { series: seriesNames } : {}),
-          ...(Object.keys(seriesLags).length ? { lags: seriesLags } : {}),
-        }));
-        for (const line of merged) await write(line);
+      if (job.mode === 'session') {
+        // ONE time order across every market — the same stream the worker
+        // writes (runner/session-feed.mjs).
+        for await (const line of sessionLines(markets, { linesOf, headerOf })) await write(line);
+      } else {
+        for (const m of markets) {
+          const merged = await linesOf(m);
+          await write(JSON.stringify({ ...headerOf(m), n: merged.length }));
+          for (const line of merged) await write(line);
+        }
       }
       child.stdin.end();
     })().catch((err) => {
@@ -317,6 +328,7 @@ export async function cmdRun({ dir, flags }) {
           path.join(jobDir, 'node_modules', 'outcometick'), { recursive: true });
       }
 
+      const feePolicy = feePolicyFor({ manifest, envFeeBps: flags['fee-bps'] ?? null });
       const baseJob = {
         entry: manifest.entry,
         hooks: Object.fromEntries(manifest.hooks.map((h) => [h, HOOK_NAMES[languageId][h]])),
@@ -324,7 +336,9 @@ export async function cmdRun({ dir, flags }) {
         params: manifest.params,
         mode: manifest.mode,
         seed: Number(flags.seed ?? 1),
-        feeBps: Number(flags['fee-bps'] ?? 0),
+        // The venue's own schedule, market by market, unless the manifest or
+        // --fee-bps says otherwise — the same rule the worker applies.
+        fees: feePolicy,
         limits: LIMITS,
       };
       if (languageId === 'python') {
@@ -427,7 +441,11 @@ export async function cmdRun({ dir, flags }) {
           from: days[0],
           to: days[days.length - 1],
           marketDays: marketDaysScanned,
-          archivedDayCount: days.length,
+          // MARKET-DAYS, the unit the queue reports here (it passes the run's
+          // market_days). This was the calendar-day count, so the same archive
+          // reported a different `metrics.market_days` locally whenever a run
+          // spanned more than one asset or market length.
+          archivedDayCount: marketDaysScanned,
         },
         scanned: {
           markets: base.result.marketsRun,
@@ -440,6 +458,7 @@ export async function cmdRun({ dir, flags }) {
         marketMeta,
         feesPaid: base.result.feesPaid,
         fillDelayMs: delayMs,
+        feeModel: feeModelReport({ policy: feePolicy, markets: markets.map((m) => m.market) }),
         sweep: null,
         crosschecks: base.result.crosschecks,
         seed: Number(flags.seed ?? 1),

@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.1.2';
+export const SDK_VERSION = '2.2.0';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -26,6 +26,12 @@ export const SDK_VERSION = '2.1.2';
  * runs the old harness under the new worker — and the failure is silent. The
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
+ *
+ * 1.20.0: protocol change, worker first. Session mode is one merged stream
+ * ({"open"}, {"i","e"}, {"close"} lines, runner/session-feed.mjs) instead of
+ * whole markets one after another, and the job carries a fee policy (`fees`)
+ * that the engines charge per market. The Python harness loop moved to
+ * otharness.py, shared with the pure-Python local backtest.
  *
  * 1.19.0: no protocol change. engine/report.mjs's slippage panel became a
  * streaming accumulator (the worker spools fills to disk); stamp moved again.
@@ -67,7 +73,7 @@ export const SDK_VERSION = '2.1.2';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.19.0';
+export const SANDBOX_IMAGE_TAG = '1.20.0';
 
 // ---------------------------------------------------------------------------
 // Languages
@@ -289,7 +295,7 @@ export const CAPTURE_WINDOWS = Object.freeze({
  * the day AFTER it was deployed, because the deploy day is mixed and claiming
  * the finer cadence for it would promise more than the archive holds.
  */
-const BOOK_CAPTURE = Object.freeze({
+export const BOOK_CAPTURE = Object.freeze({
   polymarket: Object.freeze([
     Object.freeze({ from: '2026-06-06', defaultMs: 500, perAsset: Object.freeze({}) }),
     Object.freeze({ from: '2026-08-25', defaultMs: 500, perAsset: Object.freeze({ BTC: 20, ETH: 100 }) }),

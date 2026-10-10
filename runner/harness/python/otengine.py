@@ -63,7 +63,11 @@ def js_round(x: float) -> int:
     a different level than the JS engine — a silent, data-dependent divergence
     in what fills.
     """
-    return math.floor(x + 0.5)
+    # Not floor(x + 0.5): that is wrong exactly where x + 0.5 itself rounds
+    # (0.49999999999999994, odd integers past 2**52), and then this engine
+    # quantises to a different tick than Math.round does.
+    f = math.floor(x)
+    return f + 1 if x - f >= 0.5 else f
 
 
 def to_ticks(px: float) -> int:
@@ -323,6 +327,30 @@ def match_order(book: Book, order: dict) -> dict:
 
 OUTCOME_TIE = "TIE"
 
+# Polymarket's taker fee per archived market schedule. The reasoning -- and why
+# this is an estimate rounded per book LEVEL rather than per venue match -- is
+# on feeFor in runner/engine/portfolio.mjs. MUST MATCH it exactly.
+FEE_MODEL_PM = "polymarket-taker-v1"
+
+
+def round_fee(x: float) -> float:
+    return js_round(x * 1e5) / 1e5
+
+
+def fee_for(policy, market_fee, res) -> float:
+    if isinstance(policy, dict) and policy.get("mode") == "bps":
+        bps = policy.get("bps")
+        ok = isinstance(bps, (int, float)) and not isinstance(bps, bool) and math.isfinite(bps)
+        bps = float(bps) if ok else 0.0
+        return (res["notional"] * bps) / 10_000
+    if not isinstance(market_fee, dict) or market_fee.get("model") != FEE_MODEL_PM:
+        return 0.0
+    rate = market_fee["rate"]
+    total = 0.0
+    for f in res["fills"]:
+        total += round_fee(f["size"] * rate * f["px"] * (1 - f["px"]))
+    return total
+
 
 def contract_value(side: str, outcome: str) -> float:
     # A tie settles 50:50: both outcome tokens pay half a dollar. MUST MATCH
@@ -367,8 +395,10 @@ class Leg:
 
 
 class Portfolio:
-    def __init__(self, fee_bps: float = 0) -> None:
-        self.fee_bps = float(fee_bps or 0)
+    def __init__(self, fee_bps: float = 0, fees: dict | None = None) -> None:
+        # `fees` is the run's policy; absent, the legacy flat `fee_bps` is.
+        self.fee_policy = fees if fees is not None else {"mode": "bps", "bps": float(fee_bps or 0)}
+        self.market_fees: dict[str, dict | None] = {}
         self.legs: dict[str, dict[str, Leg]] = {}
         self.trades: list[dict] = []
         self.fills: list[dict] = []
@@ -382,6 +412,17 @@ class Portfolio:
             legs = {"UP": Leg("UP"), "DOWN": Leg("DOWN")}
             self.legs[market_id] = legs
         return legs
+
+    def set_market_fee(self, market_id: str, fee) -> None:
+        """Record a market's fee schedule before any of its orders execute.
+
+        COPIED: the same dict reaches the strategy as `market.fee`, and a
+        strategy that set its rate to 0 would otherwise trade fee-free while the
+        report said otherwise. MUST MATCH setMarketFee in portfolio.mjs.
+        """
+        self.market_fees[market_id] = (
+            {"model": fee.get("model"), "rate": fee.get("rate")} if isinstance(fee, dict) else None
+        )
 
     def size_of(self, market_id: str, side: str) -> float:
         return self._legs(market_id)[side].size
@@ -484,7 +525,7 @@ class Portfolio:
             self.fills.append(self._fill_row(ts, market_id, order, res, tag, 0.0, 0.0))
             return res
 
-        fee = (res["notional"] * self.fee_bps) / 10_000
+        fee = fee_for(self.fee_policy, self.market_fees.get(market_id), res)
         self.fees_paid += fee
         realised = 0.0
 

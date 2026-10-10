@@ -14,7 +14,7 @@ import {
   KNOWN_MODES, SCHEMA_VERSION, BacktestRejection, parseReferenceFeed,
 } from './backtest-contract.mjs';
 import {
-  normalizeDatasets, normalizeIntervals, normalizeLatency, assertCoverage,
+  normalizeDatasets, normalizeIntervals, normalizeLatency, normalizeFeeBps, assertCoverage,
 } from './backtest-datasets.mjs';
 // The series parser, so the FREE check rejects a malformed CSV instead of the
 // worker rejecting it after credits are held. One implementation, shared: the
@@ -130,6 +130,10 @@ export function validateManifest(doc) {
   // every delay is another replay of the range, and it used to be five of them
   // whether or not anyone wanted the table.
   const latency = normalizeLatency(doc.latency);
+
+  // Fees default to the venue's own schedule, per market. `fee_bps` replaces
+  // it with a flat rate on notional; the report says which was used.
+  const feeBps = normalizeFeeBps(doc.fee_bps);
 
   // A hook that needs a dataset it was not given would simply never fire, and
   // a strategy that silently never trades looks like a bad strategy rather
@@ -248,6 +252,7 @@ export function validateManifest(doc) {
     datasets,
     intervals,
     latency,
+    fee_bps: feeBps,
     mode,
     deps,
     reference,

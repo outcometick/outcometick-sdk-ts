@@ -23,7 +23,7 @@ import {
  * publishes a single `orderbook` tree. A strategy that declares `book` gets
  * whatever that venue actually has, which is the point of naming it `book`.
  */
-const ARCHIVE_DATASETS = Object.freeze({
+export const ARCHIVE_DATASETS = Object.freeze({
   polymarket: Object.freeze({
     prices: Object.freeze(['prices']),
     twap30s: Object.freeze(['twap30s']),
@@ -444,6 +444,44 @@ export function normalizeLatency(value) {
       `latency must be a whole number of milliseconds between 1 and ${MAX_LATENCY_MS}, got ${JSON.stringify(value)}`);
   }
   return ms;
+}
+
+/** The highest flat fee override a manifest may declare: 10% of notional. */
+export const MAX_FEE_BPS = 1000;
+
+/**
+ * Validate a declared flat fee override, returning it normalised.
+ *
+ * Absent (null) means the venue's own schedule, market by market — the
+ * default. A number replaces it with a flat rate on notional, and 0 is a real
+ * override, not "unset": a strategy author pricing a fee rebate deal, or
+ * comparing gross and net, has to be able to say zero.
+ */
+export function normalizeFeeBps(value) {
+  if (value == null) return null;
+  const n = typeof value === 'number' ? value : Number.NaN;
+  if (!Number.isFinite(n) || n < 0 || n > MAX_FEE_BPS) {
+    throw new BacktestRejection('E_MANIFEST',
+      `fee_bps must be a number of basis points between 0 and ${MAX_FEE_BPS}, got ${JSON.stringify(value)}`);
+  }
+  return n;
+}
+
+/**
+ * The fee policy a run replays under, as both harnesses read it from the job.
+ *
+ * The venue's schedule unless the manifest overrides it. `envFeeBps` is the
+ * operator's override (OT_FEE_BPS on the worker, --fee-bps for `ot run`) and
+ * wins over both, because it is how a run is reproduced under another
+ * assumption without editing the submission.
+ */
+export function feePolicyFor({ manifest, envFeeBps = null }) {
+  if (envFeeBps != null && envFeeBps !== '') {
+    const bps = Number(envFeeBps);
+    if (Number.isFinite(bps) && bps >= 0) return { mode: 'bps', bps };
+  }
+  if (manifest?.fee_bps != null) return { mode: 'bps', bps: manifest.fee_bps };
+  return { mode: 'venue' };
 }
 
 /**
