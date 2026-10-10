@@ -38,10 +38,14 @@ export class Strategy {
  */
 export class Order {
   constructor({ side, size, notional = null, limit = null, holdS = null, hold_s = null,
-    reduceOnly = false, reduce_only = false, tif = 'ioc', tag = null } = {}) {
+    reduceOnly = false, reduce_only = false, tif = 'ioc', tag = null,
+    postOnly = false, post_only = false, clientId = null, client_id = null } = {}) {
     if (!SIDES.includes(side)) {
       throw new Error(`side must be "UP" or "DOWN", got ${JSON.stringify(side)}`);
     }
+    // Both spellings accepted: the docs use holdS in the Node examples and
+    // hold_s is the wire field. Neither should be a trap.
+    const hold = holdS ?? hold_s;
     // SIZING IN MONEY — this is about the `notional` field, converted here
     // rather than in the engine. `size` is CONTRACTS (see OrderSizing in
     // index.d.ts); it is not money, and reading this heading as if it were
@@ -95,20 +99,32 @@ export class Order {
       // never asked for.
       throw new Error(`limit must be between 0 and 1, got ${JSON.stringify(limit)}`);
     }
-    if (tif !== 'ioc') {
-      // Not modelled, so not accepted. See "Not supported yet" in the docs.
-      throw new Error(`tif must be "ioc"; ${JSON.stringify(tif)} is not supported yet`);
+    if (tif !== 'ioc' && tif !== 'gtc') {
+      throw new Error(`tif must be "ioc" or "gtc", got ${JSON.stringify(tif)}`);
+    }
+    const postOnlyFlag = Boolean(postOnly || post_only);
+    const cid = clientId ?? client_id;
+    if (tif === 'gtc') {
+      // A resting order rests AT a price; without one there is nothing to queue.
+      if (limit == null) throw new Error('a gtc order needs a limit — the price it rests at');
+      if (hold != null) throw new Error('hold_s is not supported on gtc orders; exit with a reduce_only order');
+    } else if (postOnlyFlag || cid != null) {
+      throw new Error('post_only and client_id only apply to gtc orders');
+    }
+    if (cid != null && !(typeof cid === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(cid) && !/^o[0-9]+$/.test(cid))) {
+      throw new Error(`client_id must be 1-64 of A-Z a-z 0-9 _ . : - and not look like an engine id (o<digits>), got ${JSON.stringify(cid)}`);
     }
     this.side = side;
     this.size = Number(size);
     this.limit = limit == null ? null : Number(limit);
-    // Both spellings accepted: the docs use holdS in the Node examples and
-    // hold_s is the wire field. Neither should be a trap.
-    const hold = holdS ?? hold_s;
     this.hold_s = hold == null ? null : Number(hold);
     this.reduce_only = Boolean(reduceOnly || reduce_only);
     this.tif = tif;
     this.tag = tag;
+    if (tif === 'gtc') {
+      this.post_only = postOnlyFlag;
+      this.client_id = cid ?? null;
+    }
   }
 }
 

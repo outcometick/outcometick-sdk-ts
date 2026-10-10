@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.2.2';
+export const SDK_VERSION = '2.3.0';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -26,6 +26,12 @@ export const SDK_VERSION = '2.2.2';
  * runs the old harness under the new worker — and the failure is silent. The
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
+ *
+ * 1.21.0: protocol change, worker first. Resting (gtc) orders: the job carries
+ * a `resting` policy (restingPolicyFor), fill rows carry liquidity / order id /
+ * queue / markout fields, and the result line a `maker` counter block. An old
+ * harness under the new worker refuses every gtc order (no policy); the new
+ * harness under an old worker sees no `resting` and refuses them too.
  *
  * 1.20.0: protocol change, worker first. Session mode is one merged stream
  * ({"open"}, {"i","e"}, {"close"} lines, runner/session-feed.mjs) instead of
@@ -73,7 +79,7 @@ export const SDK_VERSION = '2.2.2';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.20.0';
+export const SANDBOX_IMAGE_TAG = '1.21.0';
 
 // ---------------------------------------------------------------------------
 // Languages

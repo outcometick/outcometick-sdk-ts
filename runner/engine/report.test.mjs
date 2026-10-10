@@ -545,5 +545,8 @@ test('the streaming slippage panel equals the array version, bit for bit', () =>
   const acc = slippageAccumulator();
   for (const f of fills) acc.add(f);
   assert.deepEqual(acc.result(), reference(fills));
-  assert.deepEqual(fillStats(fills), { count: 5000, slippage: reference(fills) });
+  const { makerFills, ...rest } = fillStats(fills);
+  assert.deepEqual(rest, { count: 5000, slippage: reference(fills) });
+  // None of these fixture rows is a maker fill.
+  assert.equal(makerFills.fills, 0);
 });

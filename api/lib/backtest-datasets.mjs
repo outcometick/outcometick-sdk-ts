@@ -446,6 +446,53 @@ export function normalizeLatency(value) {
   return ms;
 }
 
+/**
+ * Validate a declared cancel latency: how long after a hook calls
+ * ctx.cancel() the cancel reaches the venue. Separate from `latency` (order
+ * entry) because the two are different trips on a real connection. 0 is
+ * allowed; absent means "same as latency".
+ */
+export function normalizeCancelLatency(value) {
+  if (value == null) return null;
+  const ms = typeof value === 'number' ? value : Number.NaN;
+  if (!Number.isInteger(ms) || ms < 0 || ms > MAX_LATENCY_MS) {
+    throw new BacktestRejection('E_MANIFEST',
+      `cancel_latency must be a whole number of milliseconds between 0 and ${MAX_LATENCY_MS}, got ${JSON.stringify(value)}`);
+  }
+  return ms;
+}
+
+/**
+ * Whether a run may rest orders, as both harnesses read it from the job.
+ *
+ * The queue model needs every print (`trades`) to advance a queue and the book
+ * (`book`) to know how long the queue is; without the book every order would
+ * join at the front, which is the most flattering assumption there is. And it
+ * exists only for Polymarket: Predict.fun's archive has book snapshots and no
+ * trade stream, so there is nothing to advance a queue with. Refusals are
+ * worded for the person who has to fix the manifest.
+ *
+ * MUST MATCH resting_policy_for in client/backtest/datasets.py.
+ */
+export function restingPolicyFor({ manifest, venue }) {
+  const refuse = (refusal) => ({ allowed: false, refusal, cancelLatencyMs: 0 });
+  if (venue !== 'polymarket') {
+    return refuse('resting (gtc) orders need a trade stream to advance the queue; '
+      + `the ${venue} archive has order-book snapshots only, so only ioc orders run there`);
+  }
+  const datasets = manifest?.datasets ?? [];
+  const missing = ['book', 'trades'].filter((d) => !datasets.includes(d));
+  if (missing.length) {
+    return refuse(`resting (gtc) orders need the ${missing.map((d) => `"${d}"`).join(' and ')} `
+      + `dataset${missing.length > 1 ? 's' : ''} — add ${missing.length > 1 ? 'them' : 'it'} to datasets in the manifest`);
+  }
+  return {
+    allowed: true,
+    refusal: null,
+    cancelLatencyMs: manifest.cancel_latency ?? manifest.latency ?? 0,
+  };
+}
+
 /** The highest flat fee override a manifest may declare: 10% of notional. */
 export const MAX_FEE_BPS = 1000;
 

@@ -277,6 +277,8 @@ const TRADE_COLUMNS = [
 const FILL_COLUMNS = [
   'ts_ms', 'market_id', 'side', 'action', 'requested', 'filled', 'unfilled',
   'avg_px', 'worst_px', 'quoted_px', 'levels_walked', 'fee', 'realised', 'tag',
+  'liquidity', 'order_id', 'queue_ahead_at_join', 'queue_ahead_at_fill', 'time_in_queue_ms',
+  'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle',
 ];
 
 /** One CSV line in the format toCsv writes. */

@@ -188,6 +188,26 @@ class Ladder:
     def view(self, n: int = 10) -> list[list[float]]:
         return [[from_ticks(t), s] for t, s, _ts in self.levels[:n]]
 
+    def size_at_ticks(self, ticks: int) -> float:
+        """Visible size resting at exactly `ticks`, 0 when there is no such level."""
+        for t, s, _ts in self.levels:
+            if t == ticks:
+                return s
+        return 0
+
+    def depth_better_ticks(self, ticks: int) -> float:
+        """Visible size at prices STRICTLY better than `ticks`."""
+        total = 0
+        for t, s, _ts in self.levels:
+            if self._worse(t, ticks) >= 0:
+                break
+            total += s
+        return total
+
+    def pairs(self) -> list[list[float]]:
+        """Best-first [ticks, size] pairs — what the maker ledger diffs across a book event."""
+        return [[t, s] for t, s, _ts in self.levels]
+
     def take(self, size: float, bound: float | None):
         cap = None if bound is None else to_ticks(float(bound))
         fills: list[dict[str, float]] = []
@@ -447,7 +467,14 @@ class Portfolio:
                    both=len(open_legs) == 2)
 
     def execute(self, book: Book, order: dict, ts: int, market_id: str,
-                tag: str | None = None, how: str = "exit"):
+                tag: str | None = None, how: str = "exit", order_id: str | None = None):
+        eff = self.normalize(order, market_id)
+        if eff is None:
+            return None
+        return self.execute_effective(book, eff, ts, market_id, tag, how, order_id)
+
+    def normalize(self, order: dict, market_id: str):
+        """The one validator. MUST MATCH normalize in portfolio.mjs."""
         if not isinstance(order, dict) or order.get("side") not in SIDES:
             self.rejected += 1
             return None
@@ -518,49 +545,93 @@ class Portfolio:
         # notional-only order produced a row whose `requested` was NaN, which
         # the parser dropped. The fill happened; only its record vanished.
         # Mirrors portfolio.mjs.
-        order = {**order, "size": size, "limit": limit}
+        return {**order, "size": size, "limit": limit}
 
+    def execute_effective(self, book: Book, order: dict, ts: int, market_id: str,
+                          tag: str | None = None, how: str = "exit", order_id: str | None = None):
+        """Take liquidity for an order `normalize` already accepted."""
         res = match_order(book, order)
         if res["filled"] <= 0:
-            self.fills.append(self._fill_row(ts, market_id, order, res, tag, 0.0, 0.0))
+            self.fills.append(self._fill_row(ts, market_id, order, res, tag, 0.0, 0.0, order_id))
             return res
 
         fee = fee_for(self.fee_policy, self.market_fees.get(market_id), res)
+        realised = self._apply(market_id, order["side"], bool(order.get("reduce_only")),
+                               res["filled"], res["notional"], fee, ts, how)
+        self.fills.append(self._fill_row(ts, market_id, order, res, tag, realised, fee, order_id))
+        return res
+
+    def maker_fill(self, market_id: str, side: str, reduce: bool, size: float, px: float, ts: int,
+                   tag=None, order_id=None, extra=None) -> dict:
+        """One maker fill of a resting order. MUST MATCH makerFill in portfolio.mjs."""
+        notional = px * size
+        policy = self.fee_policy
+        if isinstance(policy, dict) and policy.get("mode") == "bps":
+            bps = policy.get("bps")
+            ok = isinstance(bps, (int, float)) and not isinstance(bps, bool) and math.isfinite(bps)
+            fee = (notional * (bps if ok else 0)) / 10_000
+        else:
+            fee = 0
+        realised = self._apply(market_id, side, reduce, size, notional, fee, ts, "exit")
+        row = {
+            "ts_ms": ts,
+            "market_id": market_id,
+            "side": side,
+            "action": "reduce" if reduce else "open",
+            "requested": size,
+            "filled": size,
+            "unfilled": 0,
+            "avg_px": px,
+            "worst_px": px,
+            "quoted_px": px,
+            "levels_walked": 0,
+            "fee": fee,
+            "realised": realised,
+            "tag": tag,
+            "liquidity": "maker",
+            "order_id": order_id,
+        }
+        if extra:
+            row.update(extra)
+        self.fills.append(row)
+        return row
+
+    def _apply(self, market_id, side, reduce, filled, notional, fee, ts, how):
+        """Book a filled quantity against the leg; the realised PnL of the fill."""
+        leg = self._legs(market_id)[side]
         self.fees_paid += fee
         realised = 0.0
 
-        if order.get("reduce_only"):
+        if reduce:
             basis = leg.avg_entry or 0.0
-            realised = res["notional"] - basis * res["filled"] - fee
-            leg.size -= res["filled"]
-            leg.cost -= basis * res["filled"]
+            realised = notional - basis * filled - fee
+            leg.size -= filled
+            leg.cost -= basis * filled
             if leg.size <= EPS:
                 leg.size = 0.0
                 leg.cost = 0.0
             leg.realised += realised
             leg.fees += fee
-            leg.exit_size += res["filled"]
-            leg.exit_notional += res["notional"]
-            self.cash += res["notional"] - fee
+            leg.exit_size += filled
+            leg.exit_notional += notional
+            self.cash += notional - fee
             if leg.size == 0.0:
                 self._close_trade(market_id, leg, ts, how)
         else:
             if leg.size <= EPS and leg.entry_ts is None:
                 leg.entry_ts = ts
-            leg.size += res["filled"]
-            leg.cost += res["notional"]
-            leg.entry_size += res["filled"]
-            leg.entry_notional += res["notional"]
+            leg.size += filled
+            leg.cost += notional
+            leg.entry_size += filled
+            leg.entry_notional += notional
             leg.fees += fee
             # The ENTRY fee belongs in the round trip's realised PnL — see the
             # matching comment in portfolio.mjs. Both engines or neither.
             leg.realised -= fee
-            self.cash -= res["notional"] + fee
+            self.cash -= notional + fee
+        return realised
 
-        self.fills.append(self._fill_row(ts, market_id, order, res, tag, realised, fee))
-        return res
-
-    def _fill_row(self, ts, market_id, order, res, tag, realised, fee) -> dict:
+    def _fill_row(self, ts, market_id, order, res, tag, realised, fee, order_id=None) -> dict:
         return {
             "ts_ms": ts,
             "market_id": market_id,
@@ -576,6 +647,8 @@ class Portfolio:
             "fee": fee,
             "realised": realised,
             "tag": tag if tag is not None else order.get("tag"),
+            "liquidity": "taker",
+            "order_id": order_id,
         }
 
     def _close_trade(self, market_id, leg: Leg, ts, how, **extra) -> None:

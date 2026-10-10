@@ -18,7 +18,8 @@ import os
 import time
 from typing import Any, Callable
 
-from otengine import Book, BudgetMonitor, Portfolio, Rec, RunAbort, make_rng
+from otengine import Book, BudgetMonitor, Portfolio, Rec, RunAbort, contract_value, make_rng
+from otmaker import MAX_RESTING, MakerBook
 
 
 def write_all(fd, data, write=os.write):
@@ -182,6 +183,8 @@ class Ctx:
             "crosschecks": [],
             "log_truncated": False,
             "market": None,
+            # Set by MarketReplay: {orders(), cancel(id)}; None outside a replay.
+            "resting": None,
         }
 
     @property
@@ -247,6 +250,18 @@ class Ctx:
 
     def random(self, seed: int | None = None):
         return _INTERNALS[id(self)]["rng"](seed)
+
+    def orders(self) -> list:
+        """This market's resting orders that are not final yet: copies, and no
+        queue position. Mirrors ctx.orders() in replay.mjs."""
+        r = _INTERNALS[id(self)]["resting"]
+        return [Rec(v) for v in r["orders"]()] if r else []
+
+    def cancel(self, order_id) -> bool:
+        """Cancel a resting order by engine id or client_id, after the cancel
+        latency. False when there is no such order. Mirrors replay.mjs."""
+        r = _INTERNALS[id(self)]["resting"]
+        return r["cancel"](order_id) if r else False
 
     def ref(self, name: str):
         feed = _INTERNALS[id(self)]["refs"].get(name)
@@ -339,7 +354,7 @@ class MarketReplay:
                  portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
                  log_budget: dict | None = None, budget: BudgetMonitor | None = None,
                  references=None, series=None, seed: int = 1,
-                 fee_bps: float = 0) -> None:
+                 fee_bps: float = 0, resting: dict | None = None) -> None:
         self.market_id = market["market_id"]
         self.market = market
         # Attribute access for everything a hook is handed: the docs say
@@ -365,6 +380,13 @@ class MarketReplay:
         # The engine's own copy of the market, for assert_outcome.
         self.state["market"] = dict(market)
         self.state["view"] = BookView(self.book)
+        self.state["resting"] = {"orders": self._orders_view, "cancel": self._request_cancel}
+        # Resting-order policy; see the matching comment in replay.mjs.
+        self.resting = resting
+        cl = (resting or {}).get("cancelLatencyMs")
+        self.cancel_latency_ms = cl if isinstance(cl, (int, float)) and not isinstance(cl, bool) \
+            and cl == cl and cl not in (float("inf"), float("-inf")) else fill_delay_ms
+        self.maker = MakerBook(self.market_id, self.pf) if (resting or {}).get("allowed") else None
         self.pending: list[dict] = []
         # A market with no declared close has no cutoff; the last event seen
         # becomes the close, tracked as we go rather than peeked.
@@ -390,8 +412,26 @@ class MarketReplay:
                 hold = order.get("hold_s") if isinstance(order, dict) else None
                 if res and res["filled"] > 0 and hold and not order.get("reduce_only"):
                     self._schedule(job["at"] + int(hold) * 1000, "flatten", {"side": order.get("side")})
+            elif job["kind"] == "activate":
+                self.maker.activate(job["payload"], job["at"], self.book)
+            elif job["kind"] == "cancel":
+                self.maker.cancel(job["payload"], job["at"])
             else:
                 self.pf.flatten(self.market_id, self.book, job["at"], "hold_expired")
+
+    def _orders_view(self) -> list:
+        return self.maker.views() if self.maker else []
+
+    def _request_cancel(self, order_id) -> bool:
+        if self.maker is None:
+            return False
+        # Resolved NOW, to the record -- see replay.mjs.
+        rec = self.maker.find(order_id)
+        if rec is None:
+            self.maker.cancel(None, self.state["now"])
+            return False
+        self._schedule(self.state["now"] + self.cancel_latency_ms, "cancel", rec)
+        return True
 
     def _call(self, canonical: str, *args):
         name = self.hooks.get(canonical)
@@ -415,17 +455,30 @@ class MarketReplay:
         for order in orders:
             if order is None:
                 continue
-            row = _as_order(order)
-            # Mirrors replay.mjs: refused rather than silently executed as a
-            # one-shot IOC.
-            tif = row.get("tif") or "ioc"
+            # A COPY taken at decision time -- see replay.mjs.
+            row = dict(_as_order(order))
+            tif = row.get("tif")
+            if tif is None:
+                tif = "ioc"
+            if tif == "gtc":
+                self._submit_resting(row, ts)
+                continue
             if tif != "ioc":
-                raise RunAbort(
-                    "E_MANIFEST",
-                    f'tif {tif!r} is not supported — only "ioc". Resting orders need a '
-                    "queue-position model, and guessing at one inflates returns by multiples.",
-                )
+                raise RunAbort("E_MANIFEST", f'tif {_js_json(tif)} is not supported — "ioc" or "gtc".')
             self._schedule(ts + self.fill_delay_ms, "order", row)
+
+    def _submit_resting(self, order: dict, ts: int) -> None:
+        if self.maker is None:
+            refusal = (self.resting or {}).get("refusal")
+            raise RunAbort("E_MANIFEST", refusal if isinstance(refusal, str)
+                           else "resting (gtc) orders are not available for this run")
+        if order.get("hold_s") is not None:
+            raise RunAbort("E_MANIFEST", "hold_s is not supported on gtc orders; exit with a reduce_only order")
+        if self.maker.open_count() >= MAX_RESTING:
+            raise RunAbort("E_RUNTIME", f"more than {MAX_RESTING} open resting orders in market {self.market_id}")
+        rec = self.maker.submit(order, ts)
+        if rec is not None:
+            self._schedule(ts + self.fill_delay_ms, "activate", rec)
 
     def _check_budget(self) -> None:
         if self.monitor.breached:
@@ -451,6 +504,10 @@ class MarketReplay:
         # book as it stood then.
         self.drain_until(ts - 1)
         state["now"] = ts
+        maker = self.maker
+        if maker is not None:
+            maker.finalize(ts)
+            maker.resolve_markouts(ts, self.book)
 
         if ev.get("kind") == "book":
             # BEFORE the snapshot test, because a bound carries snapshot:false
@@ -458,12 +515,19 @@ class MarketReplay:
             # and no size -- which Book.delta rejects by raising, taking the
             # whole run with it. MUST MATCH the same ordering in
             # runner/engine/replay.mjs.
-            if ev.get("bbo"):
-                self.book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"))
-            elif ev.get("snapshot"):
-                self.book.snapshot(ts, ev.get("levels") or {})
+            def apply():
+                if ev.get("bbo"):
+                    self.book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"))
+                elif ev.get("snapshot"):
+                    self.book.snapshot(ts, ev.get("levels") or {})
+                else:
+                    self.book.delta(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
+            if maker is not None:
+                maker.book_event(ev, self.book, apply)
             else:
-                self.book.delta(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
+                apply()
+        elif ev.get("kind") == "trade" and maker is not None:
+            maker.trade(ev, self.book)
         self.drain_until(ts)
 
         ev_rec = Rec(ev)
@@ -489,11 +553,16 @@ class MarketReplay:
         settle_ts = self.declared_close if self.declared_close else self.last_ts
         state["now"] = settle_ts
         self.drain_until(settle_ts)
+        if self.maker is not None:
+            self.maker.close(settle_ts, self.book)
         self.pending.clear()
 
         market = self.market
         self._call("on_settle", self._settle_rec, market.get("outcome"))
-        settled = self.pf.settle(self.market_id, market["outcome"], settle_ts) if market.get("outcome") else []
+        outcome = market.get("outcome")
+        settled = self.pf.settle(self.market_id, market["outcome"], settle_ts) if outcome else []
+        if self.maker is not None:
+            self.maker.release_rows((lambda side: contract_value(side, outcome)) if outcome else None)
 
         view = state.pop("view", None)
         if view is not None:
@@ -510,6 +579,7 @@ class MarketReplay:
             "log_truncated": state["log_truncated"],
             "crosschecks": state["crosschecks"],
             "budget": self.monitor.summary(),
+            "maker": self.maker.stats if self.maker is not None else None,
         }
 
 
@@ -517,7 +587,7 @@ def replay_market(*, market: dict, events, strategy, hooks: dict,
                   portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
                   log_budget: dict | None = None, budget: BudgetMonitor | None = None,
                   references=None, series=None, seed: int = 1,
-                  fee_bps: float = 0) -> dict:
+                  fee_bps: float = 0, resting: dict | None = None) -> dict:
     """Replay one market start to finish.
 
     `events` is any ITERABLE, not necessarily a list -- the harness passes a
@@ -526,7 +596,8 @@ def replay_market(*, market: dict, events, strategy, hooks: dict,
     """
     r = MarketReplay(market=market, strategy=strategy, hooks=hooks, portfolio=portfolio,
                      fill_delay_ms=fill_delay_ms, log_budget=log_budget, budget=budget,
-                     references=references, series=series, seed=seed, fee_bps=fee_bps)
+                     references=references, series=series, seed=seed, fee_bps=fee_bps,
+                     resting=resting)
     r.open()
     for ev in events:
         if not r.step(ev):
@@ -546,4 +617,15 @@ def _as_order(order) -> dict:
         "reduce_only": getattr(order, "reduce_only", False),
         "tif": getattr(order, "tif", "ioc"),
         "tag": getattr(order, "tag", None),
+        "post_only": getattr(order, "post_only", False),
+        "client_id": getattr(order, "client_id", None),
     }
+
+
+def _js_json(v) -> str:
+    """JSON.stringify for the error message, so both engines word it alike."""
+    import json
+    try:
+        return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(v)

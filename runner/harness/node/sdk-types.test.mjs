@@ -89,7 +89,23 @@ const MUST_NOT_COMPILE = [
   `],
   ['a time-in-force the engine does not model', `
     import { Order } from './sdk/index.js';
+    export const o = new Order({ side: 'UP', size: 1, limit: 0.4, tif: 'fok' });
+  `],
+  ['a resting order with no price to rest at', `
+    import { Order } from './sdk/index.js';
     export const o = new Order({ side: 'UP', size: 1, tif: 'gtc' });
+  `],
+  ['a hold timer on a resting order', `
+    import { Order } from './sdk/index.js';
+    export const o = new Order({ side: 'UP', size: 1, limit: 0.4, tif: 'gtc', hold_s: 5 });
+  `],
+  ['a resting-only field on an ioc order', `
+    import { Order } from './sdk/index.js';
+    export const o = new Order({ side: 'UP', size: 1, limit: 0.4, postOnly: true });
+  `],
+  ['reading a queue position the venue never reports', `
+    import type { Ctx } from './sdk/index.js';
+    export function f(ctx: Ctx): number { return ctx.orders()[0].ahead; }
   `],
   ['reading the outcome from a market before settlement', `
     import type { Market } from './sdk/index.js';

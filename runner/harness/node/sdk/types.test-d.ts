@@ -9,6 +9,7 @@
 // can drift from index.mjs. This file plus the export-parity check in
 // sdk-types.test.mjs is what stops that drift being silent.
 
+import type { RestingOrder } from './index.js';
 import { Strategy, Order, SIDES } from './index.js';
 import type {
   Ctx, Tick, Market, BookView, Side, Level, Position, Outcome, BookEvent, TradeEvent, Ladders,
@@ -93,4 +94,20 @@ export function exit(ctx: Ctx<Params>): Order | null {
   const pos = ctx.position();
   if (pos.side === null || pos.size === 0) return null;
   return new Order({ side: pos.side, size: pos.size, reduce_only: true });
+}
+
+// Resting orders: a gtc order rests at its limit; ctx.orders() lists what is
+// still working, ctx.cancel() takes an engine id or the clientId.
+export function quote(ctx: Ctx<Params>): Order[] {
+  const open: RestingOrder[] = ctx.orders();
+  for (const o of open) {
+    const state: 'pending' | 'live' | 'cancel_pending' = o.state;
+    if (state === 'live') ctx.cancel(o.client_id ?? o.id);
+  }
+  const bid = ctx.book().bestBid('UP');
+  if (bid === null) return [];
+  return [
+    new Order({ side: 'UP', size: 10, limit: bid, tif: 'gtc', postOnly: true, clientId: 'bid-1' }),
+    new Order({ side: 'DOWN', size: 10, limit: 0.4, tif: 'gtc', reduce_only: true }),
+  ];
 }

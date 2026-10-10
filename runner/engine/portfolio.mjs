@@ -201,7 +201,19 @@ export class Portfolio {
    *
    * Returns the match result, or null when the order was not executable at all.
    */
-  execute({ book, order, ts, marketId, tag = null, how = 'exit' }) {
+  execute({ book, order, ts, marketId, tag = null, how = 'exit', orderId = null }) {
+    const eff = this.normalize(order, marketId);
+    if (!eff) return null;
+    return this.executeEffective({ book, eff, ts, marketId, tag, how, orderId });
+  }
+
+  /**
+   * The one validator: an order a hook returned, as the effective order the
+   * engine will act on, or null — counted in `rejected` — when it is unusable.
+   * Resting (gtc) orders go through this too, so a shape that is refused as an
+   * IOC is refused as a resting order. MUST MATCH normalize in otengine.py.
+   */
+  normalize(order, marketId) {
     if (!isSide(order?.side)) { this.rejected += 1; return null; }
 
     const leg = this.#legs(marketId)[order.side];
@@ -286,35 +298,88 @@ export class Portfolio {
     // as NaN for a notional-only order — the fill was executed (the fee was
     // identical) but the ROW was rejected by the parser and never emitted, so
     // the run silently lost its fill log. otengine.py does the same.
-    const eff = { ...order, size, limit };
+    return { ...order, size, limit };
+  }
+
+  /** Take liquidity for an order `normalize` already accepted. */
+  executeEffective({ book, eff, ts, marketId, tag = null, how = 'exit', orderId = null }) {
     const res = matchOrder(book, eff);
     if (res.filled <= 0) {
-      this.fills.push(this.#fillRow({ ts, marketId, order: eff, res, tag, realised: 0, fee: 0 }));
+      this.fills.push(this.#fillRow({ ts, marketId, order: eff, res, tag, realised: 0, fee: 0, orderId }));
       return res;
     }
 
     const fee = feeFor(this.feePolicy, this.marketFees.get(marketId) ?? null, res);
+    const realised = this.#apply(marketId, eff.side, Boolean(eff.reduce_only), res.filled, res.notional, fee, ts, how);
+    this.fills.push(this.#fillRow({ ts, marketId, order: eff, res, tag, realised, fee, orderId }));
+    return res;
+  }
+
+  /**
+   * One maker fill of a resting order: `size` contracts at the order's own
+   * limit `px`. The caller has already clamped a reduce-only fill to the open
+   * leg. Returns the fill row so the engine can attach queue and markout fields.
+   *
+   * The fee: nothing under venue fees — Polymarket charges the maker nothing,
+   * and its maker rebate is paid from a pool, not per fill, so it is not
+   * modelled. Under the flat `bps` override the rate applies to maker notional
+   * too: it is a flat rate on notional by definition.
+   * MUST MATCH maker_fill in otengine.py.
+   */
+  makerFill({ marketId, side, reduce, size, px, ts, tag = null, orderId = null, extra = null }) {
+    const notional = px * size;
+    const policy = this.feePolicy;
+    const fee = policy?.mode === 'bps'
+      ? (notional * (typeof policy.bps === 'number' && Number.isFinite(policy.bps) ? policy.bps : 0)) / 10_000
+      : 0;
+    const realised = this.#apply(marketId, side, reduce, size, notional, fee, ts, 'exit');
+    const row = {
+      ts_ms: ts,
+      market_id: marketId,
+      side,
+      action: reduce ? 'reduce' : 'open',
+      requested: size,
+      filled: size,
+      unfilled: 0,
+      avg_px: px,
+      worst_px: px,
+      quoted_px: px,
+      levels_walked: 0,
+      fee,
+      realised,
+      tag,
+      liquidity: 'maker',
+      order_id: orderId,
+      ...(extra ?? {}),
+    };
+    this.fills.push(row);
+    return row;
+  }
+
+  /** Book a filled quantity against the leg. Returns the realised PnL of the fill. */
+  #apply(marketId, side, reduce, filled, notional, fee, ts, how) {
+    const leg = this.#legs(marketId)[side];
     this.feesPaid += fee;
     let realised = 0;
 
-    if (order.reduce_only) {
+    if (reduce) {
       const basis = leg.avgEntry ?? 0;
-      realised = res.notional - basis * res.filled - fee;
-      leg.size -= res.filled;
-      leg.cost -= basis * res.filled;
+      realised = notional - basis * filled - fee;
+      leg.size -= filled;
+      leg.cost -= basis * filled;
       if (leg.size <= EPS) { leg.size = 0; leg.cost = 0; }
       leg.realised += realised;
       leg.fees += fee;
-      leg.exitSize += res.filled;
-      leg.exitNotional += res.notional;
-      this.cash += res.notional - fee;
+      leg.exitSize += filled;
+      leg.exitNotional += notional;
+      this.cash += notional - fee;
       if (leg.size === 0) this.#closeTrade(marketId, leg, ts, how);
     } else {
       if (leg.size <= EPS && leg.entryTs == null) leg.entryTs = ts;
-      leg.size += res.filled;
-      leg.cost += res.notional;
-      leg.entrySize += res.filled;
-      leg.entryNotional += res.notional;
+      leg.size += filled;
+      leg.cost += notional;
+      leg.entrySize += filled;
+      leg.entryNotional += notional;
       leg.fees += fee;
       // The ENTRY fee is part of what this round trip cost, so it belongs in
       // the trade's realised PnL. Without this line trade.pnl carried only the
@@ -322,14 +387,12 @@ export class Portfolio {
       // understated costs by every entry fee in the run — a wrong number, on
       // the first panel a paying customer looks at.
       leg.realised -= fee;
-      this.cash -= res.notional + fee;
+      this.cash -= notional + fee;
     }
-
-    this.fills.push(this.#fillRow({ ts, marketId, order: eff, res, tag, realised, fee }));
-    return res;
+    return realised;
   }
 
-  #fillRow({ ts, marketId, order, res, tag, realised, fee }) {
+  #fillRow({ ts, marketId, order, res, tag, realised, fee, orderId = null }) {
     return {
       ts_ms: ts,
       market_id: marketId,
@@ -347,6 +410,8 @@ export class Portfolio {
       fee,
       realised,
       tag: tag ?? order.tag ?? null,
+      liquidity: 'taker',
+      order_id: orderId,
     };
   }
 

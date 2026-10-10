@@ -159,6 +159,25 @@ class Ladder {
 
   view(n = 10) { return this.levels.slice(0, n).map((l) => [fromTicks(l.ticks), l.size]); }
 
+  /** Visible size resting at exactly `ticks`, 0 when there is no such level. */
+  sizeAtTicks(ticks) {
+    for (const l of this.levels) if (l.ticks === ticks) return l.size;
+    return 0;
+  }
+
+  /** Visible size at prices STRICTLY better than `ticks`. */
+  depthBetterTicks(ticks) {
+    let total = 0;
+    for (const l of this.levels) {
+      if (this.#order(l.ticks, ticks) >= 0) break;
+      total += l.size;
+    }
+    return total;
+  }
+
+  /** Best-first [ticks, size] pairs — what the maker ledger diffs across a book event. */
+  pairs() { return this.levels.map((l) => [l.ticks, l.size]); }
+
   /** Consume up to `size` from the best end, respecting `bound`. */
   take(size, bound) {
     const cap = bound == null ? null : toTicks(bound);

@@ -794,24 +794,30 @@ test('nothing after the close reaches a hook, the book, or the history', () => {
 });
 
 test('an unsupported time-in-force is refused, not silently downgraded', () => {
-  // gtc was advertised in the SDK reference and executed as a single IOC
-  // attempt: if the book did not fill at that instant the order vanished,
-  // though the documented semantics say it rests until the close. That is a
-  // wrong fill, slippage and PnL number for an order type we told customers we
-  // supported. Refused instead — the same call the docs already make about
-  // resting orders.
+  // gtc was once advertised and executed as a single IOC attempt — a wrong
+  // fill, slippage and PnL number for an order type we told customers we
+  // supported. Anything that is not ioc or gtc is still refused outright.
   assert.throws(() => replayMarket({
     market: MARKET,
     events: [snap(1000), tick(1001, 1)],
-    strategy: { on_tick() { return { side: 'UP', size: 100, limit: 1, tif: 'gtc' }; } },
+    strategy: { on_tick() { return { side: 'UP', size: 100, limit: 1, tif: 'fok' }; } },
     hooks: { on_tick: 'on_tick' },
   }), (err) => {
     // E_MANIFEST, not E_RUNTIME: it is a contract violation, and it is raised
     // from the order path rather than from inside the hook.
     assert.equal(err.code, 'E_MANIFEST');
-    assert.match(err.detail, /tif "gtc" is not supported/);
+    assert.match(err.detail, /tif "fok" is not supported/);
     return true;
   });
+
+  // gtc without a resting-order policy (no trades declared, or Predict) is
+  // refused with the policy's reason — never executed as an IOC.
+  assert.throws(() => replayMarket({
+    market: MARKET,
+    events: [snap(1000), tick(1001, 1)],
+    strategy: { on_tick() { return { side: 'UP', size: 100, limit: 0.4, tif: 'gtc' }; } },
+    hooks: { on_tick: 'on_tick' },
+  }), (err) => err.code === 'E_MANIFEST' && /resting/.test(err.detail));
 
   // The default and the explicit ioc both still work.
   assert.doesNotThrow(() => replayMarket({

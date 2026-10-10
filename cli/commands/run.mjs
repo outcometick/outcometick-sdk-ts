@@ -25,9 +25,10 @@ import {
   sortMarketsForReplay,
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
-import { buildReport, fillStats, feeModelReport } from '../../runner/engine/report.mjs';
+import { buildReport, fillStats, feeModelReport, makerReport } from '../../runner/engine/report.mjs';
+import { QUEUE_MODEL, PRINT_LAG_MS } from '../../runner/engine/maker.mjs';
 import { sessionLines } from '../../runner/session-feed.mjs';
-import { feePolicyFor } from '../../api/lib/backtest-datasets.mjs';
+import { feePolicyFor, restingPolicyFor } from '../../api/lib/backtest-datasets.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
 import { createLineWriter } from '../../runner/stdin-writer.mjs';
 import { readEventLines } from '../../runner/spool-day.mjs';
@@ -339,6 +340,8 @@ export async function cmdRun({ dir, flags }) {
         // The venue's own schedule, market by market, unless the manifest or
         // --fee-bps says otherwise — the same rule the worker applies.
         fees: feePolicy,
+        // Same rule as the worker: Polymarket with book + trades declared.
+        resting: restingPolicyFor({ manifest, venue }),
         limits: LIMITS,
       };
       if (languageId === 'python') {
@@ -428,6 +431,7 @@ export async function cmdRun({ dir, flags }) {
         stream: m.stream,
       }]));
 
+      const fillSummary = fillStats(base.fills);
       const report = buildReport({
         runId: `local_${days[0]}`,
         submittedAt: 0,
@@ -453,7 +457,10 @@ export async function cmdRun({ dir, flags }) {
           events: base.result.eventsSeen,
         },
         trades: base.trades,
-        fillStats: fillStats(base.fills),
+        fillStats: fillSummary,
+        maker: makerReport({
+          stats: base.result.maker, fills: fillSummary.makerFills, queueModel: QUEUE_MODEL, printLagMs: PRINT_LAG_MS,
+        }),
         marketSummaries: [...marketMeta.values()],
         marketMeta,
         feesPaid: base.result.feesPaid,

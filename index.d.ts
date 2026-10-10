@@ -174,6 +174,20 @@ export interface Ctx<P = Record<string, unknown>> {
   /** The only randomness available, seeded and recorded in the report. */
   random(seed?: number | null): number;
 
+  /**
+   * This market's resting (gtc) orders that are not final yet, as copies.
+   * No queue position: a venue does not tell you that, so neither do we.
+   */
+  orders(): RestingOrder[];
+
+  /**
+   * Cancel a resting order by engine id (`"o3"`, from `orders()`) or by the
+   * `clientId` you gave it. Takes effect after the run's cancel latency, and
+   * the order stays exposed to fills for the print-lag window after that.
+   * False when there is no such order.
+   */
+  cancel(id: string): boolean;
+
   /** A reference feed declared in the manifest. Throws if undeclared. */
   ref(name: string): FeedView;
 
@@ -235,10 +249,52 @@ export type OrderInit = OrderSizing & {
   hold_s?: number | null;
   reduceOnly?: boolean;
   reduce_only?: boolean;
-  /** Only 'ioc' is modelled; anything else is rejected at construction. */
-  tif?: 'ioc';
   tag?: string | null;
-};
+} & (
+  | {
+    /** Take what is resting now; anything unfilled is dropped. The default. */
+    tif?: 'ioc';
+    postOnly?: never;
+    post_only?: never;
+    clientId?: never;
+    client_id?: never;
+  }
+  | {
+    /**
+     * Rest at `limit` until filled, cancelled or the market closes, behind
+     * the queue already at that price (Polymarket only; the manifest must
+     * declare the "book" and "trades" datasets). The part that is marketable
+     * on arrival takes liquidity first.
+     */
+    tif: 'gtc';
+    /** The price the order rests at, on the 0.001 grid. Required. */
+    limit: number;
+    /** Refuse the order rather than take liquidity if it is marketable on arrival. */
+    postOnly?: boolean;
+    post_only?: boolean;
+    /** Your handle for ctx.cancel(): 1-64 of A-Z a-z 0-9 _ . : -, not o<digits>. */
+    clientId?: string | null;
+    client_id?: string | null;
+    holdS?: never;
+    hold_s?: never;
+  }
+);
+
+/** A resting order as ctx.orders() reports it. */
+export interface RestingOrder {
+  /** Engine id, `o1`, `o2`, … per market. */
+  readonly id: string;
+  readonly client_id: string | null;
+  readonly side: Side;
+  readonly action: 'open' | 'reduce';
+  readonly limit: number | null;
+  /** Null until the order reaches the venue (state `pending`). */
+  readonly size: number | null;
+  readonly remaining: number | null;
+  /** `cancel_pending`: cancelled, but still exposed for the print-lag window. */
+  readonly state: 'pending' | 'live' | 'cancel_pending';
+  readonly placed_ms: number;
+}
 
 /**
  * An order a hook returns.
@@ -253,8 +309,11 @@ export declare class Order {
   readonly limit: number | null;
   readonly hold_s: number | null;
   readonly reduce_only: boolean;
-  readonly tif: 'ioc';
+  readonly tif: 'ioc' | 'gtc';
   readonly tag: string | null;
+  /** Present on gtc orders only. */
+  readonly post_only?: boolean;
+  readonly client_id?: string | null;
 }
 
 /**

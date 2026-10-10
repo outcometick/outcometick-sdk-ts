@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "language": "python@3.14",
+  "entry": "strategy.py:SpreadQuote",
+  "hooks": ["on_market_open", "on_book"],
+  "datasets": ["settlement", "book", "trades"],
+  "intervals": ["5m"],
+  "latency": 150,
+  "cancel_latency": 100,
+  "params": {
+    "size": 20,
+    "max_inventory": 100,
+    "min_spread": 0.01,
+    "px_min": 0.10,
+    "px_max": 0.90,
+    "requote_ms": 1000,
+    "stop_quoting_s": 30
+  }
+}

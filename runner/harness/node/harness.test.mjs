@@ -522,7 +522,8 @@ test('a strategy cannot tamper with the output serializer', async () => {
     strategy: `export class S {
       onMarketOpen() {
         JSON.stringify = () => JSON.stringify({ market_id: "0xfake", side: "UP", size: 1, pnl: 999999 });
-        Object.prototype.toJSON = function () { return { market_id: "0xfake", side: "UP", size: 1, pnl: 999999 }; };
+        // (Object.prototype.toJSON used to be tried here as well. Object.prototype
+        // is now frozen before the strategy loads — see the test below.)
       }
       onTick(ctx) {
         if (this.done) return null;
@@ -628,10 +629,43 @@ test('result.json cannot be forged through prototype pollution', async () => {
       onTick() { return null; }
     }`,
   });
+  // Object.prototype is now frozen before the strategy loads, so the attempt
+  // itself is refused — the run stops with the error, nothing is forged.
+  assert.equal(r.code, EXIT.rejected, r.stderr);
+  assert.equal(r.result.rejection.code, 'E_RUNTIME');
+  assert.match(r.result.rejection.detail, /not extensible|read.only|Cannot (add|assign)/i);
+  assert.equal(r.result.marketsRun, 0, 'the real count, not the forged one');
+});
+
+test('an inherited setter on Object.prototype cannot capture engine objects', async () => {
+  // `this.x = …` in an engine constructor would run a setter inherited from
+  // Object.prototype and hand over the instance (MakerBook, Portfolio,
+  // MarketReplay). The analyser only checks direct Object.xxx calls, so an alias
+  // gets defineProperty — the lock is what stops it.
+  for (const where of ['top', 'hook']) {
+    const attack = `const O = Object; O.defineProperty(O.prototype, "pf", { configurable: true, set(v) { globalThis.stolen = this; } });`;
+    const r = await runHarness({
+      strategy: `${where === 'top' ? attack : ''}
+export class S { onMarketOpen() { ${where === 'hook' ? attack : ''} } onTick() { return null; } }`,
+    });
+    assert.equal(r.code, EXIT.rejected, `${where}: ${r.stderr}`);
+  }
+});
+
+test('ordinary code that sets its own toString still works under the lock', async () => {
+  // decimal.js does exactly this on a plain object; freezing Object.prototype
+  // naively would make it throw (the override mistake).
+  const r = await runHarness({
+    strategy: `const P = {}; P.toString = function () { return "p"; }; P.valueOf = () => 7;
+function F() {} F.prototype.toString = function () { return "f"; };
+class E extends Error {} E.prototype.name = "E";
+export class S {
+  onMarketOpen(ctx) { ctx.log(String(P) + (P + 0) + String(new F()) + new E("x").name); }
+  onTick() { return null; }
+}`,
+  });
   assert.equal(r.code, EXIT.ok, r.stderr);
-  assert.equal(r.result.marketsRun, 1, 'the real count, not the forged one');
-  assert.equal(r.result.feesPaid, 0);
-  assert.ok(r.result.budget, 'the budget summary must survive');
+  assert.match(r.logs, /p7fE/);
 });
 
 // ---------------------------------------------------------------------------
@@ -657,8 +691,6 @@ test('a strategy cannot steal the market before its first hook', async () => {
 const stolen = [];
 const realParse = JSON.parse;
 JSON.parse = function (s) { const v = realParse(s); if (v && v.kind === "tick") stolen.push(v.value); return v; };
-const realPush = Array.prototype.push;
-Array.prototype.push = function (...a) { for (const x of a) if (x && x.kind === "tick") stolen.push(x.value); return realPush.apply(this, a); };
 
 export class S {
   onMarketOpen() { this.first = true; }
@@ -672,6 +704,45 @@ export class S {
   const stolen = Number(/stolen=(\d+)/.exec(r.logs)?.[1]);
   // At most the current row. Before the fix this was all 50.
   assert.ok(stolen <= 1, `a strategy saw ${stolen} ticks before its first hook fired`);
+});
+
+test('a strategy cannot patch the built-ins the engine keeps its state in', async () => {
+  // Array.prototype.push = … passes static analysis. With it, every engine
+  // method that pushed, filtered or iterated handed over an internal array —
+  // fill rows, book levels, resting-order records — to be rewritten. The
+  // harness freezes those prototypes before the strategy loads.
+  const events = Array.from({ length: 5 }, (_, i) => tick(1000 + i, 100 + i));
+  const atLoad = await runHarness({
+    events,
+    strategy: `
+Array.prototype.push = function () { return 0; };
+export class S { onMarketOpen() {} onTick() { return null; } }`,
+  });
+  assert.equal(atLoad.code, EXIT.rejected, atLoad.stderr);
+  assert.match(atLoad.result.rejection.detail, /read.only|Cannot assign|not extensible/i);
+
+  for (const patch of ['Array.prototype.filter = (f) => []', 'Map.prototype.get = () => null',
+    'Object.keys = () => []', 'Array.prototype[Symbol.iterator] = function* () {}',
+    'WeakSet.prototype.add = function () { return this; }',
+    'Object.getPrototypeOf(function* () {}).prototype.next = () => ({ done: true })',
+    'Function.prototype.call = () => null',
+    // The stdin reader splits 64 KiB chunks: a replaced split saw rows not yet
+    // replayed, and could rewrite them.
+    'String.prototype.split = function () { return []; }',
+    'Buffer.prototype.toString = function () { return ""; }',
+    // Engine code resolves these globals by name at call time.
+    'globalThis.Math = { min: () => 1e9, max: () => 1e9 }',
+    'Math.min = () => 1e9']) {
+    const inHook = await runHarness({
+      events,
+      strategy: `export class S {
+        onMarketOpen() {}
+        onTick() { ${patch}; return null; }
+      }`,
+    });
+    assert.equal(inHook.code, EXIT.rejected, `${patch}: ${inHook.stderr}`);
+    assert.equal(inHook.result.rejection.code, 'E_RUNTIME', patch);
+  }
 });
 
 

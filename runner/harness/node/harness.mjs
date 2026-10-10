@@ -20,6 +20,7 @@ import { MarketReplay, makeLogBudget, BudgetMonitor, RunAbort } from '../../engi
 import { Book as BookCls } from '../../engine/book.mjs';
 import { buildFeeds } from '../../engine/feed.mjs';
 import { Portfolio } from '../../engine/portfolio.mjs';
+import { rowPending, newMakerStats, addMakerStats } from '../../engine/maker.mjs';
 import { CHANNEL, RESULT_FD, EXIT } from '../protocol.mjs';
 
 /**
@@ -64,6 +65,95 @@ globalThis.console = Object.freeze(Object.fromEntries(
   ].map((m) => [m, consoleIsGone]),
 ));
 
+
+/**
+ * The built-ins, locked before any strategy is imported.
+ *
+ * The strategy shares this realm with the engine, and static analysis is not a
+ * wall (`const O = Object; O.defineProperty(…)` passes it). Three ways in,
+ * each verified, each closed here:
+ *
+ *  - Replacing a method the engine calls on its own state — Array.prototype
+ *    push/filter/slice/iterator, Map.prototype.get, WeakSet.prototype.add, the
+ *    Object statics: the replacement receives the engine's internal array,
+ *    map or row as `this` or an argument, and can rewrite it (fabricate
+ *    liquidity, jump a queue, edit fills).
+ *  - A SETTER on Object.prototype: every engine constructor's `this.x = …` on
+ *    a fresh instance runs an inherited setter, handing the strategy the whole
+ *    MakerBook, Portfolio or MarketReplay.
+ *  - Replacing the generator prototype's `next`: the replay loop pulls events
+ *    from a generator, so a strategy could FEED the engine invented events.
+ *  - Replacing a String or Buffer method the stdin reader uses (`split`,
+ *    `toString`): each read is a 64 KiB chunk, so the replacement saw rows not
+ *    yet replayed — the future, in the process after all — and could rewrite
+ *    them. Same for Math (`Math.min` sizes every fill) and the other value
+ *    prototypes the engine calls.
+ *  - Re-binding a global (`globalThis.Math = …`): engine code resolves `Math`,
+ *    `Buffer`, `Object`… by name at call time, so the bindings themselves are
+ *    made read-only too.
+ *
+ * Not a forged output line (the HMAC stops that) but a genuinely computed
+ * report that means nothing. Freezing makes every such write throw (modules
+ * are strict); a strategy that patches built-ins fails with the error saying so.
+ *
+ * Object.prototype and Function.prototype cannot simply be frozen: ordinary
+ * library code assigns an own `toString` (decimal.js does `P.toString = …` on
+ * a plain object), and assigning a property that is frozen further up the
+ * chain throws — the "override mistake". So, as SES does, their data
+ * properties become accessors whose setter defines an own property on the
+ * object being written to, and refuses only a write to the prototype itself.
+ * Everything else is frozen as is.
+ */
+{
+  const { defineProperty, getOwnPropertyDescriptors, freeze, getPrototypeOf } = Object;
+  const ownKeys = Reflect.ownKeys;
+  const tame = (proto) => {
+    const descs = getOwnPropertyDescriptors(proto);
+    for (const key of ownKeys(descs)) {
+      const d = descs[key];
+      if (!('value' in d) || !d.writable || !d.configurable) continue;
+      const value = d.value;
+      defineProperty(proto, key, {
+        configurable: false,
+        enumerable: d.enumerable,
+        get() { return value; },
+        set(v) {
+          if (this === proto) throw new TypeError(`Cannot assign to read only property '${String(key)}' of a built-in prototype`);
+          defineProperty(this, key, { value: v, writable: true, enumerable: true, configurable: true });
+        },
+      });
+    }
+    freeze(proto);
+  };
+  tame(Object.prototype);
+  tame(Function.prototype);
+  const arrayIter = getPrototypeOf([][Symbol.iterator]());
+  const generator = getPrototypeOf(function* g() {});
+  const typedArray = getPrototypeOf(Float64Array);
+  for (const target of [
+    Array, Array.prototype, arrayIter, getPrototypeOf(arrayIter),
+    Map, Map.prototype, getPrototypeOf(new Map()[Symbol.iterator]()),
+    Set, Set.prototype, getPrototypeOf(new Set()[Symbol.iterator]()),
+    WeakMap, WeakMap.prototype, WeakSet, WeakSet.prototype,
+    generator, generator.prototype,
+    String, String.prototype, getPrototypeOf(''[Symbol.iterator]()),
+    RegExp, RegExp.prototype, Number, Number.prototype, Boolean, Boolean.prototype,
+    Symbol, Symbol.prototype, BigInt, BigInt.prototype, Promise, Promise.prototype,
+    typedArray, typedArray.prototype, Float64Array, Float64Array.prototype,
+    Uint8Array, Uint8Array.prototype, Buffer, Buffer.prototype,
+    Math, Object, Reflect,
+  ]) freeze(target);
+  // The names engine code looks up at call time. JSON keeps a writable
+  // property set (its parse is captured below, and nothing else is used for
+  // output), but the binding is fixed like the rest.
+  for (const name of [
+    'Object', 'Function', 'Array', 'Map', 'Set', 'WeakMap', 'WeakSet', 'String', 'Number',
+    'Boolean', 'Symbol', 'BigInt', 'Promise', 'RegExp', 'Math', 'JSON', 'Reflect', 'Buffer',
+    'Float64Array', 'Uint8Array', 'Error', 'TypeError', 'console',
+  ]) {
+    defineProperty(globalThis, name, { value: globalThis[name], writable: false, configurable: false, enumerable: false });
+  }
+}
 
 /**
  * The parser, captured at module load — before any strategy is imported.
@@ -170,6 +260,8 @@ const TRADE_FIELDS = [
 const FILL_FIELDS = [
   'ts_ms', 'market_id', 'side', 'action', 'requested', 'filled', 'unfilled',
   'avg_px', 'worst_px', 'quoted_px', 'levels_walked', 'fee', 'realised', 'tag',
+  'liquidity', 'order_id', 'queue_ahead_at_join', 'queue_ahead_at_fill', 'time_in_queue_ms',
+  'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle',
 ];
 
 /**
@@ -334,6 +426,8 @@ async function main() {
     market_summaries: [],
     crosschecks: [],
     rejection: null,
+    // Summed over markets; null when the run could not rest orders at all.
+    maker: null,
   };
 
   const finish = (code) => {
@@ -372,6 +466,7 @@ async function main() {
   // market mode gets a fresh instance per market, which is what lets a run be
   // sharded at all.
   const fees = feePolicy(job);
+  const resting = restingPolicy(job);
   const session = job.mode === 'session';
   const shared = session ? new Portfolio({ fees }) : null;
   let sharedInstance = null;
@@ -481,6 +576,7 @@ async function main() {
       seed: job.seed ?? 1,
       references,
       series,
+      resting,
     });
     m.replay.open();
   };
@@ -531,6 +627,7 @@ async function main() {
     const prefix = openedAt == null ? shortId : `${openedAt} ${shortId}`;
     for (const line of out.logs) logsOut.write(`${prefix} ${line}\n`);
     for (const c of out.crosschecks) result.crosschecks.push(c);
+    if (out.maker) result.maker = addMakerStats(result.maker ?? newMakerStats(), out.maker);
 
     // Tracked as the stream went past rather than scanned afterwards: there
     // is no array left to scan, which is the point. The worker prices the
@@ -729,19 +826,43 @@ function feePolicy(job) {
   return { mode: 'bps', bps: job.feeBps ?? 0 };
 }
 
+/**
+ * The run's resting-order policy, as the writer decided it (restingPolicyFor in
+ * api/lib/backtest-datasets.mjs). Anything malformed is "not allowed" — the
+ * fail-closed direction. MUST MATCH resting_policy in otharness.py.
+ */
+function restingPolicy(job) {
+  const r = job.resting;
+  if (!r || typeof r !== 'object') {
+    return { allowed: false, refusal: 'resting (gtc) orders are not available for this run', cancelLatencyMs: 0 };
+  }
+  return {
+    allowed: r.allowed === true,
+    refusal: typeof r.refusal === 'string' ? r.refusal : 'resting (gtc) orders are not available for this run',
+    cancelLatencyMs: Number.isFinite(r.cancelLatencyMs) && r.cancelLatencyMs >= 0 ? r.cancelLatencyMs : (job.fillDelayMs ?? 0),
+  };
+}
+
 /** Write everything a market added to the two logs. */
 function flush(pf, before, emit, marketId) {
   for (let i = before.trades; i < pf.trades.length; i += 1) {
     emit(CHANNEL.trade, stringify(projectRow(pf.trades[i], TRADE_FIELDS)));
   }
+  // A session drain (marketId === true) happens whenever ANY market closes, so
+  // it can meet maker rows of a market still open, whose markouts are not
+  // final yet. Those stay behind, in order, until their own market's close.
+  const held = [];
   for (let i = before.fills; i < pf.fills.length; i += 1) {
-    emit(CHANNEL.fill, stringify(projectRow(pf.fills[i], FILL_FIELDS)));
+    const row = pf.fills[i];
+    if (marketId === true && rowPending(row)) { held.push(row); continue; }
+    emit(CHANNEL.fill, stringify(projectRow(row, FILL_FIELDS)));
   }
   // Keep memory flat across hundreds of market-days: once written, the rows
   // are the worker's problem, not ours.
   if (marketId) {
     pf.trades.length = before.trades;
     pf.fills.length = before.fills;
+    for (const row of held) pf.fills.push(row);
   }
 }
 

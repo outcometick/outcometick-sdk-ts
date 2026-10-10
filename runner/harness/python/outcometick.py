@@ -10,6 +10,7 @@ with.
 from __future__ import annotations
 
 import math
+import re
 
 # Named explicitly so `from __future__ import annotations` does not leak
 # `annotations` into the package's public surface — this module is also
@@ -17,6 +18,9 @@ import math
 __all__ = ("Strategy", "Order", "SIDES")
 
 SIDES = ("UP", "DOWN")
+
+_CLIENT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_ENGINE_ID = re.compile(r"o[0-9]+")
 
 
 class Strategy:
@@ -40,10 +44,10 @@ class Order:
     opening, a floor when reducing.
     """
 
-    __slots__ = ("side", "size", "limit", "hold_s", "reduce_only", "tif", "tag")
+    __slots__ = ("side", "size", "limit", "hold_s", "reduce_only", "tif", "tag", "post_only", "client_id")
 
     def __init__(self, side, size=None, limit=None, hold_s=None, reduce_only=False,
-                 tif="ioc", tag=None, notional=None):
+                 tif="ioc", tag=None, notional=None, post_only=False, client_id=None):
         if side not in SIDES:
             raise ValueError(f'side must be "UP" or "DOWN", got {side!r}')
         # SIZING IN MONEY -- this is about the `notional` argument below.
@@ -95,9 +99,21 @@ class Order:
             # that is not a price, and silently clamping it would fill an order
             # the strategy never asked for.
             raise ValueError(f"limit must be between 0 and 1, got {limit!r}")
-        if tif != "ioc":
-            # Not modelled, so not accepted. See "Not supported yet" in the docs.
-            raise ValueError(f'tif must be "ioc"; {tif!r} is not supported yet')
+        if tif not in ("ioc", "gtc"):
+            raise ValueError(f'tif must be "ioc" or "gtc", got {tif!r}')
+        # Mirrors index.mjs: a resting order rests AT a price; hold_s has no
+        # single fill to time from; post_only and client_id mean nothing to an ioc.
+        if tif == "gtc":
+            if limit is None:
+                raise ValueError("a gtc order needs a limit — the price it rests at")
+            if hold_s is not None:
+                raise ValueError("hold_s is not supported on gtc orders; exit with a reduce_only order")
+        elif post_only or client_id is not None:
+            raise ValueError("post_only and client_id only apply to gtc orders")
+        if client_id is not None and not (isinstance(client_id, str) and _CLIENT_ID.fullmatch(client_id)
+                                          and not _ENGINE_ID.fullmatch(client_id)):
+            raise ValueError("client_id must be 1-64 of A-Z a-z 0-9 _ . : - and not look like an engine id "
+                             f"(o<digits>), got {client_id!r}")
         self.side = side
         self.size = float(size)
         self.limit = None if limit is None else float(limit)
@@ -105,7 +121,10 @@ class Order:
         self.reduce_only = bool(reduce_only)
         self.tif = tif
         self.tag = tag
+        self.post_only = bool(post_only) if tif == "gtc" else False
+        self.client_id = client_id if tif == "gtc" else None
 
     def __repr__(self) -> str:
+        extra = f", tif='gtc', client_id={self.client_id!r}" if self.tif == "gtc" else ""
         return (f"Order(side={self.side!r}, size={self.size}, limit={self.limit}, "
-                f"reduce_only={self.reduce_only})")
+                f"reduce_only={self.reduce_only}{extra})")

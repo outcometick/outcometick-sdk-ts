@@ -391,7 +391,9 @@ export function slippageAccumulator() {
   let n = 0;
   return {
     add(f) {
-      if (f.action !== 'open') return;
+      // Maker fills are at the order's own price by definition: there is no
+      // quote to slip from, and counting them would dilute the panel.
+      if (f.action !== 'open' || f.liquidity === 'maker') return;
       orders += 1;
       if (f.filled > 0 && f.levels_walked === 1) atQuote += 1;
       if (f.filled > 0 && f.levels_walked > 1) walked += 1;
@@ -440,9 +442,122 @@ export function slippage(fills) {
   return acc.result();
 }
 
-/** What the report needs from the fill log: its size and the slippage panel. */
+/**
+ * The fill-derived half of the maker block, fed one fill at a time: queue
+ * position and time in queue per maker fill, markouts weighted by size.
+ * MUST MATCH maker_fill_accumulator in client/backtest/report.py.
+ */
+export const MARKOUT_KEYS = Object.freeze([
+  ['1s', 'markout_1s'], ['10s', 'markout_10s'], ['60s', 'markout_60s'], ['settle', 'markout_settle'],
+]);
+
+export function makerFillAccumulator() {
+  const join = [];
+  const atFill = [];
+  const inQueue = [];
+  let fills = 0;
+  let size = 0;
+  const mk = Object.fromEntries(MARKOUT_KEYS.map(([k]) => [k, { sum: 0, size: 0, n: 0 }]));
+  return {
+    add(f) {
+      if (f.liquidity !== 'maker' || !(f.filled > 0)) return;
+      fills += 1;
+      size += f.filled;
+      if (Number.isFinite(f.queue_ahead_at_join)) join.push(f.queue_ahead_at_join);
+      if (Number.isFinite(f.queue_ahead_at_fill)) atFill.push(f.queue_ahead_at_fill);
+      if (Number.isFinite(f.time_in_queue_ms)) inQueue.push(f.time_in_queue_ms);
+      for (const [k, field] of MARKOUT_KEYS) {
+        const v = f[field];
+        if (!Number.isFinite(v)) continue;
+        mk[k].sum += v * f.filled;
+        mk[k].size += f.filled;
+        mk[k].n += 1;
+      }
+    },
+    result() {
+      const median = (xs) => {
+        if (!xs.length) return null;
+        const s = [...xs].sort((a, b) => a - b);
+        return s[Math.min(s.length - 1, Math.floor(0.5 * s.length))];
+      };
+      return {
+        fills,
+        size,
+        median_ahead_at_join: median(join),
+        median_ahead_at_fill: median(atFill),
+        median_time_in_queue_ms: median(inQueue),
+        markout: Object.fromEntries(MARKOUT_KEYS.map(([k]) => [k, {
+          // Per share, size-weighted, over the fills that had a value.
+          mean: mk[k].size > 0 ? mk[k].sum / mk[k].size : null,
+          fills: mk[k].n,
+          size: mk[k].size,
+        }])),
+      };
+    },
+  };
+}
+
+/** What the report needs from the fill log: its size, the slippage panel, the maker fills. */
 export function fillStats(fills) {
-  return { count: fills.length, slippage: slippage(fills) };
+  const maker = makerFillAccumulator();
+  for (const f of fills) maker.add(f);
+  return { count: fills.length, slippage: slippage(fills), makerFills: maker.result() };
+}
+
+/**
+ * The maker block: how resting orders fared, and how they are modelled.
+ *
+ * `stats` are the engine's counters (summed over markets by the harness);
+ * `fills` is makerFillAccumulator().result(). Null when the strategy never
+ * submitted a resting order — the block describes resting orders, and an
+ * empty one would read as "tried and never filled".
+ *
+ * The model's name and its lag constant ride along for the same reason
+ * fee_model does: a forwarded report must say how its fills were produced.
+ * MUST MATCH maker_report in client/backtest/report.py.
+ */
+export function makerReport({ stats, fills, queueModel, printLagMs }) {
+  if (!stats || !(stats.submitted > 0)) return null;
+  const rate = (a, b) => (b > 0 ? r4(a / b) : null);
+  const f = fills ?? makerFillAccumulator().result();
+  return {
+    queue_model: queueModel,
+    print_lag_ms: printLagMs,
+    orders: {
+      submitted: stats.submitted,
+      rested: stats.rested,
+      with_maker_fill: stats.orders_with_maker_fill,
+      fully_filled: stats.fully_filled,
+      cancelled: stats.cancelled,
+      cancelled_before_entry: stats.cancelled_before_entry,
+      cancelled_no_position: stats.cancelled_no_position,
+      expired: stats.expired,
+      rejected_invalid: stats.rejected_invalid,
+      rejected_post_only: stats.rejected_post_only,
+      rejected_self_cross: stats.rejected_self_cross,
+      rejected_duplicate_id: stats.rejected_duplicate_id,
+    },
+    size: {
+      rested: r2(stats.rested_size),
+      maker_filled: r2(stats.maker_filled_size),
+      taker_on_arrival: r2(stats.taker_on_arrival_size),
+    },
+    // Of what rested, how much the queue model filled — by size and by order.
+    fill_rate_size: rate(stats.maker_filled_size, stats.rested_size),
+    fill_rate_orders: rate(stats.orders_with_maker_fill, stats.rested),
+    maker_fills: f.fills,
+    median_ahead_at_join: r2(f.median_ahead_at_join),
+    median_ahead_at_fill: r2(f.median_ahead_at_fill),
+    median_time_in_queue_ms: f.median_time_in_queue_ms,
+    markout: Object.fromEntries(Object.entries(f.markout).map(([k, m]) => [k, {
+      mean: r4(m.mean), fills: m.fills, size: r2(m.size),
+    }])),
+    // What the model declined to fill, said out loud: volume that reached an
+    // order inside its entry window, and how often the archive's book crossed
+    // a resting order without a print to fill it.
+    lag_suppressed_size: r2(stats.lag_suppressed_size),
+    crossed_observations: stats.crossed_observations,
+  };
 }
 
 /** PnL split by asset and market period, for the by-market panel. */
@@ -537,7 +652,7 @@ export function buildReport({
   runId, submittedAt, manifest, scope, sourceSha256 = null,
   trades, fillStats: fillSummary, marketSummaries, marketMeta,
   feesPaid = 0, fillDelayMs = 0, feeModel = null, sweep = null, coverage = null,
-  crosschecks = [], budget = null, seed = null, scanned = {},
+  crosschecks = [], budget = null, seed = null, scanned = {}, maker = null,
 }) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
   const equity = equityCurve(closed);
@@ -602,6 +717,8 @@ export function buildReport({
     // zero-latency run or a 250ms one.
     fill_delay_ms: fillDelayMs,
     fee_model: feeModel,
+    // Resting orders, when the strategy used any (makerReport).
+    maker,
     sweep,
     coverage,
     budget,

@@ -13,7 +13,8 @@
 // CPU, not the customer's data.
 
 import { Book } from './book.mjs';
-import { Portfolio } from './portfolio.mjs';
+import { Portfolio, contractValue } from './portfolio.mjs';
+import { MakerBook, MAX_RESTING } from './maker.mjs';
 
 
 // Mirrors LIMITS.logLineChars / LIMITS.logBytesPerRun, and does NOT import
@@ -203,7 +204,7 @@ function bookView(book) {
   });
 }
 
-function createCtx({ params, portfolio, marketId, market, logBudget, references, series, rng }) {
+function createCtx({ params, portfolio, marketId, market, logBudget, references, series, rng, resting = null }) {
   const history = [];
   const logs = [];
   const crosschecks = [];
@@ -268,6 +269,19 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
 
     /** Seeded generator — the only randomness available, and it is recorded. */
     random(seed = null) { return rng(seed); },
+
+    /**
+     * This market's resting orders that are not final yet: copies, and no
+     * queue position — a venue does not tell you that, so neither do we.
+     */
+    orders() { return resting ? resting.orders() : []; },
+
+    /**
+     * Cancel a resting order by engine id (`o3`) or by its client_id. Takes
+     * effect after the run's cancel latency; returns false when there is no
+     * such order.
+     */
+    cancel(id) { return resting ? resting.cancel(id) : false; },
 
     /**
      * A declared reference feed as of now.
@@ -352,6 +366,7 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
 
   const control = {
     setNow(v) { now = v; },
+    get now() { return now; },
     setBook(b) { book = b; },
     // A COPY. The same object is handed to the hook, and a strategy that
     // writes to `tick.value` would otherwise be rewriting the series its own
@@ -438,6 +453,12 @@ export class MarketReplay {
     series = null,
     seed = 1,
     feeBps = 0,
+    /**
+     * Resting-order policy for the run: `{ allowed, refusal, cancelLatencyMs }`,
+     * decided once from the venue and the declared datasets (restingPolicyFor).
+     * Absent or not allowed, a gtc order aborts the run with `refusal`.
+     */
+    resting = null,
   }) {
     this.marketId = market.market_id;
     this.pf = portfolio ?? new Portfolio({ feeBps });
@@ -462,10 +483,18 @@ export class MarketReplay {
       references,
       series,
       rng: makeRng(seed),
+      resting: {
+        orders: () => (this.maker ? this.maker.views() : []),
+        cancel: (id) => this.#requestCancel(id),
+      },
     });
     this.ctx = ctx;
     this.control = control;
     control.setBook(this.book);
+
+    this.resting = resting;
+    this.cancelLatencyMs = Number.isFinite(resting?.cancelLatencyMs) ? resting.cancelLatencyMs : fillDelayMs;
+    this.maker = resting?.allowed ? new MakerBook({ marketId: this.marketId, portfolio: this.pf }) : null;
 
     // Orders decided at T but matched at T + fillDelayMs, and hold_s expiries.
     /** @type {Array<{at:number, kind:'order'|'flatten', payload:any}>} */
@@ -528,10 +557,24 @@ export class MarketReplay {
         if (res?.filled > 0 && job.payload.hold_s > 0 && !job.payload.reduce_only) {
           this.#schedule(job.at + job.payload.hold_s * 1000, 'flatten', { side: job.payload.side });
         }
+      } else if (job.kind === 'activate') {
+        this.maker.activate(job.payload, job.at, this.book);
+      } else if (job.kind === 'cancel') {
+        this.maker.cancel(job.payload, job.at);
       } else {
         this.pf.flatten(this.marketId, this.book, job.at, 'hold_expired');
       }
     }
+  }
+
+  #requestCancel(id) {
+    if (!this.maker) return false;
+    // Resolved NOW, to the record: a client_id reused after this call cannot
+    // redirect a cancel already on its way.
+    const rec = this.maker.find(id);
+    if (!rec) { this.maker.cancel(null, this.control.now); return false; }
+    this.#schedule(this.control.now + this.cancelLatencyMs, 'cancel', rec);
+    return true;
   }
 
   #call(name, ...args) {
@@ -551,25 +594,41 @@ export class MarketReplay {
   #emit(out, ts) {
     if (out == null) return;
     const list = Array.isArray(out) ? out : [out];
-    for (const order of list) {
-      if (order == null) continue;
-      // `gtc` was advertised in the SDK reference and silently executed as a
-      // single IOC attempt: if the book did not fill at that instant the order
-      // vanished, even though the documented semantics say it rests until the
-      // market closes. That is a wrong fill, slippage and PnL number for an
-      // order type we told customers we supported.
-      //
-      // Refused rather than approximated, which is the same call the docs
-      // already make about resting orders: "we would rather ship it late than
-      // ship it flattering."
+    for (const raw of list) {
+      if (raw == null) continue;
+      // A COPY, taken at decision time. The hook's own object used to be
+      // scheduled by reference, so a strategy could rewrite `limit` or `size`
+      // while the order was still "in flight" and have the engine act on what
+      // it decided later — latency that only applied to the decision, not to
+      // its content.
+      const order = typeof raw === 'object' ? { ...raw } : raw;
       const tif = order.tif ?? 'ioc';
+      if (tif === 'gtc') {
+        this.#submitResting(order, ts);
+        continue;
+      }
       if (tif !== 'ioc') {
-        throw new RunAbort('E_MANIFEST',
-          `tif ${JSON.stringify(tif)} is not supported — only "ioc". Resting orders need a`
-          + ' queue-position model, and guessing at one inflates returns by multiples.');
+        throw new RunAbort('E_MANIFEST', `tif ${JSON.stringify(tif)} is not supported — "ioc" or "gtc".`);
       }
       this.#schedule(ts + this.fillDelayMs, 'order', order);
     }
+  }
+
+  #submitResting(order, ts) {
+    if (!this.maker) {
+      throw new RunAbort('E_MANIFEST', this.resting?.refusal
+        ?? 'resting (gtc) orders are not available for this run');
+    }
+    // hold_s is a timer from a fill, and a resting order fills in pieces over
+    // time — there is no single fill to time from. Refused, not guessed at.
+    if (order.hold_s != null) {
+      throw new RunAbort('E_MANIFEST', 'hold_s is not supported on gtc orders; exit with a reduce_only order');
+    }
+    if (this.maker.openCount() >= MAX_RESTING) {
+      throw new RunAbort('E_RUNTIME', `more than ${MAX_RESTING} open resting orders in market ${this.marketId}`);
+    }
+    const rec = this.maker.submit(order, ts);
+    if (rec) this.#schedule(ts + this.fillDelayMs, 'activate', rec);
   }
 
   #checkBudget() {
@@ -598,15 +657,28 @@ export class MarketReplay {
     // order against depth that arrived after it.
     this.drainUntil(ev.ts_ms - 1);
     this.control.setNow(ev.ts_ms);
+    const maker = this.maker;
+    if (maker) {
+      maker.finalize(ev.ts_ms);
+      maker.resolveMarkouts(ev.ts_ms, this.book);
+    }
 
     if (ev.kind === 'book') {
       // BEFORE the snapshot test, because a bound carries snapshot:false and
       // would otherwise be applied as a delta with no ladder, no price and no
       // size — which Book.delta rejects by throwing, taking the whole run with
       // it.
-      if (ev.bbo) this.book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask);
-      else if (ev.snapshot) this.book.snapshot(ev.ts_ms, ev.levels);
-      else this.book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+      const apply = () => {
+        if (ev.bbo) this.book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask);
+        else if (ev.snapshot) this.book.snapshot(ev.ts_ms, ev.levels);
+        else this.book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+      };
+      if (maker) maker.bookEvent(ev, this.book, apply);
+      else apply();
+    } else if (ev.kind === 'trade' && maker) {
+      // Resting orders see the print BEFORE any hook does, and an order a hook
+      // returns now cannot consume it (see PRINT_LAG_MS).
+      maker.trade(ev, this.book);
     }
     this.drainUntil(ev.ts_ms);
 
@@ -645,12 +717,17 @@ export class MarketReplay {
     const settleTs = this.declaredClose ?? this.lastTs;
     this.control.setNow(settleTs);
     this.drainUntil(settleTs);
+    // Resting orders end here, pending ones included, before anything settles:
+    // nothing fills after the close.
+    if (this.maker) this.maker.close(settleTs, this.book);
     // Whatever is still pending never filled. Dropped, not back-dated.
     this.pending.length = 0;
 
     this.#call('on_settle', { ...this.market }, this.market.outcome);
 
-    const settled = this.market.outcome ? this.pf.settle(this.marketId, this.market.outcome, settleTs) : [];
+    const outcome = this.market.outcome;
+    const settled = outcome ? this.pf.settle(this.marketId, outcome, settleTs) : [];
+    if (this.maker) this.maker.releaseRows(outcome ? (side) => contractValue(side, outcome) : null);
 
     return {
       marketId: this.marketId,
@@ -663,6 +740,7 @@ export class MarketReplay {
       logTruncated: this.control.logTruncated,
       crosschecks: this.control.crosschecks,
       budget: this.monitor.summary(),
+      maker: this.maker ? this.maker.stats : null,
     };
   }
 }

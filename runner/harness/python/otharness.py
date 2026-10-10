@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import datetime as _datetime
 import json
+import math
 
 from otengine import Book as _Book, BudgetMonitor, Portfolio, RunAbort
 from otfeed import build_feeds
+from otmaker import add_maker_stats, new_maker_stats, row_pending
 from otreplay import MarketReplay, make_log_budget, LOG_BYTES_PER_RUN, LOG_LINE_CHARS
 
 CHANNEL_TRADE = "t"
@@ -98,6 +100,8 @@ TRADE_FIELDS = (
 FILL_FIELDS = (
     "ts_ms", "market_id", "side", "action", "requested", "filled", "unfilled",
     "avg_px", "worst_px", "quoted_px", "levels_walked", "fee", "realised", "tag",
+    "liquidity", "order_id", "queue_ahead_at_join", "queue_ahead_at_fill", "time_in_queue_ms",
+    "markout_1s", "markout_10s", "markout_60s", "markout_settle",
 )
 
 
@@ -128,6 +132,24 @@ def fee_policy(job: dict) -> dict:
     if isinstance(fees, dict) and fees.get("mode") in ("venue", "bps"):
         return fees
     return {"mode": "bps", "bps": job.get("feeBps", 0)}
+
+
+_NO_RESTING = "resting (gtc) orders are not available for this run"
+
+
+def resting_policy(job: dict) -> dict:
+    """The run's resting-order policy as the writer decided it; anything
+    malformed is "not allowed". MUST MATCH restingPolicy in the Node harness."""
+    r = job.get("resting")
+    if not isinstance(r, dict):
+        return {"allowed": False, "refusal": _NO_RESTING, "cancelLatencyMs": 0}
+    cl = r.get("cancelLatencyMs")
+    ok = isinstance(cl, (int, float)) and not isinstance(cl, bool) and math.isfinite(cl) and cl >= 0
+    return {
+        "allowed": r.get("allowed") is True,
+        "refusal": r.get("refusal") if isinstance(r.get("refusal"), str) else _NO_RESTING,
+        "cancelLatencyMs": cl if ok else job.get("fillDelayMs", 0),
+    }
 
 
 def _log_prefix(market: dict) -> str:
@@ -193,6 +215,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
         limits.get("logLineChars", LOG_LINE_CHARS),
     )
     fees = fee_policy(job)
+    resting = resting_policy(job)
     hooks = job.get("hooks") or {}
     session = job.get("mode") == "session"
 
@@ -205,6 +228,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
         "market_summaries": [],
         "crosschecks": [],
         "rejection": None,
+        "maker": None,
     }
 
     def log(text):
@@ -218,11 +242,18 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
     def flush(pf: Portfolio, before: dict, market_id) -> None:
         for row in pf.trades[before["trades"]:]:
             emit(CHANNEL_TRADE, _DUMPS(project_row(row, TRADE_FIELDS)))
+        # A session drain holds back maker rows of markets still open -- see
+        # flush in the Node harness.
+        held = []
         for row in pf.fills[before["fills"]:]:
+            if market_id is True and row_pending(row):
+                held.append(row)
+                continue
             emit(CHANNEL_FILL, _DUMPS(project_row(row, FILL_FIELDS)))
         if market_id:
             del pf.trades[before["trades"]:]
             del pf.fills[before["fills"]:]
+            pf.fills.extend(held)
 
     try:
         klass = load_class()
@@ -261,6 +292,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             seed=job.get("seed", 1),
             references=build_feeds(refs, {n: m.rows_for(n) for n in refs}, entry.get("lags") or {}),
             series=build_feeds(series, {n: m.rows_for(n) for n in series}, entry.get("lags") or {}),
+            resting=resting,
         )
         m.replay.open()
 
@@ -279,6 +311,8 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
         for line in out["logs"]:
             log(f"{prefix} {line}\n")
         result["crosschecks"].extend(out["crosschecks"])
+        if out.get("maker"):
+            result["maker"] = add_maker_stats(result["maker"] or new_maker_stats(), out["maker"])
         oq = m.open_quotes
         result["market_summaries"].append({
             "market_id": entry["market"]["market_id"],

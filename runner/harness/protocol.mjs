@@ -124,6 +124,17 @@ export const TRADE_FIELDS = Object.freeze([
 export const FILL_FIELDS = Object.freeze([
   'ts_ms', 'market_id', 'side', 'action', 'requested', 'filled', 'unfilled',
   'avg_px', 'worst_px', 'quoted_px', 'levels_walked', 'fee', 'realised',
+  'liquidity', 'order_id', 'queue_ahead_at_join', 'queue_ahead_at_fill', 'time_in_queue_ms',
+  'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle',
+]);
+
+/** The maker block's counters, and nothing else, from a harness result. */
+export const MAKER_STAT_KEYS = Object.freeze([
+  'submitted', 'rested', 'rested_size', 'taker_on_arrival_size', 'maker_filled_size', 'maker_fills',
+  'orders_with_maker_fill', 'fully_filled', 'cancelled', 'cancelled_before_entry',
+  'cancelled_no_position', 'expired', 'rejected_invalid', 'rejected_post_only',
+  'rejected_self_cross', 'rejected_duplicate_id', 'cancel_noop', 'lag_suppressed_size',
+  'crossed_observations',
 ]);
 
 const finite = (x) => typeof x === 'number' && Number.isFinite(x);
@@ -185,7 +196,26 @@ export function parseFill(raw) {
     fee: finite(raw.fee) ? raw.fee : 0,
     realised: finite(raw.realised) ? raw.realised : 0,
     tag: typeof raw.tag === 'string' ? raw.tag.slice(0, 64) : null,
+    // A row from before resting orders existed has no `liquidity`, and every
+    // such row was a taker fill.
+    liquidity: raw.liquidity === 'maker' ? 'maker' : 'taker',
+    order_id: typeof raw.order_id === 'string' ? raw.order_id.slice(0, 16) : null,
+    queue_ahead_at_join: px(raw.queue_ahead_at_join),
+    queue_ahead_at_fill: px(raw.queue_ahead_at_fill),
+    time_in_queue_ms: px(raw.time_in_queue_ms),
+    markout_1s: px(raw.markout_1s),
+    markout_10s: px(raw.markout_10s),
+    markout_60s: px(raw.markout_60s),
+    markout_settle: px(raw.markout_settle),
   };
+}
+
+/** A harness's summed maker counters: finite non-negative numbers, or null. */
+function parseMakerStats(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const out = {};
+  for (const k of MAKER_STAT_KEYS) out[k] = finite(raw[k]) && raw[k] >= 0 ? raw[k] : 0;
+  return out;
 }
 
 /**
@@ -229,6 +259,7 @@ export function parseResult(raw) {
     feesPaid: finite(r.fees_paid) ? r.fees_paid : 0,
     logTruncated: Boolean(r.log_truncated),
     budget: r.budget && typeof r.budget === 'object' ? r.budget : null,
+    maker: parseMakerStats(r.maker),
     marketSummaries: marketSummaries.filter((m) => m && typeof m === 'object').map((m) => ({
       market_id: typeof m.market_id === 'string' ? m.market_id : null,
       asset: typeof m.asset === 'string' ? m.asset : null,
