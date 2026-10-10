@@ -162,6 +162,8 @@ export class DataClient {
       query: {
         date: q.date, from: q.from, to: q.to,
         venue: q.venue, dataset: q.dataset, asset: q.asset, interval: q.interval,
+        // 'parquet' lists the Parquet copy of each file instead; omitted = the .gz archive files.
+        format: q.format,
       },
     });
   }

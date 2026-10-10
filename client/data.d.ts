@@ -39,6 +39,9 @@ export interface FileRow {
   sha256: string;
   /** Direct download; needs the key, as a header or `?api_key=`. */
   url: string;
+  /** format=parquet only: the row count, and the archive file it was built from. */
+  rows?: number;
+  source?: string;
 }
 
 export interface FilesResult {
@@ -50,6 +53,10 @@ export interface FilesResult {
   /** Total size of the matched files. */
   bytes: number;
   files: FileRow[];
+  /** format=parquet only. */
+  format?: 'parquet';
+  /** format=parquet only: matching files whose Parquet copy is not built yet. */
+  pending?: number;
 }
 
 export interface FilesQuery {
@@ -69,6 +76,8 @@ export interface FilesQuery {
   asset?: Filter;
   /** `"none"` selects the streams that have no period at all. */
   interval?: Filter;
+  /** `"parquet"` lists the Parquet copy of each file; omitted means the .gz archive files. */
+  format?: 'gz' | 'parquet';
 }
 
 export interface MetaResult {

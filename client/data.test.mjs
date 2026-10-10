@@ -158,6 +158,15 @@ test('array filters are sent as the comma alternatives the API expects', async (
   });
 });
 
+test('format is passed through, and omitted when not asked for', async () => {
+  await withApi(async (api, ot) => {
+    await ot.files({ dataset: 'book', format: 'parquet' });
+    assert.equal(api.seen.at(-1).query.format, 'parquet');
+    await ot.files({ dataset: 'book' });
+    assert.equal('format' in api.seen.at(-1).query, false);
+  });
+});
+
 test('empty and null filters are omitted rather than sent blank', async () => {
   await withApi(async (api, ot) => {
     await ot.files({ asset: [], dataset: null, venue: undefined, date: '2026-08-12' });

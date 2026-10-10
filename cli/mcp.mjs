@@ -139,6 +139,7 @@ export const TOOLS = [
         dataset: LIST('e.g. prices, twap60s, book, markets, last_trade_price, klines, orderbook'),
         asset: LIST('Base symbol, e.g. BTC'),
         interval: LIST('e.g. 5m, 15m, 1m, or "none" for period-less files'),
+        format: { type: 'string', enum: ['gz', 'parquet'], description: 'parquet lists the Parquet copy of each file (same rows, already typed); default gz, the archive files' },
         limit: { type: 'integer', minimum: 1, maximum: MAX_FILE_ROWS, description: `Rows to return (default ${DEFAULT_FILE_ROWS}); count and bytes always cover everything matched.` },
       },
       additionalProperties: false,
