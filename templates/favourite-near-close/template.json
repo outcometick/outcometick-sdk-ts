@@ -1,0 +1,8 @@
+{
+  "title": { "en": "Favourite near close", "zh": "临近结算吃单" },
+  "summary": {
+    "en": "In the last minute, buy the side the settlement feed says is winning, if the book still sells it below a ceiling. Hold to settlement.",
+    "zh": "最后一分钟里，按结算流判断哪一边在领先；盘口卖价还低于上限时买入这一边，持有到结算。"
+  },
+  "runsLocally": true
+}

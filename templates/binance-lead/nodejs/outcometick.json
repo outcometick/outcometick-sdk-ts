@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "language": "nodejs@24",
+  "entry": "strategy.mjs:BinanceLead",
+  "hooks": ["on_market_open", "on_tick", "on_settle"],
+  "datasets": ["settlement", "book"],
+  "intervals": ["5m"],
+  "reference": ["binance:btcusdt:spot:1s"],
+  "params": {
+    "window_s": 180,
+    "stop_s": 10,
+    "min_move_bps": 5,
+    "max_px": 0.65,
+    "notional": 50
+  }
+}

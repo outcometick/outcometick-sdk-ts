@@ -1,0 +1,11 @@
+{
+  "title": {
+    "en": "Binance lead",
+    "zh": "喂价套利"
+  },
+  "summary": {
+    "en": "Chainlink's settlement TWAP follows Binance spot with a lag. When spot has already moved since the market opened and the book has not priced it, take that side. Reads each coin's own Binance spot feed (declare one per coin; no HYPE).",
+    "zh": "Chainlink 结算 TWAP 跟随币安现货但有滞后。现货自开盘以来已经明显移动、盘口还没跟上时，买入这一边。每个币读自己的币安现货流（每个币都要声明；HYPE 没有）。"
+  },
+  "runsLocally": false
+}

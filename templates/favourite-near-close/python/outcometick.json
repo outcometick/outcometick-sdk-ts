@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "language": "python@3.14",
+  "entry": "strategy.py:FavouriteNearClose",
+  "hooks": ["on_market_open", "on_tick", "on_settle"],
+  "datasets": ["settlement", "book"],
+  "intervals": ["5m"],
+  "params": {
+    "enter_at_s": 60,
+    "min_lead_bps": 2,
+    "px_min": 0.55,
+    "px_max": 0.95,
+    "notional": 50
+  }
+}

@@ -29,6 +29,9 @@ import { analyzeSource } from '../runner/analyze/index.mjs';
 
 const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
 
+  ot init <dir> --template <id> [--lang python|nodejs]
+      Start from a working strategy. \`ot init\` alone lists the templates.
+
   ot check <dir>
       Validate the manifest, the entry point, the hook signatures and every
       import. Touches no data and costs nothing. This is the exact validator
@@ -222,6 +225,10 @@ async function main(argv) {
 
   try {
     if (command === 'check') return await cmdCheck(parsed);
+    if (command === 'init') {
+      const { cmdInit } = await import('./commands/init.mjs');
+      return await cmdInit(parsed);
+    }
     if (command === 'run') {
       const { cmdRun } = await import('./commands/run.mjs');
       return await cmdRun(parsed);
