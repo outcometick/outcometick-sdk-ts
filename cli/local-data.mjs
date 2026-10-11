@@ -43,7 +43,7 @@ import { spoolDay } from '../runner/spool-day.mjs';
  *
  * Regular files and real directories are all a genuine archive contains.
  */
-async function walk(root, prefix = '', depth = 0) {
+export async function walk(root, prefix = '', depth = 0) {
   const out = [];
   // A real archive is nested about six deep. The bound is what stops a
   // symlink-free cycle or a pathologically deep tree from spinning here.

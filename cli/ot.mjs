@@ -45,6 +45,9 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
       Refused if the manifest declares a reference feed: those come from an
       archive held on the worker, so a local replay would hand your strategy
       empty ones. Your own CSV series work locally.
+      --cache <dir|off>   decoded days are kept (default ~/.cache/outcometick/
+                          decoded-js), so the next run over the same days skips
+                          decoding; keyed on every file's sha256 and the decoder
 
   ot run <dir> --data <dataset> [--mark-max-age-ms <ms>] [--out <file>]
       Your own data for ANY Polymarket binary market: a directory with

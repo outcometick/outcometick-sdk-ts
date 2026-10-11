@@ -33,6 +33,7 @@ import { fingerprintOfFiles, datasetDigest, localInputs } from '../../api/lib/ba
 import { buildArchive } from '../../runner/archive.mjs';
 import { createLineWriter } from '../../runner/stdin-writer.mjs';
 import { readEventLines } from '../../runner/spool-day.mjs';
+import { decoderDigest, defaultCacheRoot, loadLocalDayCached } from '../decode-cache.mjs';
 import {
   loadLocalDay, localDays, looksLikeArchive, archiveVenues, defaultVenue,
 } from '../local-data.mjs';
@@ -108,9 +109,9 @@ function runHarness({
     // One market read back from its spool file (see spoolDay): the day is
     // never all in memory, only the markets being fed.
     // A generic-data market is streamed, never read whole (it can span months).
-    const cursorOf = (m) => fileLines(path.join(eventsDir, m.eventsFile));
+    const cursorOf = (m) => fileLines(path.resolve(eventsDir, m.eventsFile));
     const linesOf = async (m) => {
-      const lines = await readEventLines(path.join(eventsDir, m.eventsFile));
+      const lines = await readEventLines(path.resolve(eventsDir, m.eventsFile));
       return seriesNames.length
         ? mergeReferenceRows(lines, seriesRows, m.market, 'ext', seriesLags)
         : lines;
@@ -309,22 +310,30 @@ export async function cmdRun({ dir, flags }) {
       markets.push(...genericDecoded.markets);
     }
     const runInputs = [];
+    // Decoded days are kept (cli/decode-cache.mjs) unless --cache off.
+    const cacheFlag = flags.cache;
+    const cacheRoot = cacheFlag === 'off' ? null : path.resolve(cacheFlag ?? defaultCacheRoot());
+    const decoder = cacheRoot && !generic ? await decoderDigest() : null;
     for (const day of days) {
-      const loaded = await loadLocalDay({
+      // The SAME cadence the queue would replay this range at — built from the
+      // whole range, not this day, so an asset's density never changes partway
+      // through a run. Per asset, not run-wide: see makeBookThrottle. A fresh
+      // gate per decode: it remembers the rows it has kept.
+      const newThrottle = throttleFlag === 'off' ? null : () => makeBookThrottle({
+        venue,
+        assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
+        from: days[0],
+        to: days[days.length - 1],
+      });
+      const request = {
         root: dataRoot, day, venue, eventsDir,
         assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
         datasets: manifest.datasets,
         intervals: manifest.intervals,
-        // The SAME cadence the queue would replay this range at — built from the
-        // whole range, not this day, so an asset's density never changes partway
-        // through a run. Per asset, not run-wide: see makeBookThrottle.
-        throttle: throttleFlag === 'off' ? null : makeBookThrottle({
-          venue,
-          assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
-          from: days[0],
-          to: days[days.length - 1],
-        }),
-      });
+      };
+      const loaded = cacheRoot
+        ? await loadLocalDayCached({ ...request, cacheRoot, decoder, newThrottle })
+        : await loadLocalDay({ ...request, throttle: newThrottle ? newThrottle() : null });
       // Measured from EVENTS, keyed by market-day — the same fact the queue
       // records, produced by the same decoder. See fetchDay's bboKeys.
       // Every archive file this day was read from (the fingerprint's inputs_sha256).
