@@ -112,7 +112,7 @@ class Ladder {
    * but the age test is not prefix-aligned, so the prefix is filtered rather
    * than sliced.
    */
-  prune(bound, ts) {
+  prune(bound, ts, inclusive = false) {
     // Not just finite: inside [0, 1]. An outcome token pays 0 or 1, so a bound
     // outside that is a row we cannot read, and a bound is a MAXIMAL deletion
     // instruction — acting on a misread one empties the ladder and the market
@@ -131,7 +131,10 @@ class Ladder {
     let removed = 0;
     const kept = [];
     for (const l of this.levels) {
-      if (this.#order(l.ticks, cap) < 0 && l.ts < ts) { removed += 1; continue; }
+      // `inclusive` is generic data only (generic-data.mjs): there the input
+      // order IS the venue's order, so every level present when the bound is
+      // applied came before it, same millisecond or not.
+      if (this.#order(l.ticks, cap) < 0 && (inclusive ? l.ts <= ts : l.ts < ts)) { removed += 1; continue; }
       kept.push(l);
     }
     if (removed) this.levels = kept;
@@ -243,11 +246,25 @@ export class Book {
    *
    * @returns {number} levels removed, for the caller that reports it
    */
-  bbo(ts, side, bid, ask) {
+  bbo(ts, side, bid, ask, { inclusive = false } = {}) {
     this.ts = ts;
     if (!isSide(side)) throw new Error(`unknown side ${side}`);
     const l = this.ladders[side];
-    return l.asks.prune(ask, ts) + l.bids.prune(bid, ts);
+    return l.asks.prune(ask, ts, inclusive) + l.bids.prune(bid, ts, inclusive);
+  }
+
+  /**
+   * A delta on a single-book market whose other token is the mirror (pmdata
+   * data, client/backtest/generic.py): applied to BOTH tokens in one step, so
+   * no hook or fill ever sees one leg updated and the other not. A bid at q on
+   * one token is an ask at 1 - q on the other.
+   */
+  deltaMirrored(ts, side, kind, px, size) {
+    this.delta(ts, side, kind, px, size);
+    const other = side === 'UP' ? 'DOWN' : 'UP';
+    const m = Number((1 - px).toFixed(10));
+    if (!(m >= 0 && m <= 1)) return;
+    this.delta(ts, other, kind === 'asks' ? 'bids' : 'asks', m, size);
   }
 
   /**

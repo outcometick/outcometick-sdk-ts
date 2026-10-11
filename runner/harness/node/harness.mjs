@@ -270,12 +270,20 @@ const TRADE_FIELDS = [
   'market_id', 'side', 'size', 'entry_px', 'exit_px', 'pnl', 'fees',
   'opened_ms', 'closed_ms', 'how', 'outcome',
 ];
+// Generic markets (runner/generic-data.mjs) add these; archive rows never carry
+// a `label`, so their projection is exactly the fields above.
+// MUST MATCH GENERIC_TRADE_FIELDS in otharness.py.
+const GENERIC_TRADE_FIELDS = [
+  ...TRADE_FIELDS, 'label', 'mark_px', 'marked_size', 'marked_pnl', 'mark_source',
+  'mark_ts_ms', 'mark_age_ms', 'mark_missing',
+];
 const FILL_FIELDS = [
   'ts_ms', 'market_id', 'side', 'action', 'requested', 'filled', 'unfilled',
   'avg_px', 'worst_px', 'quoted_px', 'levels_walked', 'fee', 'realised', 'tag',
   'liquidity', 'order_id', 'queue_ahead_at_join', 'queue_ahead_at_fill', 'time_in_queue_ms',
   'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle',
 ];
+const GENERIC_FILL_FIELDS = [...FILL_FIELDS, 'label'];
 
 /**
  * Pull lines off a file descriptor SYNCHRONOUSLY, one at a time.
@@ -544,7 +552,11 @@ async function main() {
     if (ev.kind === 'book' && m.openQuotes === null) {
       if (ev.snapshot) m.summaryBook.snapshot(ev.ts_ms, ev.levels);
       else if (ev.side && ev.ladder) {
-        m.summaryBook.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+        if (ev.mirror === true && m.entry.market?.kind === 'generic') {
+          m.summaryBook.deltaMirrored(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+        } else {
+          m.summaryBook.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+        }
       }
       const up = m.summaryBook.best('UP');
       const down = m.summaryBook.best('DOWN');
@@ -592,6 +604,9 @@ async function main() {
       references,
       series,
       resting,
+      // Generic markets: the decoder's terminal mark. Lives on the header, not
+      // on the market record, and only the replay holds it.
+      terminal: entry.terminal ?? null,
     });
     m.replay.open();
   };
@@ -764,6 +779,10 @@ async function main() {
  */
 function runSession({ nextLine, newMarket, observe, start, finished, rejected, logsOut }) {
   const active = new Map();
+  // Generic markets whose trading has ended and whose settlement is still to
+  // come (`{"end":k}` then, later, `{"close":k}`). Out of `active`: nothing
+  // reaches them in between, and settleEarlier has nothing of theirs to drain.
+  const ending = new Map();
   // Before ANY hook runs at instant `ts` — an opening, an event, a closing —
   // every other open market settles what it had scheduled strictly earlier,
   // against its own book as it stands. The same "strictly before" rule a
@@ -796,8 +815,19 @@ function runSession({ nextLine, newMarket, observe, start, finished, rejected, l
       } catch (err) { return rejected(m, err); }
       continue;
     }
+    if (msg.end != null) {
+      const m = active.get(msg.end);
+      if (!m) continue;
+      try {
+        settleEarlier(m, m.replay.tradeUntil);
+        active.delete(msg.end);
+        ending.set(msg.end, m);
+        m.replay.endTrading();
+      } catch (err) { return rejected(m, err); }
+      continue;
+    }
     if (msg.close != null) {
-      const m = active.get(msg.close);
+      const m = active.get(msg.close) ?? ending.get(msg.close);
       if (!m) continue;
       let out;
       try {
@@ -805,6 +835,7 @@ function runSession({ nextLine, newMarket, observe, start, finished, rejected, l
         // saw when it has none (MarketReplay.close uses the same).
         settleEarlier(m, m.replay.declaredClose ?? m.replay.lastTs);
         active.delete(msg.close);
+        ending.delete(msg.close);
         out = m.replay.close();
       } catch (err) { return rejected(m, err); }
       finished(m, out);
@@ -823,7 +854,7 @@ function runSession({ nextLine, newMarket, observe, start, finished, rejected, l
   }
   // A stream that ended with markets still open was cut short; close them so
   // what did happen is reported, and the worker's count catches the rest.
-  for (const m of active.values()) {
+  for (const m of [...active.values(), ...ending.values()]) {
     let out;
     try { out = m.replay.close(); } catch (err) { return rejected(m, err); }
     finished(m, out);
@@ -861,7 +892,8 @@ function restingPolicy(job) {
 /** Write everything a market added to the two logs. */
 function flush(pf, before, emit, marketId) {
   for (let i = before.trades; i < pf.trades.length; i += 1) {
-    emit(CHANNEL.trade, stringify(projectRow(pf.trades[i], TRADE_FIELDS)));
+    const row = pf.trades[i];
+    emit(CHANNEL.trade, stringify(projectRow(row, row.label !== undefined ? GENERIC_TRADE_FIELDS : TRADE_FIELDS)));
   }
   // A session drain (marketId === true) happens whenever ANY market closes, so
   // it can meet maker rows of a market still open, whose markouts are not
@@ -870,7 +902,7 @@ function flush(pf, before, emit, marketId) {
   for (let i = before.fills; i < pf.fills.length; i += 1) {
     const row = pf.fills[i];
     if (marketId === true && rowPending(row)) { held.push(row); continue; }
-    emit(CHANNEL.fill, stringify(projectRow(row, FILL_FIELDS)));
+    emit(CHANNEL.fill, stringify(projectRow(row, row.label !== undefined ? GENERIC_FILL_FIELDS : FILL_FIELDS)));
   }
   // Keep memory flat across hundreds of market-days: once written, the rows
   // are the worker's problem, not ours.

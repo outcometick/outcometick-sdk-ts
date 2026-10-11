@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.4.3';
+export const SDK_VERSION = '2.5.0';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -26,6 +26,14 @@ export const SDK_VERSION = '2.4.3';
  * runs the old harness under the new worker — and the failure is silent. The
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
+ *
+ * 1.22.0: no protocol change for archive runs. Engine and harness learn
+ * generic-data markets (kind 'generic': labels as order sides, trading ending
+ * before settlement, `end` lines in the session stream, marks for unresolved
+ * markets, extra row fields) — never sent by the worker. An order side that is
+ * a string but not UP/DOWN (nor a label) now stops the run with E_RUNTIME
+ * instead of being dropped and counted. Node heap capped at 1536MB, inside the
+ * 2GB container limit (was 7168: over-limit strategies died as exit 137).
  *
  * 1.21.3: no protocol change, no result change. The images ship no shell
  * (sh/dash/bash deleted; build.sh fails the build if one survives).
@@ -93,7 +101,7 @@ export const SDK_VERSION = '2.4.3';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.21.3';
+export const SANDBOX_IMAGE_TAG = '1.22.0';
 
 // ---------------------------------------------------------------------------
 // Languages

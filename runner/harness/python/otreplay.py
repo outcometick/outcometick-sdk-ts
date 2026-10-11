@@ -14,6 +14,7 @@ the conformance vectors compare them row for row. In particular:
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any, Callable
@@ -354,19 +355,31 @@ class MarketReplay:
                  portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
                  log_budget: dict | None = None, budget: BudgetMonitor | None = None,
                  references=None, series=None, seed: int = 1,
-                 fee_bps: float = 0, resting: dict | None = None) -> None:
+                 fee_bps: float = 0, resting: dict | None = None, terminal=None) -> None:
         self.market_id = market["market_id"]
         self.market = market
+        # generic-data.mjs; see the matching comment in replay.mjs.
+        self.generic = market.get("kind") == "generic"
+        self.terminal = terminal if self.generic else None
         # Attribute access for everything a hook is handed: the docs say
         # `market.strike` and `tick.value`, and they have to be true here.
         # Pre-settle view: `outcome` is a future fact and is stripped. See the
         # matching comment in replay.mjs -- a strategy that read it in
         # on_market_open could buy the winning side and the report became
         # meaningless. Only on_settle sees it.
-        self._market_rec = Rec({k: v for k, v in market.items() if k != "outcome"})
-        self._settle_rec = Rec(market)
+        if self.generic:
+            self._market_rec = Rec(generic_view(market))
+            settle = generic_view(market)
+            settle["outcome"] = market.get("outcome")
+            settle["resolved_ts_ms"] = market.get("resolved_ts_ms")
+            self._settle_rec = Rec(settle)
+        else:
+            self._market_rec = Rec({k: v for k, v in market.items() if k != "outcome"})
+            self._settle_rec = Rec(market)
         self.pf = portfolio if portfolio is not None else Portfolio(fee_bps=fee_bps)
         self.pf.set_market_fee(self.market_id, market.get("fee"))
+        if self.generic:
+            self.pf.set_market_labels(self.market_id, market.get("labels"))
         self.book = Book(self.market_id)
         self.monitor = budget if budget is not None else BudgetMonitor()
         self.strategy = strategy
@@ -395,6 +408,12 @@ class MarketReplay:
         self.seen = 0
         self.last_ts = 0
         self.ended = False
+        if self.generic:
+            self.trade_until = market.get("trade_until_ts_ms")
+            self.close_ts = self.trade_until
+            self.trading_ended = False
+            self.closed = None
+            self.marked = []
 
     def _schedule(self, at: int, kind: str, payload) -> None:
         i = len(self.pending)
@@ -457,6 +476,11 @@ class MarketReplay:
                 continue
             # A COPY taken at decision time -- see replay.mjs.
             row = dict(_as_order(order))
+            side = row.get("side")
+            if isinstance(side, str) and self.pf.side_of(side, self.market_id) is None:
+                labels = self.pf.market_labels.get(self.market_id)
+                extra = (" or an outcome of this market (" + ", ".join(_js_json(lb) for lb in labels) + ")") if labels else ""
+                raise RunAbort("E_RUNTIME", f'order side {_js_json(side)} is not "UP" or "DOWN"{extra}')
             tif = row.get("tif")
             if tif is None:
                 tif = "ioc"
@@ -517,11 +541,15 @@ class MarketReplay:
             # and no size -- which Book.delta rejects by raising, taking the
             # whole run with it. MUST MATCH the same ordering in
             # runner/engine/replay.mjs.
+            generic = self.generic
+
             def apply():
                 if bbo:
-                    self.book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"))
+                    self.book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"), generic)
                 elif ev.get("snapshot"):
                     self.book.snapshot(ts, ev.get("levels") or {})
+                elif generic and ev.get("mirror") is True:
+                    self.book.delta_mirrored(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
                 else:
                     self.book.delta(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
             if maker is not None:
@@ -548,7 +576,54 @@ class MarketReplay:
         self._check_budget()
         return True
 
+    def end_trading(self) -> None:
+        """Generic markets: trading ends. MUST MATCH endTrading in replay.mjs."""
+        if not self.generic or self.trading_ended:
+            return
+        self.trading_ended = True
+        self.ended = True
+        ts = self.trade_until
+        self.state["now"] = ts
+        self.drain_until(ts)
+        if self.maker is not None:
+            self.maker.close(ts, self.book)
+        self.pending.clear()
+        self.marked = [] if self.market.get("outcome") else self.pf.mark(self.market_id, self.terminal, ts)
+
+    def _close_generic(self) -> dict:
+        if self.closed is not None:
+            return self.closed
+        self.end_trading()
+        state = self.state
+        outcome = self.market.get("outcome")
+        settle_ts = self.declared_close
+        state["now"] = settle_ts
+        settled = self.marked
+        if outcome:
+            self._call("on_settle", self._settle_rec, outcome)
+            settled = self.pf.settle(self.market_id, outcome, settle_ts)
+        if self.maker is not None:
+            self.maker.release_rows((lambda side: contract_value(side, outcome)) if outcome else None)
+        view = state.pop("view", None)
+        if view is not None:
+            _BOOKS.pop(id(view), None)
+        _INTERNALS.pop(id(self.ctx), None)
+        self.closed = {
+            "market_id": self.market_id,
+            "asset": None,
+            "events": self.seen,
+            "settled": settled,
+            "logs": state["logs"],
+            "log_truncated": state["log_truncated"],
+            "crosschecks": state["crosschecks"],
+            "budget": self.monitor.summary(),
+            "maker": self.maker.stats if self.maker is not None else None,
+        }
+        return self.closed
+
     def close(self) -> dict:
+        if self.generic:
+            return self._close_generic()
         state = self.state
         # Queued work lands AT THE CLOSE, never at its own future timestamp --
         # see the matching comment in replay.mjs. Both engines or neither.
@@ -583,6 +658,22 @@ class MarketReplay:
             "budget": self.monitor.summary(),
             "maker": self.maker.stats if self.maker is not None else None,
         }
+
+
+_GENERIC_VIEW = (
+    "market_id", "kind", "venue", "question", "slug", "token_ids", "labels", "fee",
+    "tick_size", "min_size", "trading_end_ts_ms", "open_ts_ms",
+)
+
+
+def generic_view(market: dict) -> dict:
+    """A deep copy of a generic market's whitelist. MUST MATCH genericView in replay.mjs."""
+    out = {}
+    for k in _GENERIC_VIEW:
+        v = market.get(k)
+        out[k] = None if v is None else (json.loads(json.dumps(v)) if isinstance(v, (dict, list)) else v)
+    out["close_ts_ms"] = market.get("trading_end_ts_ms")
+    return out
 
 
 def replay_market(*, market: dict, events, strategy, hooks: dict,

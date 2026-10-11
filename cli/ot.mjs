@@ -46,6 +46,12 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
       archive held on the worker, so a local replay would hand your strategy
       empty ones. Your own CSV series work locally.
 
+  ot run <dir> --data <dataset> [--mark-max-age-ms <ms>] [--out <file>]
+      Your own data for ANY Polymarket binary market: a directory with
+      markets.json (or .jsonl) at its top and CLOB frames in *.jsonl[.gz].
+      Every market in it is replayed; an unresolved one is valued at the
+      external mid when trading ends (--mark-max-age-ms refuses older quotes).
+
   ot submit <dir> --assets btc,eth --days <n> [--venue polymarket]
   ot submit <dir> --assets btc,eth --from <day> --to <day> [--venue polymarket]
       Send it to the queue. Needs OT_BACKTEST_KEY.

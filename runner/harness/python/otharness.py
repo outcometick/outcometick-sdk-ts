@@ -114,12 +114,19 @@ TRADE_FIELDS = (
     "market_id", "side", "size", "entry_px", "exit_px", "pnl", "fees",
     "opened_ms", "closed_ms", "how", "outcome",
 )
+# Generic markets add these; archive rows never carry a label.
+# MUST MATCH GENERIC_TRADE_FIELDS in runner/harness/node/harness.mjs.
+GENERIC_TRADE_FIELDS = TRADE_FIELDS + (
+    "label", "mark_px", "marked_size", "marked_pnl", "mark_source",
+    "mark_ts_ms", "mark_age_ms", "mark_missing",
+)
 FILL_FIELDS = (
     "ts_ms", "market_id", "side", "action", "requested", "filled", "unfilled",
     "avg_px", "worst_px", "quoted_px", "levels_walked", "fee", "realised", "tag",
     "liquidity", "order_id", "queue_ahead_at_join", "queue_ahead_at_fill", "time_in_queue_ms",
     "markout_1s", "markout_10s", "markout_60s", "markout_settle",
 )
+GENERIC_FILL_FIELDS = FILL_FIELDS + ("label",)
 
 
 def project_row(row, fields):
@@ -215,7 +222,10 @@ class _Market:
             if ev.get("snapshot"):
                 self.book.snapshot(ev.get("ts_ms") or 0, ev.get("levels") or {})
             elif ev.get("side") and ev.get("ladder"):
-                self.book.delta(ev.get("ts_ms") or 0, ev["side"], ev["ladder"], ev.get("px"), ev.get("size"))
+                if ev.get("mirror") is True and self.entry["market"].get("kind") == "generic":
+                    self.book.delta_mirrored(ev.get("ts_ms") or 0, ev["side"], ev["ladder"], ev.get("px"), ev.get("size"))
+                else:
+                    self.book.delta(ev.get("ts_ms") or 0, ev["side"], ev["ladder"], ev.get("px"), ev.get("size"))
             up, down = self.book.best("UP"), self.book.best("DOWN")
             if up is not None and down is not None:
                 self.open_quotes = (up, down)
@@ -262,7 +272,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
 
     def flush(pf: Portfolio, before: dict, market_id) -> None:
         for row in pf.trades[before["trades"]:]:
-            emit(CHANNEL_TRADE, _DUMPS(project_row(row, TRADE_FIELDS)))
+            emit(CHANNEL_TRADE, _DUMPS(project_row(row, GENERIC_TRADE_FIELDS if "label" in row else TRADE_FIELDS)))
         # A session drain holds back maker rows of markets still open -- see
         # flush in the Node harness.
         held = []
@@ -270,7 +280,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             if market_id is True and row_pending(row):
                 held.append(row)
                 continue
-            emit(CHANNEL_FILL, _DUMPS(project_row(row, FILL_FIELDS)))
+            emit(CHANNEL_FILL, _DUMPS(project_row(row, GENERIC_FILL_FIELDS if "label" in row else FILL_FIELDS)))
         if market_id:
             del pf.trades[before["trades"]:]
             del pf.fills[before["fills"]:]
@@ -314,6 +324,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             references=build_feeds(refs, {n: m.rows_for(n) for n in refs}, entry.get("lags") or {}),
             series=build_feeds(series, {n: m.rows_for(n) for n in series}, entry.get("lags") or {}),
             resting=resting,
+            terminal=entry.get("terminal"),
         )
         m.replay.open()
 
@@ -427,6 +438,8 @@ def _run_session(next_line, start, finished, rejected, log):
     cleanly with every market closed.
     """
     active: dict = {}
+    # Generic markets past `end` and before `close` -- see runSession.
+    ending: dict = {}
 
     def settle_earlier(except_, ts):
         """Before ANY hook at instant `ts` -- an opening, an event, a closing --
@@ -459,8 +472,22 @@ def _run_session(next_line, start, finished, rejected, log):
             except Exception as err:  # noqa: BLE001
                 return rejected(m, err)
             continue
+        if "end" in msg:
+            m = active.get(msg["end"])
+            if m is None:
+                continue
+            try:
+                settle_earlier(m, m.replay.trade_until)
+                active.pop(msg["end"], None)
+                ending[msg["end"]] = m
+                m.replay.end_trading()
+            except Exception as err:  # noqa: BLE001
+                return rejected(m, err)
+            continue
         if "close" in msg:
             m = active.get(msg["close"])
+            if m is None:
+                m = ending.get(msg["close"])
             if m is None:
                 continue
             try:
@@ -469,6 +496,7 @@ def _run_session(next_line, start, finished, rejected, log):
                 r = m.replay
                 settle_earlier(m, r.declared_close if r.declared_close else r.last_ts)
                 active.pop(msg["close"], None)
+                ending.pop(msg["close"], None)
                 out = r.close()
             except Exception as err:  # noqa: BLE001
                 return rejected(m, err)
@@ -487,7 +515,7 @@ def _run_session(next_line, start, finished, rejected, log):
             return rejected(m, err)
     # A stream that ended with markets still open was cut short; close them so
     # what did happen is reported, and the worker's count catches the rest.
-    for m in list(active.values()):
+    for m in list(active.values()) + list(ending.values()):
         try:
             out = m.replay.close()
         except Exception as err:  # noqa: BLE001

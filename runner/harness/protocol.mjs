@@ -172,6 +172,29 @@ export function parseTrade(raw) {
     closed_ms: finite(raw.closed_ms) ? raw.closed_ms : null,
     how: typeof raw.how === 'string' ? raw.how : 'exit',
     outcome: OUTCOMES.includes(raw.outcome) ? raw.outcome : undefined,
+    ...genericTradeFields(raw),
+  };
+}
+
+const label = (v) => (typeof v === 'string' ? v.slice(0, 200) : null);
+const numOrNull = (v) => (finite(v) ? v : null);
+
+/**
+ * The extra fields of a GENERIC market's row (runner/generic-data.mjs),
+ * present only when the row carries a label — archive rows never do, so their
+ * parse is exactly what it always was. MUST MATCH the Python report parser.
+ */
+function genericTradeFields(raw) {
+  if (typeof raw.label !== 'string') return {};
+  return {
+    label: label(raw.label),
+    mark_px: raw.mark_px == null ? null : (finite(raw.mark_px) && raw.mark_px >= 0 && raw.mark_px <= 1 ? raw.mark_px : null),
+    marked_size: numOrNull(raw.marked_size),
+    marked_pnl: numOrNull(raw.marked_pnl),
+    mark_source: ['up_mid', 'down_mid', 'last_trade'].includes(raw.mark_source) ? raw.mark_source : null,
+    mark_ts_ms: numOrNull(raw.mark_ts_ms),
+    mark_age_ms: numOrNull(raw.mark_age_ms),
+    mark_missing: ['no_quote', 'stale'].includes(raw.mark_missing) ? raw.mark_missing : null,
   };
 }
 
@@ -207,6 +230,7 @@ export function parseFill(raw) {
     markout_10s: px(raw.markout_10s),
     markout_60s: px(raw.markout_60s),
     markout_settle: px(raw.markout_settle),
+    ...(typeof raw.label === 'string' ? { label: label(raw.label) } : {}),
   };
 }
 

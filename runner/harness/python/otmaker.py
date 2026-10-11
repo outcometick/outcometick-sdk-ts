@@ -179,6 +179,9 @@ class MakerBook:
         if rec.state != "pending":
             return
         eff = self.pf.normalize(rec.order, self.market_id)
+        # The engine's side (a generic market's order may name it by label).
+        if eff is not None:
+            rec.side = eff["side"]
         limit = eff.get("limit") if eff is not None else None
         ticks = None if limit is None else to_ticks(limit)
         if (eff is None or limit is None or not (0 < limit < 1)
@@ -269,6 +272,8 @@ class MakerBook:
                     self.token_ts[s] = ev["ts_ms"]
         elif side == "UP" or side == "DOWN":
             self.token_ts[side] = ev["ts_ms"]
+            if ev.get("mirror") is True:
+                self.token_ts["DOWN" if side == "UP" else "UP"] = ev["ts_ms"]
         if not self.tracking():
             apply()
             return

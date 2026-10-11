@@ -36,6 +36,8 @@ import {
   loadLocalDay, localDays, looksLikeArchive, archiveVenues, defaultVenue,
 } from '../local-data.mjs';
 import { readSubmission, validate } from '../ot.mjs';
+import { looksLikeGenericDataset, decodeGenericDir, fileLines } from '../../runner/generic-data.mjs';
+import { genericReportExtras, applyGenericExtras } from '../../runner/generic-report.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(HERE, '..', '..', 'runner');
@@ -104,6 +106,8 @@ function runHarness({
     // stamped rather than when it could have existed.
     // One market read back from its spool file (see spoolDay): the day is
     // never all in memory, only the markets being fed.
+    // A generic-data market is streamed, never read whole (it can span months).
+    const cursorOf = (m) => fileLines(path.join(eventsDir, m.eventsFile));
     const linesOf = async (m) => {
       const lines = await readEventLines(path.join(eventsDir, m.eventsFile));
       return seriesNames.length
@@ -113,6 +117,7 @@ function runHarness({
     const headerOf = (m) => ({
       market: m.market,
       stream: m.stream,
+      ...(m.market?.kind === 'generic' ? { terminal: m.terminal ?? null } : {}),
       ...(seriesNames.length ? { series: seriesNames } : {}),
       ...(Object.keys(seriesLags).length ? { lags: seriesLags } : {}),
     });
@@ -121,9 +126,14 @@ function runHarness({
       if (job.mode === 'session') {
         // ONE time order across every market — the same stream the worker
         // writes (runner/session-feed.mjs).
-        for await (const line of sessionLines(markets, { linesOf, headerOf })) await write(line);
+        for await (const line of sessionLines(markets, { linesOf, headerOf, cursorOf })) await write(line);
       } else {
         for (const m of markets) {
+          if (m.market?.kind === 'generic') {
+            await write(JSON.stringify({ ...headerOf(m), n: m.n }));
+            for await (const line of cursorOf(m)) await write(line);
+            continue;
+          }
           const merged = await linesOf(m);
           await write(JSON.stringify({ ...headerOf(m), n: merged.length }));
           for (const line of merged) await write(line);
@@ -170,7 +180,10 @@ export async function cmdRun({ dir, flags }) {
     throw new Error('--data is required: point it at an unpacked sample archive\n'
       + '  curl -L https://github.com/outcometick/polymarket-tick-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz');
   }
-  if (!await looksLikeArchive(dataRoot)) {
+  // A directory with a markets file at its top is the user's own data for any
+  // binary market (runner/generic-data.mjs), not the outcometick archive.
+  const generic = await looksLikeGenericDataset(dataRoot);
+  if (!generic && !await looksLikeArchive(dataRoot)) {
     throw new Error(`${path.resolve(dataRoot)} does not look like an archive — no recognisable data files under it\n`
       + '  the sample archive is a release download, not the git repository:\n'
       + '  curl -L https://github.com/outcometick/polymarket-tick-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz');
@@ -181,9 +194,15 @@ export async function cmdRun({ dir, flags }) {
   const { manifest } = checked;
   const languageId = manifest.languageId;
 
-  const available = await localDays(dataRoot);
-  if (available.length === 0) throw new Error(`no dated files under ${path.resolve(dataRoot)}`);
-  const days = flags.date ? [flags.date] : available;
+  if (!generic && flags['mark-max-age-ms'] != null) {
+    throw new Error('--mark-max-age-ms applies to generic data only: archive markets settle on their official outcome');
+  }
+  if (generic && flags.date) {
+    throw new Error('--date selects archive days; generic data has no days — every market in the dataset is replayed');
+  }
+  const available = generic ? [] : await localDays(dataRoot);
+  if (!generic && available.length === 0) throw new Error(`no dated files under ${path.resolve(dataRoot)}`);
+  const days = generic ? [] : (flags.date ? [flags.date] : available);
   const unknown = days.filter((d) => !available.includes(d));
   if (unknown.length) {
     throw new Error(`${unknown.join(', ')} not in ${path.resolve(dataRoot)} — it holds ${available[0]}..${available[available.length - 1]}`);
@@ -226,8 +245,15 @@ export async function cmdRun({ dir, flags }) {
     (manifest.series ?? []).filter((x) => x.lag_ms > 0).map((x) => [x.name, x.lag_ms]),
   );
   const seriesNames = Object.keys(seriesRows.rowsByName ?? {});
+  if (generic && seriesNames.length) {
+    throw new Error('series are not supported with generic data yet — run without `series` in the manifest');
+  }
 
   // Inferred from the archive when not given: see defaultVenue.
+  if (generic && flags.venue && flags.venue !== 'polymarket') {
+    throw new Error('generic data is Polymarket CLOB data; --venue must be polymarket or omitted');
+  }
+  // A generic dataset holds no archive files, so this is polymarket for it.
   const venue = flags.venue ?? defaultVenue(await archiveVenues(dataRoot));
   const assets = (flags.assets ?? '').split(',').map((a) => a.trim().toUpperCase()).filter(Boolean);
 
@@ -244,6 +270,19 @@ export async function cmdRun({ dir, flags }) {
   try {
     const missing = [];
     const bboApplied = new Map();  // day -> Set('<ASSET>|<interval>')
+    let genericDecoded = null;
+    if (generic) {
+      const markAge = flags['mark-max-age-ms'];
+      if (markAge != null && !/^[0-9]+$/.test(markAge)) {
+        throw new Error(`--mark-max-age-ms must be a whole number of milliseconds, got ${markAge}`);
+      }
+      genericDecoded = await decodeGenericDir(dataRoot, {
+        eventsDir,
+        markMaxAgeMs: markAge == null ? null : Number(markAge),
+      });
+      for (const u of genericDecoded.unusable) process.stderr.write(`  ${u.market_id ?? '?'}: ${u.why}\n`);
+      markets.push(...genericDecoded.markets);
+    }
     for (const day of days) {
       const loaded = await loadLocalDay({
         root: dataRoot, day, venue, eventsDir,
@@ -297,7 +336,9 @@ export async function cmdRun({ dir, flags }) {
       }
       markets.push(...loaded.markets);
     }
-    if (markets.length === 0) throw new Error('no market-days could be read from that archive');
+    if (markets.length === 0) {
+      throw new Error(generic ? 'no market of that dataset could be replayed (reasons above)' : 'no market-days could be read from that archive');
+    }
     // SESSION IS ONE STREAM ACROSS THE RANGE, so it is ordered once over every
     // day — the same thing fetchMarketDays does for the queue. Ordering it a day
     // at a time leaves the stream day-major, which is chronological only by
@@ -311,7 +352,8 @@ export async function cmdRun({ dir, flags }) {
     // entry per market, and a day of BTC 15-minute markets is ninety-six of them,
     // so counting entries reported a run as being a hundred times bigger than the
     // customer is charged for and disagreed with the queue's own coverage.
-    const marketDaysScanned = countMarketDays(markets);
+    // Generic data has no days: the unit is the market.
+    const marketDaysScanned = generic ? markets.length : countMarketDays(markets);
 
     const jobDir = await mkdtemp(path.join(tmpdir(), 'ot-run-'));
     try {
@@ -433,8 +475,8 @@ export async function cmdRun({ dir, flags }) {
       }]));
 
       const fillSummary = fillStats(base.fills);
-      const report = buildReport({
-        runId: `local_${days[0]}`,
+      let report = buildReport({
+        runId: generic ? 'local_generic' : `local_${days[0]}`,
         submittedAt: 0,
         manifest,
         // Local runs have no stored submission to hash, and saying null is
@@ -491,6 +533,14 @@ export async function cmdRun({ dir, flags }) {
         }),
         budget: base.result.budget,
       });
+      if (generic) {
+        report = applyGenericExtras(report, genericReportExtras({
+          trades: base.trades,
+          markets,
+          unusable: genericDecoded.unusable,
+          counts: genericDecoded.counts,
+        }));
+      }
 
       if (flags.json) {
         process.stdout.write(`${JSON.stringify(report)}\n`);

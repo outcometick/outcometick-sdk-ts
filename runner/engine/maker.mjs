@@ -274,6 +274,9 @@ export class MakerBook {
   activate(rec, ts, book) {
     if (rec.state !== 'pending') return;
     const eff = this.pf.normalize(rec.order, this.marketId);
+    // The engine's side from here on: on a generic market the order may have
+    // named it by label (Portfolio.sideOf). Identical for archive markets.
+    if (eff) rec.side = eff.side;
     const limit = eff?.limit;
     const ticks = limit == null ? null : toTicks(limit);
     // A resting order needs a price to rest at, on the venue's grid, strictly
@@ -388,6 +391,8 @@ export class MakerBook {
       for (const side of ['UP', 'DOWN']) if (ev.levels?.[side] != null) this.tokenTs[side] = ev.ts_ms;
     } else if (ev.side === 'UP' || ev.side === 'DOWN') {
       this.tokenTs[ev.side] = ev.ts_ms;
+      // A mirrored delta (generic single-book data) updates both tokens.
+      if (ev.mirror === true) this.tokenTs[ev.side === 'UP' ? 'DOWN' : 'UP'] = ev.ts_ms;
     }
     if (!this.tracking()) { apply(); return; }
     // Only the canonical (UP) ladders matter, and most events cannot touch

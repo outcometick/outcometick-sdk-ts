@@ -459,10 +459,22 @@ export class MarketReplay {
      * Absent or not allowed, a gtc order aborts the run with `refusal`.
      */
     resting = null,
+    /**
+     * Generic markets only: the decoder's terminal mark for an UNRESOLVED
+     * market (`{UP, DOWN, source, ts_ms, age_ms}` or `{none}`). Kept here and
+     * never on the market record a hook is handed — it is a future fact.
+     */
+    terminal = null,
   }) {
     this.marketId = market.market_id;
+    // generic-data.mjs. Every branch that differs from the archive path is
+    // keyed on this; archive records carry no `kind` and take exactly the
+    // code they always took.
+    this.generic = market.kind === 'generic';
+    this.terminal = this.generic ? terminal : null;
     this.pf = portfolio ?? new Portfolio({ feeBps });
     this.pf.setMarketFee(this.marketId, market.fee ?? null);
+    if (this.generic) this.pf.setMarketLabels(this.marketId, market.labels);
     this.book = new Book(this.marketId);
     this.monitor = budget ?? new BudgetMonitor();
     this.strategy = strategy;
@@ -514,6 +526,15 @@ export class MarketReplay {
     // than peeked.
     this.declaredClose = this.market.close_ts_ms ?? null;
     this.closeTs = this.declaredClose ?? Number.POSITIVE_INFINITY;
+    if (this.generic) {
+      // Two instants, not one: trading ends at trade_until (the decoder already
+      // dropped every event after it), and a resolved market pays at its
+      // resolution time — declaredClose — which can be later.
+      this.tradeUntil = this.market.trade_until_ts_ms;
+      this.closeTs = this.tradeUntil;
+      this.tradingEnded = false;
+      this.closed = null;
+    }
     this.seen = 0;
     this.lastTs = 0;
     this.ended = false;
@@ -534,6 +555,7 @@ export class MarketReplay {
    * carrying the official outcome and strike".
    */
   #preSettleMarket() {
+    if (this.generic) return genericView(this.market);
     const { outcome, ...rest } = this.market;
     return rest;
   }
@@ -602,6 +624,13 @@ export class MarketReplay {
       // it decided later — latency that only applied to the decision, not to
       // its content.
       const order = typeof raw === 'object' ? { ...raw } : raw;
+      // A side NAMED but not this market's: stop, loudly. Counting it as one
+      // rejected order hid a misspelt side in a run that simply never traded.
+      if (typeof order?.side === 'string' && this.pf.sideOf(order.side, this.marketId) == null) {
+        const labels = this.pf.marketLabels.get(this.marketId);
+        throw new RunAbort('E_RUNTIME', `order side ${JSON.stringify(order.side)} is not "UP" or "DOWN"${
+          labels ? ` or an outcome of this market (${labels.map((l) => JSON.stringify(l)).join(', ')})` : ''}`);
+      }
       const tif = order.tif ?? 'ioc';
       if (tif === 'gtc') {
         this.#submitResting(order, ts);
@@ -668,9 +697,11 @@ export class MarketReplay {
       // would otherwise be applied as a delta with no ladder, no price and no
       // size — which Book.delta rejects by throwing, taking the whole run with
       // it.
+      const generic = this.generic;
       const apply = () => {
-        if (ev.bbo) this.book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask);
+        if (ev.bbo) this.book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask, generic ? { inclusive: true } : undefined);
         else if (ev.snapshot) this.book.snapshot(ev.ts_ms, ev.levels);
+        else if (generic && ev.mirror === true) this.book.deltaMirrored(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
         else this.book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
       };
       if (maker) maker.bookEvent(ev, this.book, apply);
@@ -706,7 +737,56 @@ export class MarketReplay {
     return true;
   }
 
+  /**
+   * Generic markets: trading ends. Everything scheduled up to trade_until
+   * executes, resting orders expire and their short markouts resolve against
+   * the book as it stood, the rest is dropped — and an unresolved market's
+   * open legs are valued at the decoder's mark. Idempotent: session mode calls
+   * it at trade_until and close() calls it again.
+   * MUST MATCH end_trading in otreplay.py.
+   */
+  endTrading() {
+    if (!this.generic || this.tradingEnded) return;
+    this.tradingEnded = true;
+    this.ended = true;
+    const ts = this.tradeUntil;
+    this.control.setNow(ts);
+    this.drainUntil(ts);
+    if (this.maker) this.maker.close(ts, this.book);
+    this.pending.length = 0;
+    this.marked = this.market.outcome ? [] : this.pf.mark(this.marketId, this.terminal, ts);
+  }
+
+  /** Generic markets: end trading if not yet, then pay out (resolved) or finish (marked). */
+  #closeGeneric() {
+    if (this.closed) return this.closed;
+    this.endTrading();
+    const outcome = this.market.outcome;
+    const settleTs = this.declaredClose;
+    this.control.setNow(settleTs);
+    let settled = this.marked;
+    if (outcome) {
+      // A venue settlement: on_settle is for that and only that.
+      this.#call('on_settle', { ...genericView(this.market), outcome, resolved_ts_ms: this.market.resolved_ts_ms }, outcome);
+      settled = this.pf.settle(this.marketId, outcome, settleTs);
+    }
+    if (this.maker) this.maker.releaseRows(outcome ? (side) => contractValue(side, outcome) : null);
+    this.closed = {
+      marketId: this.marketId,
+      asset: null,
+      events: this.seen,
+      settled,
+      logs: this.control.logs,
+      logTruncated: this.control.logTruncated,
+      crosschecks: this.control.crosschecks,
+      budget: this.monitor.summary(),
+      maker: this.maker ? this.maker.stats : null,
+    };
+    return this.closed;
+  }
+
   close() {
+    if (this.generic) return this.#closeGeneric();
     // Anything still queued lands AT THE CLOSE — not at its own future
     // timestamp. Draining to Infinity executed a delayed order stamped after the
     // market had already closed, producing trade rows with opened_ms later than
@@ -743,6 +823,30 @@ export class MarketReplay {
       maker: this.maker ? this.maker.stats : null,
     };
   }
+}
+
+/**
+ * What a hook sees of a GENERIC market before it settles: a fresh deep copy of
+ * a whitelist. Not "the record minus outcome" — the record carries more than
+ * one future fact (resolution time and source, a trading end derived from the
+ * resolution), and a nested object handed over by reference could be written
+ * to. MUST MATCH generic_view in otreplay.py.
+ */
+const GENERIC_VIEW = [
+  'market_id', 'kind', 'venue', 'question', 'slug', 'token_ids', 'labels', 'fee',
+  'tick_size', 'min_size', 'trading_end_ts_ms', 'open_ts_ms',
+];
+
+export function genericView(market) {
+  const out = {};
+  for (const k of GENERIC_VIEW) {
+    const v = market[k];
+    out[k] = v == null ? null : (typeof v === 'object' ? JSON.parse(JSON.stringify(v)) : v);
+  }
+  // The name archive strategies read. Only a DECLARED trading end — never one
+  // derived from the resolution, which would date the outcome.
+  out.close_ts_ms = market.trading_end_ts_ms ?? null;
+  return out;
 }
 
 /**

@@ -281,6 +281,15 @@ const FILL_COLUMNS = [
   'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle',
 ];
 
+// A generic-data run (report.data_kind === 'generic') appends these; an
+// archive run's files keep exactly the columns above.
+const GENERIC_TRADE_COLUMNS = [
+  ...TRADE_COLUMNS, 'label', 'mark_px', 'marked_size', 'marked_pnl', 'mark_source',
+  'mark_ts_ms', 'mark_age_ms', 'mark_missing',
+];
+const GENERIC_FILL_COLUMNS = [...FILL_COLUMNS, 'label'];
+const isGeneric = (report) => report?.data_kind === 'generic';
+
 /** One CSV line in the format toCsv writes. */
 const csvLine = (row, columns) => columns.map((c) => csvField(row[c])).join(',');
 
@@ -342,7 +351,7 @@ export async function writeArchive({ outPath, report, trades, fillsCsv, logs }) 
   try {
     const tradesCsv = path.join(scratch, 'trades.csv');
     const equityCsv = path.join(scratch, 'equity.csv');
-    await writeCsvFile(tradesCsv, trades, TRADE_COLUMNS);
+    await writeCsvFile(tradesCsv, trades, isGeneric(report) ? GENERIC_TRADE_COLUMNS : TRADE_COLUMNS);
     // FROM THE FULL TRADE LIST, not report.equity — that one is thinned for
     // the page. Same rows and rounding the report used to carry in full.
     await writeCsvFile(equityCsv, fullEquity(trades), ['ts_ms', 'equity']);
@@ -387,7 +396,7 @@ export async function buildArchive({ report, trades, fills, logs }) {
   const dir = await mkdtemp(path.join(tmpdir(), 'ot-archive-'));
   try {
     const fillsCsv = path.join(dir, 'fills.csv');
-    await writeCsvFile(fillsCsv, fills ?? [], FILL_COLUMNS);
+    await writeCsvFile(fillsCsv, fills ?? [], isGeneric(report) ? GENERIC_FILL_COLUMNS : FILL_COLUMNS);
     const outPath = path.join(dir, 'report.zip');
     await writeArchive({ outPath, report, trades, fillsCsv, logs });
     return await readFile(outPath);

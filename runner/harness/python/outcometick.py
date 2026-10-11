@@ -48,8 +48,9 @@ class Order:
 
     def __init__(self, side, size=None, limit=None, hold_s=None, reduce_only=False,
                  tif="ioc", tag=None, notional=None, post_only=False, client_id=None):
-        if side not in SIDES:
-            raise ValueError(f'side must be "UP" or "DOWN", got {side!r}')
+        # "UP" / "DOWN", or an outcome label on generic data -- see index.mjs.
+        if side not in SIDES and not (isinstance(side, str) and side.strip() != ""):
+            raise ValueError(f'side must be "UP", "DOWN" or an outcome label, got {side!r}')
         # SIZING IN MONEY -- this is about the `notional` argument below.
         # `size` is CONTRACTS (see OrderSizing in index.d.ts); it is not
         # money, and reading this heading as if it were is the one wrong

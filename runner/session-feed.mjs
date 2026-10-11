@@ -43,7 +43,17 @@ function lineTime(line, lags) {
   return ts;
 }
 
-/** A binary heap of market cursors, ordered by (time, phase, market index). */
+/** A generic event line's global input sequence (runner/generic-data.mjs). */
+function lineSeq(line) {
+  const m = /"seq"\s*:\s*(-?\d+)/.exec(line);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * A binary heap of market cursors, ordered by (time, phase, s, market index).
+ * `s` is 0 for every archive cursor — so the archive order is exactly (time,
+ * phase, market index) — and the global input sequence for a generic event.
+ */
 class CursorHeap {
   constructor() { this.a = []; }
 
@@ -52,7 +62,10 @@ class CursorHeap {
   peek() { return this.a[0]; }
 
   static less(x, y) {
-    return x.t < y.t || (x.t === y.t && (x.phase < y.phase || (x.phase === y.phase && x.k < y.k)));
+    if (x.t !== y.t) return x.t < y.t;
+    if (x.phase !== y.phase) return x.phase < y.phase;
+    if (x.s !== y.s) return x.s < y.s;
+    return x.k < y.k;
   }
 
   push(c) {
@@ -107,13 +120,43 @@ class CursorHeap {
  * order, then closings — so a market can trade on the instant it opens, and
  * every event stamped at a market's close reaches it before it settles.
  */
-export async function* sessionLines(markets, { linesOf, headerOf }) {
+export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = null }) {
   const heap = new CursorHeap();
   const openAt = (m) => {
     const v = m?.market?.open_ts_ms;
     return typeof v === 'number' && Number.isFinite(v) ? v : Number.NEGATIVE_INFINITY;
   };
   let next = 0;
+
+  /**
+   * A GENERIC market (runner/generic-data.mjs) is read as a stream, one line of
+   * look-ahead, so a months-long market is never held whole. Its lifecycle has
+   * two closing instants: `end` at trade_until (phase 2), then `close` at its
+   * settlement (phase 3). Events tie-break on the global input sequence.
+   */
+  const advanceGeneric = async (c) => {
+    const nx = await c.it.next();
+    if (!nx.done) {
+      const line = nx.value;
+      const t = lineTime(line, null);
+      if (Number.isFinite(t) && t > c.run) c.run = t;
+      c.line = line;
+      c.t = c.run;
+      c.phase = 1;
+      c.s = lineSeq(line);
+    } else if (!c.endSent) {
+      c.line = null;
+      c.t = Math.max(c.endAt, c.run);
+      c.phase = 2;
+      c.s = 0;
+    } else {
+      c.line = null;
+      c.t = Math.max(c.closeAt, c.t);
+      c.phase = 3;
+      c.s = 0;
+    }
+    heap.push(c);
+  };
 
   const advance = (c) => {
     if (c.i < c.lines.length) {
@@ -124,6 +167,7 @@ export async function* sessionLines(markets, { linesOf, headerOf }) {
       c.t = c.closeAt;
       c.phase = 2;
     }
+    c.s = 0;
     heap.push(c);
   };
 
@@ -134,6 +178,24 @@ export async function* sessionLines(markets, { linesOf, headerOf }) {
       const m = markets[next];
       next += 1;
       const header = headerOf(m);
+      if (m?.market?.kind === 'generic') {
+        if (!cursorOf) throw new Error('a generic market needs a streaming cursor (cursorOf)');
+        yield JSON.stringify({ open: { i: k, ...header } });
+        await advanceGeneric({
+          k,
+          generic: true,
+          it: cursorOf(m)[Symbol.asyncIterator](),
+          run: openAt(m),
+          endAt: m.market.trade_until_ts_ms,
+          closeAt: m.market.close_ts_ms,
+          endSent: false,
+          line: null,
+          t: 0,
+          phase: 0,
+          s: 0,
+        });
+        continue;
+      }
       const lines = await linesOf(m);
       const lags = header.lags ?? null;
       // Each line's time, made monotone within the market: the stream is
@@ -155,6 +217,19 @@ export async function* sessionLines(markets, { linesOf, headerOf }) {
     }
     if (top == null) break;
     const c = heap.pop();
+    if (c.generic) {
+      if (c.phase === 1) {
+        yield `{"i":${c.k},"e":${c.line}}`;
+      } else if (c.phase === 2) {
+        yield `{"end":${c.k}}`;
+        c.endSent = true;
+      } else {
+        yield `{"close":${c.k}}`;
+        continue;
+      }
+      await advanceGeneric(c);
+      continue;
+    }
     if (c.phase === 2) {
       yield `{"close":${c.k}}`;
       continue;

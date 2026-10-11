@@ -79,6 +79,16 @@ _TICKS: dict = {}
 _first = operator.itemgetter(0)
 
 
+def js_to_fixed10(x: float) -> float:
+    """`Number(x.toFixed(10))`: ties away from zero on the exact binary value.
+
+    Python's round() is half-even and 1/2048 is an exact tie at ten digits, so
+    the rule is reproduced, not approximated. MUST MATCH mirror() in events.mjs.
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    return float(Decimal(x).quantize(Decimal(1).scaleb(-10), rounding=ROUND_HALF_UP)) + 0.0
+
+
 def to_ticks(px: float) -> int:
     t = _TICKS.get(px)
     if t is None:
@@ -142,7 +152,7 @@ class Ladder:
             j -= 1
         self.levels.insert(j, [ticks, n, ts])
 
-    def prune(self, bound: float | None, ts: int) -> int:
+    def prune(self, bound: float | None, ts: int, inclusive: bool = False) -> int:
         """Delete every level STRICTLY BETTER than `bound` that is older than `ts`.
 
         The whole of what the unthrottled top-of-book stream may do. It carries
@@ -181,7 +191,8 @@ class Ladder:
         kept = []
         removed = 0
         for level in self.levels:
-            if self._worse(level[0], cap) < 0 and level[2] < ts:
+            # `inclusive`: generic data only -- see Ladder.prune in book.mjs.
+            if self._worse(level[0], cap) < 0 and (level[2] <= ts if inclusive else level[2] < ts):
                 removed += 1
                 continue
             kept.append(level)
@@ -273,7 +284,7 @@ class Book:
             raise ValueError(f"unknown ladder {kind}")
         self.ladders[side][kind].apply(px, size, ts)
 
-    def bbo(self, ts: int, side: str, bid: float | None, ask: float | None) -> int:
+    def bbo(self, ts: int, side: str, bid: float | None, ask: float | None, inclusive: bool = False) -> int:
         """Apply an unthrottled top-of-book bound. DELETES ONLY.
 
         `bid` and `ask` are prices with no size behind them, so they can shrink
@@ -290,7 +301,19 @@ class Book:
         if side not in SIDES:
             raise ValueError(f"unknown side {side}")
         lad = self.ladders[side]
-        return lad["asks"].prune(ask, ts) + lad["bids"].prune(bid, ts)
+        return lad["asks"].prune(ask, ts, inclusive) + lad["bids"].prune(bid, ts, inclusive)
+
+    def delta_mirrored(self, ts: int, side: str, kind: str, px: float, size: float) -> None:
+        """A single-book delta applied to BOTH tokens in one step.
+
+        MUST MATCH Book.deltaMirrored in runner/engine/book.mjs.
+        """
+        self.delta(ts, side, kind, px, size)
+        other = "DOWN" if side == "UP" else "UP"
+        m = js_to_fixed10(1 - px)
+        if not (0 <= m <= 1):
+            return
+        self.delta(ts, other, "bids" if kind == "asks" else "asks", m, size)
 
     def best(self, side: str) -> float | None:
         """The price to BUY that outcome at — the best ask."""
@@ -441,6 +464,33 @@ class Portfolio:
         self.cash = 0.0
         self.fees_paid = 0.0
         self.rejected = 0
+        # Generic markets only: outcome labels by index. See portfolio.mjs.
+        self.market_labels: dict[str, tuple] = {}
+        self.marked_value = 0.0
+
+    def set_market_labels(self, market_id: str, labels) -> None:
+        """MUST MATCH setMarketLabels in portfolio.mjs."""
+        if isinstance(labels, (list, tuple)) and len(labels) == 2:
+            self.market_labels[market_id] = (str(labels[0]), str(labels[1]))
+
+    def side_of(self, side, market_id: str):
+        """UP/DOWN, or a label on a market with labels; else None. MUST MATCH sideOf."""
+        if isinstance(side, str) and side in SIDES:
+            return side
+        labels = self.market_labels.get(market_id)
+        if labels is None or not isinstance(side, str):
+            return None
+        s = side.strip().lower()
+        if s == labels[0].strip().lower():
+            return "UP"
+        if s == labels[1].strip().lower():
+            return "DOWN"
+        return None
+
+    def _label(self, market_id, side, row) -> None:
+        labels = self.market_labels.get(market_id)
+        if labels is not None:
+            row["label"] = labels[0 if side == "UP" else 1]
 
     def _legs(self, market_id: str) -> dict[str, Leg]:
         legs = self.legs.get(market_id)
@@ -491,11 +541,12 @@ class Portfolio:
 
     def normalize(self, order: dict, market_id: str):
         """The one validator. MUST MATCH normalize in portfolio.mjs."""
-        if not isinstance(order, dict) or order.get("side") not in SIDES:
+        side = self.side_of(order.get("side"), market_id) if isinstance(order, dict) else None
+        if side is None:
             self.rejected += 1
             return None
 
-        leg = self._legs(market_id)[order["side"]]
+        leg = self._legs(market_id)[side]
 
         # ONE PLACE THAT DECIDES WHETHER AN ORDER IS USABLE.
         # Mirrors portfolio.mjs line for line -- see the reasoning there. Every
@@ -561,7 +612,7 @@ class Portfolio:
         # notional-only order produced a row whose `requested` was NaN, which
         # the parser dropped. The fill happened; only its record vanished.
         # Mirrors portfolio.mjs.
-        return {**order, "size": size, "limit": limit}
+        return {**order, "side": side, "size": size, "limit": limit}
 
     def execute_effective(self, book: Book, order: dict, ts: int, market_id: str,
                           tag: str | None = None, how: str = "exit", order_id: str | None = None):
@@ -609,6 +660,7 @@ class Portfolio:
         }
         if extra:
             row.update(extra)
+        self._label(market_id, side, row)
         self.fills.append(row)
         return row
 
@@ -648,7 +700,7 @@ class Portfolio:
         return realised
 
     def _fill_row(self, ts, market_id, order, res, tag, realised, fee, order_id=None) -> dict:
-        return {
+        row = {
             "ts_ms": ts,
             "market_id": market_id,
             "side": order.get("side"),
@@ -666,6 +718,8 @@ class Portfolio:
             "liquidity": "taker",
             "order_id": order_id,
         }
+        self._label(market_id, order.get("side"), row)
+        return row
 
     def _close_trade(self, market_id, leg: Leg, ts, how, **extra) -> None:
         row = {
@@ -681,6 +735,7 @@ class Portfolio:
             "how": how,
         }
         row.update(extra)
+        self._label(market_id, leg.side, row)
         self.trades.append(row)
         leg.reset()
 
@@ -702,6 +757,46 @@ class Portfolio:
             self.cash += value
             before = len(self.trades)
             self._close_trade(market_id, leg, ts, "settled", outcome=outcome)
+            closed.append(self.trades[before])
+            leg.size = 0.0
+            leg.cost = 0.0
+        return closed
+
+    def mark(self, market_id: str, terminal, ts: int) -> list[dict]:
+        """Value an UNRESOLVED market's open legs at its mark; cash unchanged.
+
+        MUST MATCH Portfolio.mark in portfolio.mjs.
+        """
+        legs = self.legs.get(market_id)
+        if not legs:
+            return []
+        closed = []
+        valued = isinstance(terminal, dict) and terminal.get("none") is None
+        for side in SIDES:
+            leg = legs[side]
+            if leg.size <= EPS:
+                continue
+            v = terminal.get(side) if valued else None
+            px = v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+            q = leg.size
+            basis = leg.cost
+            value = 0 if px is None else px * q
+            leg.realised += value - basis
+            leg.exit_size += q
+            leg.exit_notional += value
+            self.marked_value += value
+            before = len(self.trades)
+            self._close_trade(
+                market_id, leg, ts, "marked",
+                outcome=None,
+                mark_px=px,
+                marked_size=q,
+                marked_pnl=value - basis,
+                mark_source=terminal.get("source") if valued else None,
+                mark_ts_ms=terminal.get("ts_ms") if valued else None,
+                mark_age_ms=terminal.get("age_ms") if valued else None,
+                mark_missing=None if valued else ((terminal or {}).get("none") or "no_quote"),
+            )
             closed.append(self.trades[before])
             leg.size = 0.0
             leg.cost = 0.0

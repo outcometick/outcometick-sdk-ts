@@ -140,6 +140,41 @@ export class Portfolio {
     this.feesPaid = 0;
     /** Orders that could not be sized or sided — reported, never silent. */
     this.rejected = 0;
+    /**
+     * Generic markets only (generic-data.mjs): outcome labels by index, e.g.
+     * ['Yes', 'No']. An order may name its side by label, and every row of
+     * such a market carries the label. Archive markets have none.
+     */
+    this.marketLabels = new Map();
+    /** Value of positions closed at a mark (pf.mark): never cash. */
+    this.markedValue = 0;
+  }
+
+  /** MUST MATCH set_market_labels in otengine.py. */
+  setMarketLabels(marketId, labels) {
+    if (Array.isArray(labels) && labels.length === 2) {
+      this.marketLabels.set(marketId, Object.freeze([String(labels[0]), String(labels[1])]));
+    }
+  }
+
+  /**
+   * An order's side as the engine's UP/DOWN: UP/DOWN themselves, or — on a
+   * market with labels — a label, matched exactly after trimming and
+   * case-folding. Anything else is null (counted by the caller).
+   */
+  sideOf(side, marketId) {
+    if (isSide(side)) return side;
+    const labels = this.marketLabels.get(marketId);
+    if (!labels || typeof side !== 'string') return null;
+    const s = side.trim().toLowerCase();
+    if (s === labels[0].trim().toLowerCase()) return 'UP';
+    if (s === labels[1].trim().toLowerCase()) return 'DOWN';
+    return null;
+  }
+
+  #label(marketId, side) {
+    const labels = this.marketLabels.get(marketId);
+    return labels ? { label: labels[side === 'UP' ? 0 : 1] } : null;
   }
 
   #legs(marketId) {
@@ -214,9 +249,10 @@ export class Portfolio {
    * IOC is refused as a resting order. MUST MATCH normalize in otengine.py.
    */
   normalize(order, marketId) {
-    if (!isSide(order?.side)) { this.rejected += 1; return null; }
+    const side = this.sideOf(order?.side, marketId);
+    if (side == null) { this.rejected += 1; return null; }
 
-    const leg = this.#legs(marketId)[order.side];
+    const leg = this.#legs(marketId)[side];
 
     // ONE PLACE THAT DECIDES WHETHER AN ORDER IS USABLE.
     //
@@ -298,7 +334,7 @@ export class Portfolio {
     // as NaN for a notional-only order — the fill was executed (the fee was
     // identical) but the ROW was rejected by the parser and never emitted, so
     // the run silently lost its fill log. otengine.py does the same.
-    return { ...order, size, limit };
+    return { ...order, side, size, limit };
   }
 
   /** Take liquidity for an order `normalize` already accepted. */
@@ -351,6 +387,7 @@ export class Portfolio {
       liquidity: 'maker',
       order_id: orderId,
       ...(extra ?? {}),
+      ...this.#label(marketId, side),
     };
     this.fills.push(row);
     return row;
@@ -412,6 +449,7 @@ export class Portfolio {
       tag: tag ?? order.tag ?? null,
       liquidity: 'taker',
       order_id: orderId,
+      ...this.#label(marketId, order.side),
     };
   }
 
@@ -428,6 +466,7 @@ export class Portfolio {
       closed_ms: ts,
       how,
       ...extra,
+      ...this.#label(marketId, leg.side),
     });
     leg.reset();
   }
@@ -454,6 +493,56 @@ export class Portfolio {
 
       const before = this.trades.length;
       this.#closeTrade(marketId, leg, ts, 'settled', { outcome });
+      closed.push(this.trades[before]);
+
+      leg.size = 0;
+      leg.cost = 0;
+    }
+    return closed;
+  }
+
+  /**
+   * Value every open leg of an UNRESOLVED market at its terminal mark.
+   *
+   * Not settle() with another price: nothing was sold and nothing paid out,
+   * so `cash` does not move. The round trip still closes the way settle()
+   * closes it — size and exit_px describe the whole round trip — and the
+   * valued part is kept apart in `marked_pnl` so a report can say how much
+   * of the result is a valuation rather than money.
+   *
+   * `terminal` is `{UP, DOWN, source, ts_ms, age_ms}` (marks from external
+   * data only, computed by the decoder) or `{none: reason}`: with no mark a
+   * leg is valued at 0, the loss bound for a long-only position.
+   * MUST MATCH mark in otengine.py.
+   */
+  mark(marketId, terminal, ts) {
+    const legs = this.legs.get(marketId);
+    if (!legs) return [];
+    const closed = [];
+    const valued = terminal && terminal.none == null;
+    for (const side of ['UP', 'DOWN']) {
+      const leg = legs[side];
+      if (leg.size <= EPS) continue;
+      const px = valued && typeof terminal[side] === 'number' ? terminal[side] : null;
+      const q = leg.size;
+      const basis = leg.cost;
+      const value = px == null ? 0 : px * q;
+      leg.realised += value - basis;
+      leg.exitSize += q;
+      leg.exitNotional += value;
+      this.markedValue += value;
+
+      const before = this.trades.length;
+      this.#closeTrade(marketId, leg, ts, 'marked', {
+        outcome: null,
+        mark_px: px,
+        marked_size: q,
+        marked_pnl: value - basis,
+        mark_source: valued ? terminal.source ?? null : null,
+        mark_ts_ms: valued ? terminal.ts_ms ?? null : null,
+        mark_age_ms: valued ? terminal.age_ms ?? null : null,
+        mark_missing: valued ? null : (terminal?.none ?? 'no_quote'),
+      });
       closed.push(this.trades[before]);
 
       leg.size = 0;

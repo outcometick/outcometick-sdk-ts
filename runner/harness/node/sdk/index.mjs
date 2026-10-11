@@ -40,8 +40,11 @@ export class Order {
   constructor({ side, size, notional = null, limit = null, holdS = null, hold_s = null,
     reduceOnly = false, reduce_only = false, tif = 'ioc', tag = null,
     postOnly = false, post_only = false, clientId = null, client_id = null } = {}) {
-    if (!SIDES.includes(side)) {
-      throw new Error(`side must be "UP" or "DOWN", got ${JSON.stringify(side)}`);
+    // "UP" / "DOWN", or — on your own data for any binary market — one of the
+    // market's outcome labels ("Yes", "No", a team name). The runner checks
+    // the label against the market and stops the run on one it does not have.
+    if (!SIDES.includes(side) && !(typeof side === 'string' && side.trim() !== '')) {
+      throw new Error(`side must be "UP", "DOWN" or an outcome label, got ${JSON.stringify(side)}`);
     }
     // Both spellings accepted: the docs use holdS in the Node examples and
     // hold_s is the wire field. Neither should be a trap.
