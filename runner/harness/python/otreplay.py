@@ -509,14 +509,16 @@ class MarketReplay:
             maker.finalize(ts)
             maker.resolve_markouts(ts, self.book)
 
-        if ev.get("kind") == "book":
+        kind = ev.get("kind")
+        bbo = ev.get("bbo")
+        if kind == "book":
             # BEFORE the snapshot test, because a bound carries snapshot:false
             # and would otherwise be applied as a delta with no ladder, no price
             # and no size -- which Book.delta rejects by raising, taking the
             # whole run with it. MUST MATCH the same ordering in
             # runner/engine/replay.mjs.
             def apply():
-                if ev.get("bbo"):
+                if bbo:
                     self.book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"))
                 elif ev.get("snapshot"):
                     self.book.snapshot(ts, ev.get("levels") or {})
@@ -526,12 +528,12 @@ class MarketReplay:
                 maker.book_event(ev, self.book, apply)
             else:
                 apply()
-        elif ev.get("kind") == "trade" and maker is not None:
+        elif kind == "trade" and maker is not None:
             maker.trade(ev, self.book)
         self.drain_until(ts)
 
         ev_rec = Rec(ev)
-        if ev.get("kind") == "tick":
+        if kind == "tick":
             # A separate copy from the one the hook is handed -- see the
             # matching comment in replay.mjs.
             state["history"].append(Rec(ev))
@@ -540,7 +542,7 @@ class MarketReplay:
         # event has no levels/ladder/px/size, the stream is unthrottled, and
         # ctx.book() is live so the next real event already sees the refined
         # ladder. Full reasoning in replay.mjs; both engines or neither.
-        hook = None if ev.get("bbo") else HOOK_FOR.get(ev.get("kind"))
+        hook = None if bbo else HOOK_FOR.get(kind)
         if hook and self.hooks.get(hook):
             self._emit(self._call(hook, ev_rec), ts)
         self._check_budget()

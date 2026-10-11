@@ -253,26 +253,32 @@ class MakerBook:
                 self.ledger[kind] = [e for e in led if e[0] + self.lag >= T]
 
     def tracking(self) -> bool:
-        return any(o.state in ("live", "cancel_pending") for o in self.open)
+        # A plain loop: this runs on every book event and trade.
+        for o in self.open:
+            if o.state == "live" or o.state == "cancel_pending":
+                return True
+        return False
 
     def book_event(self, ev: dict, book, apply) -> None:
-        if ev.get("snapshot"):
+        snapshot = ev.get("snapshot")
+        side = ev.get("side")
+        if snapshot:
             levels = ev.get("levels") or {}
-            for side in ("UP", "DOWN"):
-                if levels.get(side) is not None:
-                    self.token_ts[side] = ev["ts_ms"]
-        elif ev.get("side") in ("UP", "DOWN"):
-            self.token_ts[ev["side"]] = ev["ts_ms"]
+            for s in ("UP", "DOWN"):
+                if levels.get(s) is not None:
+                    self.token_ts[s] = ev["ts_ms"]
+        elif side == "UP" or side == "DOWN":
+            self.token_ts[side] = ev["ts_ms"]
         if not self.tracking():
             apply()
             return
         # Only events that can change the UP ladders -- see bookEvent in maker.mjs.
-        touches_up = (ev.get("levels") or {}).get("UP") is not None if ev.get("snapshot") else ev.get("side") == "UP"
+        touches_up = (ev.get("levels") or {}).get("UP") is not None if snapshot else side == "UP"
         if not touches_up:
             apply()
             return
         T = ev["ts_ms"]
-        if not ev.get("snapshot") and not ev.get("bbo"):
+        if not snapshot and not ev.get("bbo"):
             kind = ev.get("ladder")
             px = ev.get("px")
             if kind not in ("asks", "bids") or not _num(px):

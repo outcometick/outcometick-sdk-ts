@@ -21,6 +21,7 @@ is the only rounding this module uses.
 from __future__ import annotations
 
 import math
+import operator
 
 from typing import Any, Callable, Iterable
 
@@ -70,8 +71,21 @@ def js_round(x: float) -> int:
     return f + 1 if x - f >= 0.5 else f
 
 
+# Prices repeat: a day of book events is tens of millions of to_ticks calls on
+# a few hundred distinct values. Cached by value, which is exact -- the result
+# is a pure function of px -- bounded, and NaN never enters (it equals nothing,
+# so every NaN would be a new key).
+_TICKS: dict = {}
+_first = operator.itemgetter(0)
+
+
 def to_ticks(px: float) -> int:
-    return js_round(px * PRICE_SCALE)
+    t = _TICKS.get(px)
+    if t is None:
+        t = js_round(px * PRICE_SCALE)
+        if px == px and len(_TICKS) < 65536:
+            _TICKS[px] = t
+    return t
 
 
 def from_ticks(t: int) -> float:
@@ -105,7 +119,9 @@ class Ladder:
             px, size = entry[0], float(entry[1])
             if size > 0:
                 rows.append([to_ticks(float(px)), size, ts])
-        rows.sort(key=lambda r: r[0] * (1 if self.direction > 0 else -1))
+        # Best first. reverse=True keeps the sort stable (equal ticks stay in
+        # archive order), same as negating the key did.
+        rows.sort(key=_first, reverse=self.direction < 0)
         self.levels = rows
 
     def apply(self, px: float, size: float, ts: int = 0) -> None:

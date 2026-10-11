@@ -129,7 +129,8 @@ function runHarness({
           for (const line of merged) await write(line);
         }
       }
-      child.stdin.end();
+      // Through the writer, which flushes its last batch first.
+      await write.end();
     })().catch((err) => {
       streamError = err;
       child.stdin.destroy();

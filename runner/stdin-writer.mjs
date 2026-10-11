@@ -25,12 +25,32 @@
  */
 
 /**
- * @param {import('node:stream').Writable} stream
- * @returns {(line: string) => Promise<void>} resolves once the line is accepted
+ * Lines are BATCHED into ~64 KB writes. One write() per line was one write
+ * syscall per line on a real pipe: measured on the production worker, feeding
+ * one BTC market-day (5.9M lines, 808 MB) cost the worker 35 s of CPU into
+ * /dev/null and 73 s into a pipe, while the reader got ~320 bytes per read.
+ * The harness pulls lines one at a time from its own read buffer either way,
+ * and the pipe already holds 64 KB of future lines, so batching changes no
+ * isolation property — only how many syscalls carry the same bytes.
+ *
+ * Batching means lines can sit in this writer until the next flush, so the
+ * stream must be ended through `write.end()`, which flushes first. Ending the
+ * stream directly would drop the tail — and the "replayed fewer markets than
+ * it was fed" checks on both sides would refuse the run.
  */
-export function createLineWriter(stream) {
+export const WRITE_BATCH_CHARS = 64 * 1024;
+
+/**
+ * @param {import('node:stream').Writable} stream
+ * @param {{ batchChars?: number }} [opts] flush threshold; 0 = one write per line
+ * @returns {((line: string) => Promise<void>) & { end: () => Promise<void> }}
+ *   resolves once the line is accepted (buffered, or written with backpressure)
+ */
+export function createLineWriter(stream, { batchChars = WRITE_BATCH_CHARS } = {}) {
   let writeError = null;
   let wakeDrain = null;
+  let pending = '';
+  let ended = false;
 
   stream.on('error', (err) => {
     writeError = err;
@@ -39,21 +59,22 @@ export function createLineWriter(stream) {
     if (wake) wake();
   });
 
-  return (line) => new Promise((resolve, reject) => {
+  // Sequential by contract, and it says so rather than corrupting quietly.
+  // `wakeDrain` is a single slot: a second concurrent call would overwrite
+  // the first one's continuation, so that write would never settle and its
+  // line could interleave into the middle of another. Both callers await
+  // every line, and the framing (a market header, then that market's rows)
+  // only means anything in order — so this is a programming error, not a
+  // case to support.
+  const concurrent = () => new Error('createLineWriter: concurrent write; lines must be awaited one at a time');
+
+  const flush = () => new Promise((resolve, reject) => {
     if (writeError) { reject(writeError); return; }
-    // Sequential by contract, and it says so rather than corrupting quietly.
-    // `wakeDrain` is a single slot: a second concurrent call would overwrite
-    // the first one's continuation, so that write would never settle and its
-    // line could interleave into the middle of another. Both callers await
-    // every line, and the framing (a market header, then that market's rows)
-    // only means anything in order — so this is a programming error, not a
-    // case to support.
-    if (wakeDrain) {
-      reject(new Error('createLineWriter: concurrent write; lines must be awaited one at a time'));
-      return;
-    }
+    if (wakeDrain) { reject(concurrent()); return; }
+    const chunk = pending;
+    pending = '';
     // Respect backpressure: ignoring the return of write() is the whole bug.
-    if (stream.write(`${line}\n`)) { resolve(); return; }
+    if (!chunk || stream.write(chunk)) { resolve(); return; }
     wakeDrain = () => {
       stream.removeListener('drain', onDrain);
       if (writeError) reject(writeError);
@@ -66,4 +87,20 @@ export function createLineWriter(stream) {
     }
     stream.once('drain', onDrain);
   });
+
+  const write = (line) => {
+    if (writeError) return Promise.reject(writeError);
+    if (wakeDrain) return Promise.reject(concurrent());
+    if (ended) return Promise.reject(new Error('createLineWriter: write after end'));
+    pending += `${line}\n`;
+    return pending.length < batchChars ? Promise.resolve() : flush();
+  };
+  /** Flush what is buffered, then end the stream. */
+  write.end = async () => {
+    if (ended) return;
+    ended = true;
+    await flush();
+    stream.end();
+  };
+  return write;
 }

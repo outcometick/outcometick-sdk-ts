@@ -537,16 +537,18 @@ async function main() {
       return false;
     }
     m.seen += 1;
-    if (ev.kind === 'book') {
+    // This book exists only to find the opening quotes, so it stops being kept
+    // once they are known: the replay keeps its own, and applying every event
+    // to both was a second book's worth of work per event.
+    // MUST MATCH observe() in runner/harness/python/otharness.py.
+    if (ev.kind === 'book' && m.openQuotes === null) {
       if (ev.snapshot) m.summaryBook.snapshot(ev.ts_ms, ev.levels);
       else if (ev.side && ev.ladder) {
         m.summaryBook.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
       }
-      if (m.openQuotes === null) {
-        const up = m.summaryBook.best('UP');
-        const down = m.summaryBook.best('DOWN');
-        if (up != null && down != null) m.openQuotes = { up, down };
-      }
+      const up = m.summaryBook.best('UP');
+      const down = m.summaryBook.best('DOWN');
+      if (up != null && down != null) m.openQuotes = { up, down };
     }
     return true;
   };

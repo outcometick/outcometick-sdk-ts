@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.4.2';
+export const SDK_VERSION = '2.4.3';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -26,6 +26,11 @@ export const SDK_VERSION = '2.4.2';
  * runs the old harness under the new worker — and the failure is silent. The
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
+ *
+ * 1.21.2: no protocol change, no result change. Faster per event: the
+ * harness-side book stops once the opening quotes are known, the Python
+ * harness parses lines through the C scanner (json.loads fallback), and the
+ * Python engine caches to_ticks and drops repeated dict lookups.
  *
  * 1.21.1: no protocol change. The Node harness's built-in lock tames only
  * Object.prototype, Function.prototype, constructor statics, Math and Reflect
@@ -85,7 +90,7 @@ export const SDK_VERSION = '2.4.2';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.21.1';
+export const SANDBOX_IMAGE_TAG = '1.21.2';
 
 // ---------------------------------------------------------------------------
 // Languages

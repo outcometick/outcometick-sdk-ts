@@ -45,7 +45,24 @@ EXIT_BUDGET = 11
 
 # Bound before any submitted code runs (the harness imports this module first),
 # so a strategy that rebinds json.loads at import time cannot reach the stream.
-_LOADS = json.loads
+_JSON_LOADS = json.loads
+_SCAN = json.JSONDecoder().scan_once
+
+
+def _LOADS(s):
+    """json.loads, with the C scanner as a fast path.
+
+    json.loads wraps the scanner in two whitespace regex matches and a decode
+    call per line -- ~13 s of a BTC market-day. A line the scanner consumes
+    WHOLE, from index 0, is exactly what json.loads would return for it (the
+    default decoder, nothing before it, nothing after it); anything else goes
+    through json.loads itself, so every error and edge case is still its.
+    """
+    try:
+        obj, end = _SCAN(s, 0)
+    except (StopIteration, ValueError):
+        return _JSON_LOADS(s)
+    return obj if end == len(s) else _JSON_LOADS(s)
 
 # Our own JSON writer — the mirror of `stringify` in harness.mjs, and for the
 # same reason: the harness shares a process with the submitted code, so anything
@@ -190,11 +207,15 @@ class _Market:
             self.rows_for(ev.get("name")).append(row)
             return False
         self.seen += 1
-        if kind == "book" and ev.get("snapshot"):
-            self.book.snapshot(ev.get("ts_ms") or 0, ev.get("levels") or {})
-        elif kind == "book" and ev.get("side") and ev.get("ladder"):
-            self.book.delta(ev.get("ts_ms") or 0, ev["side"], ev["ladder"], ev.get("px"), ev.get("size"))
+        # This book exists only to find the opening quotes, so it stops being
+        # kept once they are known: the replay keeps its own, and applying
+        # every event to both was a second book's worth of work per event.
+        # MUST MATCH observe() in runner/harness/node/harness.mjs.
         if kind == "book" and self.open_quotes is None:
+            if ev.get("snapshot"):
+                self.book.snapshot(ev.get("ts_ms") or 0, ev.get("levels") or {})
+            elif ev.get("side") and ev.get("ladder"):
+                self.book.delta(ev.get("ts_ms") or 0, ev["side"], ev["ladder"], ev.get("px"), ev.get("size"))
             up, down = self.book.best("UP"), self.book.best("DOWN")
             if up is not None and down is not None:
                 self.open_quotes = (up, down)
