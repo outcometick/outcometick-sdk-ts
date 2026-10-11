@@ -27,6 +27,9 @@ export const SDK_VERSION = '2.4.3';
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
  *
+ * 1.21.3: no protocol change, no result change. The images ship no shell
+ * (sh/dash/bash deleted; build.sh fails the build if one survives).
+ *
  * 1.21.2: no protocol change, no result change. Faster per event: the
  * harness-side book stops once the opening quotes are known, the Python
  * harness parses lines through the C scanner (json.loads fallback), and the
@@ -90,7 +93,7 @@ export const SDK_VERSION = '2.4.3';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.21.2';
+export const SANDBOX_IMAGE_TAG = '1.21.3';
 
 // ---------------------------------------------------------------------------
 // Languages

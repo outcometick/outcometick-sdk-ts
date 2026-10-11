@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 4a5467b84c0a1e2aac9ab880e67042bf1cfb7dd9.
+  Generated from monorepo revision 3a41b4e7be04b1e419d932f0ea8ddf25c645dfb3.
 -->
 
 # outcometick
@@ -170,3 +170,4 @@ Full reference: https://outcometick.com/docs/sdk
 - [Run a backtest](https://outcometick.com/backtest) — paste a strategy, watch it run
 - [SDK reference](https://outcometick.com/docs/sdk) — manifest, hooks, `ctx`, limits
 - [Data API](https://outcometick.com/docs) — the archive these strategies read
+- [Discord](https://discord.gg/ZDMqkptwm5) (English and 中文) and [Telegram](https://t.me/+TcK_hJOzOz5mZTk1) — questions and strategy talk
