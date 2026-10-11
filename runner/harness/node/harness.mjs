@@ -19,7 +19,7 @@ import { pathToFileURL } from 'node:url';
 import { MarketReplay, makeLogBudget, BudgetMonitor, RunAbort } from '../../engine/replay.mjs';
 import { Book as BookCls } from '../../engine/book.mjs';
 import { buildFeeds } from '../../engine/feed.mjs';
-import { Portfolio } from '../../engine/portfolio.mjs';
+import { Portfolio, newOrderStats } from '../../engine/portfolio.mjs';
 import { rowPending, newMakerStats, addMakerStats } from '../../engine/maker.mjs';
 import { CHANNEL, RESULT_FD, EXIT } from '../protocol.mjs';
 
@@ -438,6 +438,11 @@ async function main() {
   };
   const logsOut = { write: (text) => emit(CHANNEL.log, text.replace(/\n/g, ' ').trimEnd()) };
 
+  // Execution options (job.engine) and the run-wide order counters they feed.
+  const engine = enginePolicy(job);
+  const orderStats = engine ? newOrderStats() : null;
+  const fillExtras = engineFillFields(engine);
+
   const result = {
     markets_run: 0,
     events_seen: 0,
@@ -453,6 +458,7 @@ async function main() {
 
   const finish = (code) => {
     result.budget = monitor.summary();
+    if (orderStats) result.orders = orderStats;
     // Projected like the rows: `result` is an ordinary object built AFTER
     // untrusted code has run, and Object.prototype.toJSON reaches every
     // ordinary object — so a captured stringify alone still let a strategy
@@ -488,9 +494,13 @@ async function main() {
   // sharded at all.
   const fees = feePolicy(job);
   const resting = restingPolicy(job);
+
   const session = job.mode === 'session';
-  const shared = session ? new Portfolio({ fees }) : null;
+  const shared = session ? new Portfolio({ fees, engine, orderStats }) : null;
   let sharedInstance = null;
+  // Global scheduler: the run's clock (MarketReplay `clock`), one for the whole
+  // session, one per market otherwise; advanced only by advanceClock.
+  const sessionClock = session ? { t: -Infinity } : null;
 
   /** What the loop tracks for one open market, besides the replay itself. */
   const newMarket = (entry) => {
@@ -531,6 +541,7 @@ async function main() {
       // the favourite is the dearer of the pair.
       openQuotes: null,
       rowsFor,
+      clock: sessionClock ?? { t: -Infinity },
     };
   };
 
@@ -568,7 +579,7 @@ async function main() {
   /** Build a market's replay and open it (on_market_open). */
   const start = (m) => {
     const { entry } = m;
-    const pf = shared ?? new Portfolio({ fees });
+    const pf = shared ?? new Portfolio({ fees, engine, orderStats });
     let instance;
     if (shared) {
       sharedInstance ??= new Klass();
@@ -607,8 +618,10 @@ async function main() {
       // Generic markets: the decoder's terminal mark. Lives on the header, not
       // on the market record, and only the replay holds it.
       terminal: entry.terminal ?? null,
+      engine,
+      clock: m.clock,
     });
-    m.replay.open();
+    m.replay.open(m.openTs ?? null);
   };
 
   /** Book-keeping once a market has been replayed and settled. */
@@ -658,6 +671,10 @@ async function main() {
     for (const line of out.logs) logsOut.write(`${prefix} ${line}\n`);
     for (const c of out.crosschecks) result.crosschecks.push(c);
     if (out.maker) result.maker = addMakerStats(result.maker ?? newMakerStats(), out.maker);
+    if (engine?.timers && out.timers) {
+      const t = result.timers ?? (result.timers = { created: 0, fired: 0, dropped: 0 });
+      for (const k of ['created', 'fired', 'dropped']) t[k] += out.timers[k] ?? 0;
+    }
 
     // Tracked as the stream went past rather than scanned afterwards: there
     // is no array left to scan, which is the point. The worker prices the
@@ -672,14 +689,14 @@ async function main() {
       stream: entry.stream ?? null,
     });
     if (!shared) {
-      flush(m.replay.pf, m.before, emit, entry.market.market_id);
+      flush(m.replay.pf, m.before, emit, entry.market.market_id, fillExtras);
       result.fees_paid += m.replay.pf.feesPaid;
     } else {
       // Session: everything the shared portfolio has written so far goes out
       // now, and the arrays are emptied. Its positions and running fee total
       // are untouched — only the append-only logs are drained — so a long
       // session holds one market's worth of rows, not the whole run's.
-      flush(shared, { trades: 0, fills: 0 }, emit, true);
+      flush(shared, { trades: 0, fills: 0 }, emit, true, fillExtras);
     }
   };
 
@@ -690,18 +707,19 @@ async function main() {
       // A budget breach kills the shard, and a strategy that throws is not
       // going to stop throwing on the next market. Either way the run is
       // over and nothing is billed.
-      if (shared) flush(shared, { trades: 0, fills: 0 }, emit, true);
-      else if (m?.replay) flush(m.replay.pf, m.before, emit, id);
+      if (shared) flush(shared, { trades: 0, fills: 0 }, emit, true, fillExtras);
+      else if (m?.replay) flush(m.replay.pf, m.before, emit, id, fillExtras);
       return finish(err.code === 'E_BUDGET' ? EXIT.budget : EXIT.rejected);
     }
     result.rejection = { code: 'E_RUNTIME', detail: `${id}: ${err?.message ?? err}` };
     return finish(EXIT.rejected);
   };
 
+  const global = engine?.scheduler === 'global';
   if (session) {
-    const code = runSession({ nextLine, newMarket, observe, start, finished, rejected, logsOut });
+    const code = runSession({ nextLine, newMarket, observe, start, finished, rejected, logsOut, global });
     if (code != null) return code;
-    flush(shared, { trades: 0, fills: 0 }, emit, null);
+    flush(shared, { trades: 0, fills: 0 }, emit, null, fillExtras);
     result.fees_paid = shared.feesPaid;
     return finish(EXIT.ok);
   }
@@ -718,7 +736,13 @@ async function main() {
       break;
     }
     const m = newMarket(entry);
+    m.openTs = entry.market?.open_ts_ms ?? null;
     const remaining = { n: entry.n ?? 0 };
+    const one = [{ m, k: 0 }];
+    // Global mode: the line's own time — a feed row becomes visible at its
+    // stamp plus its declared lag, exactly as the stream ordered it.
+    const lineTime = (ev) => ((ev.kind === 'ref' || ev.kind === 'ext')
+      ? Number(ev.ts_ms) + (Number(entry.lags?.[ev.name]) || 0) : ev.ts_ms);
 
     // The market's events, pulled ONE AT A TIME as the replay loop asks for
     // them. Nothing here holds more than the current row, which is the whole
@@ -735,6 +759,14 @@ async function main() {
           // A corrupt row in OUR OWN data is not the strategy's problem. The
           // worker reconciles what it sent against what came back.
           continue;
+        }
+        if (global) {
+          // Nothing past the market's last instant is processed, and every job
+          // before this line runs first (feed rows included).
+          const t = lineTime(ev);
+          if (typeof t === 'number' && t > m.replay.closeTs) { remaining.stop = true; return; }
+          runDue(one, t, false);
+          advanceClock(m.clock, t);
         }
         if (observe(m, ev)) yield ev;
       }
@@ -753,6 +785,14 @@ async function main() {
       start(m);
       for (const ev of eventStream()) {
         if (!m.replay.step(ev)) break;
+      }
+      if (global) {
+        // Every job up to the last tradable instant (generic: trade_until;
+        // archive: the close), then the close itself.
+        const r = m.replay;
+        const end = r.generic ? r.tradeUntil : (r.declaredClose ?? r.lastTs);
+        runDue(one, end, true);
+        advanceClock(m.clock, end);
       }
       out = m.replay.close();
     } catch (err) {
@@ -777,7 +817,7 @@ async function main() {
  *
  * Returns an exit code if the run ended early, null when the stream ended.
  */
-function runSession({ nextLine, newMarket, observe, start, finished, rejected, logsOut }) {
+function runSession({ nextLine, newMarket, observe, start, finished, rejected, logsOut, global = false }) {
   const active = new Map();
   // Generic markets whose trading has ended and whose settlement is still to
   // come (`{"end":k}` then, later, `{"close":k}`). Out of `active`: nothing
@@ -806,6 +846,14 @@ function runSession({ nextLine, newMarket, observe, start, finished, rejected, l
       break;
     }
     if (!msg || typeof msg !== 'object') continue;
+    if (global) {
+      // Phase 2b: one time line. The stream says when each line happens (t);
+      // every job strictly before it — in every market, in (at, rank, market,
+      // seq) order — runs first; end and close also run the jobs AT their time.
+      const code = sessionGlobal(msg, { active, ending, newMarket, observe, start, finished, rejected });
+      if (code !== undefined) return code;
+      continue;
+    }
     if (msg.open) {
       const m = newMarket(msg.open);
       try {
@@ -863,6 +911,86 @@ function runSession({ nextLine, newMarket, observe, start, finished, rejected, l
 }
 
 /**
+ * Run every job due before `t` (or at it, `inclusive`) across `markets`
+ * ([{m, k}]), one at a time, always the globally earliest by (at, rank, k,
+ * seq) — re-scanning after each, because a job can create jobs. MUST MATCH
+ * run_due in otharness.py.
+ */
+function runDue(markets, t, inclusive) {
+  if (typeof t !== 'number' || Number.isNaN(t)) return;
+  for (;;) {
+    let best = null;
+    for (const x of markets) {
+      const d = x.m.replay?.nextDue?.();
+      if (!d || (inclusive ? d.at > t : d.at >= t)) continue;
+      if (!best || d.at < best.d.at || (d.at === best.d.at && (d.rank < best.d.rank
+        || (d.rank === best.d.rank && (x.k < best.x.k || (x.k === best.x.k && d.seq < best.d.seq)))))) {
+        best = { d, x };
+      }
+    }
+    if (!best) return;
+    advanceClock(best.x.m.clock, best.d.at);
+    best.x.m.replay.runOne();
+  }
+}
+
+/** The run has reached `t`: nothing may be filed or run before it now. MUST MATCH advance_clock. */
+function advanceClock(clock, t) {
+  if (clock && typeof t === 'number' && t > clock.t) clock.t = t;
+}
+
+/** One session line under the global scheduler. Returns an exit code to stop, else undefined. */
+function sessionGlobal(msg, { active, ending, newMarket, observe, start, finished, rejected }) {
+  const all = () => [...[...active].map(([k, m]) => ({ m, k })), ...[...ending].map(([k, m]) => ({ m, k }))];
+  const t = typeof msg.t === 'number' ? msg.t : null;
+  const guard = (m, fn) => { try { fn(); return undefined; } catch (err) { return rejected(m, err); } };
+  if (msg.open) {
+    const m = newMarket(msg.open);
+    m.openTs = t;
+    return guard(m, () => {
+      if (t != null) runDue(all(), t, false);
+      advanceClock(m.clock, t);
+      active.set(msg.open.i, m);
+      start(m);
+    });
+  }
+  if (msg.end != null) {
+    const m = active.get(msg.end);
+    if (!m) return undefined;
+    return guard(m, () => {
+      runDue(all(), t ?? m.replay.tradeUntil, true);
+      advanceClock(m.clock, t ?? m.replay.tradeUntil);
+      active.delete(msg.end);
+      ending.set(msg.end, m);
+      m.replay.endTrading();
+    });
+  }
+  if (msg.close != null) {
+    const m = active.get(msg.close) ?? ending.get(msg.close);
+    if (!m) return undefined;
+    let out;
+    const code = guard(m, () => {
+      runDue(all(), t ?? m.replay.declaredClose ?? m.replay.lastTs, true);
+      advanceClock(m.clock, t ?? m.replay.declaredClose ?? m.replay.lastTs);
+      active.delete(msg.close);
+      ending.delete(msg.close);
+      out = m.replay.close(t);
+    });
+    if (code !== undefined) return code;
+    finished(m, out);
+    return undefined;
+  }
+  const m = active.get(msg.i);
+  const ev = msg.e;
+  if (!m || !ev || typeof ev !== 'object') return undefined;
+  return guard(m, () => {
+    if (t != null) runDue(all(), t, false);
+    advanceClock(m.clock, t);
+    if (observe(m, ev)) m.replay.step(ev);
+  });
+}
+
+/**
  * The run's fee policy: `job.fees` when the writer sent one, else the legacy
  * flat `feeBps`. MUST MATCH fee_policy in otharness.py.
  */
@@ -870,6 +998,30 @@ function feePolicy(job) {
   const f = job.fees;
   if (f && typeof f === 'object' && (f.mode === 'venue' || f.mode === 'bps')) return f;
   return { mode: 'bps', bps: job.feeBps ?? 0 };
+}
+
+/**
+ * The run's execution options (enginePolicyFor), or null. Anything malformed is
+ * null — every option off, the fail-closed direction for options that only
+ * ever add rules. MUST MATCH engine_policy in otharness.py.
+ */
+function enginePolicy(job) {
+  const e = job.engine;
+  return e && typeof e === 'object' && !Array.isArray(e) ? e : null;
+}
+
+/**
+ * The fill-row fields the run's options can produce, in column order. Fixed
+ * per run, before any row exists, so every writer (the worker's streaming
+ * fills.csv included) knows its columns up front. MUST MATCH
+ * engine_fill_fields in otharness.py and fillColumnsFor in runner/archive.mjs.
+ */
+function engineFillFields(engine) {
+  if (!engine) return [];
+  const out = [];
+  if (engine.fok || engine.order_rules || engine.quote_guard) out.push('reject_reason');
+  if (engine.maker_rebate != null) out.push('rebate');
+  return out;
 }
 
 /**
@@ -890,7 +1042,7 @@ function restingPolicy(job) {
 }
 
 /** Write everything a market added to the two logs. */
-function flush(pf, before, emit, marketId) {
+function flush(pf, before, emit, marketId, fillExtras = []) {
   for (let i = before.trades; i < pf.trades.length; i += 1) {
     const row = pf.trades[i];
     emit(CHANNEL.trade, stringify(projectRow(row, row.label !== undefined ? GENERIC_TRADE_FIELDS : TRADE_FIELDS)));
@@ -902,7 +1054,8 @@ function flush(pf, before, emit, marketId) {
   for (let i = before.fills; i < pf.fills.length; i += 1) {
     const row = pf.fills[i];
     if (marketId === true && rowPending(row)) { held.push(row); continue; }
-    emit(CHANNEL.fill, stringify(projectRow(row, row.label !== undefined ? GENERIC_FILL_FIELDS : FILL_FIELDS)));
+    const base = row.label !== undefined ? GENERIC_FILL_FIELDS : FILL_FIELDS;
+    emit(CHANNEL.fill, stringify(projectRow(row, fillExtras.length ? [...base, ...fillExtras] : base)));
   }
   // Keep memory flat across hundreds of market-days: once written, the rows
   // are the worker's problem, not ours.

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { replayMarket, makeLogBudget, BudgetMonitor, RunAbort, makeRng } from './replay.mjs';
+import { replayMarket, makeLogBudget, BudgetMonitor, RunAbort, makeRng, MarketReplay } from './replay.mjs';
 import { Portfolio } from './portfolio.mjs';
 
 const near = (a, b, eps = 1e-9) => assert.ok(Math.abs(a - b) < eps, `${a} != ${b}`);
@@ -800,15 +800,23 @@ test('an unsupported time-in-force is refused, not silently downgraded', () => {
   assert.throws(() => replayMarket({
     market: MARKET,
     events: [snap(1000), tick(1001, 1)],
-    strategy: { on_tick() { return { side: 'UP', size: 100, limit: 1, tif: 'fok' }; } },
+    strategy: { on_tick() { return { side: 'UP', size: 100, limit: 1, tif: 'day' }; } },
     hooks: { on_tick: 'on_tick' },
   }), (err) => {
     // E_MANIFEST, not E_RUNTIME: it is a contract violation, and it is raised
     // from the order path rather than from inside the hook.
     assert.equal(err.code, 'E_MANIFEST');
-    assert.match(err.detail, /tif "fok" is not supported/);
+    assert.match(err.detail, /tif "day" is not supported/);
     return true;
   });
+  // fok exists, but only for a run that declared it ("fok": true): its fill
+  // rows carry a column the writer must know about before the first row.
+  assert.throws(() => replayMarket({
+    market: MARKET,
+    events: [snap(1000), tick(1001, 1)],
+    strategy: { on_tick() { return { side: 'UP', size: 100, limit: 1, tif: 'fok' }; } },
+    hooks: { on_tick: 'on_tick' },
+  }), (err) => err.code === 'E_MANIFEST' && /needs "fok": true/.test(err.detail));
 
   // gtc without a resting-order policy (no trades declared, or Predict) is
   // refused with the policy's reason — never executed as an IOC.
@@ -891,4 +899,29 @@ test('a bound refines the book but never reaches a hook', () => {
   // which is live, on the next event it IS woken for.
   const t = seen.find((s) => Array.isArray(s));
   assert.deepEqual(t, ['tick', 2001, 0.45], 'the pruned ladder is what the next hook reads');
+});
+
+test('global scheduler: a cancel through a kept ctx is asked at the run clock and pays the full latency', () => {
+  const T = 1_000_000;
+  const market = { market_id: 'm', open_ts_ms: T, close_ts_ms: T + 60_000, outcome: 'UP' };
+  const clock = { t: -Infinity };
+  const strategy = {
+    on_market_open(ctx) { this.ctx = ctx; },
+    on_book() { return this.sent ? null : ((this.sent = true), { side: 'UP', size: 5, limit: 0.4, tif: 'gtc', client_id: 'x' }); },
+  };
+  const r = new MarketReplay({
+    market, strategy, hooks: { on_market_open: 'on_market_open', on_book: 'on_book' },
+    resting: { allowed: true, refusal: null, cancelLatencyMs: 10 },
+    engine: { scheduler: 'global', timers: false, feed_latency: 0 }, clock,
+  });
+  r.open(T);
+  r.step({ kind: 'book', ts_ms: T, snapshot: true, levels: { UP: { asks: [[0.6, 10]], bids: [[0.39, 10]] }, DOWN: { asks: [[0.61, 10]], bids: [[0.4, 10]] } } });
+  clock.t = T;
+  r.runOne(); // the activation, at T
+  assert.equal(r.maker.stats.rested, 1);
+  // Another market has taken the run to T + 5000; this market's now is still T.
+  clock.t = T + 5000;
+  assert.equal(strategy.ctx.now, T);
+  assert.equal(strategy.ctx.cancel('x'), true);
+  assert.equal(r.nextDue().at, T + 5010, 'asked at the run clock, plus the full cancel latency');
 });

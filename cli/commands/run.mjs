@@ -25,10 +25,10 @@ import {
   sortMarketsForReplay,
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
-import { buildReport, fillStats, feeModelReport, makerReport } from '../../runner/engine/report.mjs';
+import { buildReport, fillStats, feeModelReport, makerReport, ordersReport } from '../../runner/engine/report.mjs';
 import { QUEUE_MODEL, PRINT_LAG_MS } from '../../runner/engine/maker.mjs';
 import { sessionLines } from '../../runner/session-feed.mjs';
-import { feePolicyFor, restingPolicyFor } from '../../api/lib/backtest-datasets.mjs';
+import { feePolicyFor, restingPolicyFor, enginePolicyFor } from '../../api/lib/backtest-datasets.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
 import { createLineWriter } from '../../runner/stdin-writer.mjs';
 import { readEventLines } from '../../runner/spool-day.mjs';
@@ -126,7 +126,7 @@ function runHarness({
       if (job.mode === 'session') {
         // ONE time order across every market — the same stream the worker
         // writes (runner/session-feed.mjs).
-        for await (const line of sessionLines(markets, { linesOf, headerOf, cursorOf })) await write(line);
+        for await (const line of sessionLines(markets, { linesOf, headerOf, cursorOf, timed: job.engine?.scheduler === 'global' })) await write(line);
       } else {
         for (const m of markets) {
           if (m.market?.kind === 'generic') {
@@ -255,6 +255,20 @@ export async function cmdRun({ dir, flags }) {
   }
   // A generic dataset holds no archive files, so this is polymarket for it.
   const venue = flags.venue ?? defaultVenue(await archiveVenues(dataRoot));
+
+  // Execution options (fok, order rules, quote guard, maker rebate, mirror
+  // depth): one decision for the run, the same function the worker calls.
+  const enginePolicy = enginePolicyFor({ manifest, venue, data: generic ? 'generic' : 'archive' });
+
+  // LOCAL ONLY: the archive's book thinning, on (the default, what the queue
+  // replays) or off. Given either way, the report states what was applied.
+  const throttleFlag = flags['book-throttle'];
+  if (throttleFlag != null && throttleFlag !== 'on' && throttleFlag !== 'off') {
+    throw new Error(`--book-throttle must be on or off, got ${throttleFlag}`);
+  }
+  if (generic && throttleFlag != null) {
+    throw new Error('--book-throttle applies to the archive; your own data is never thinned');
+  }
   const assets = (flags.assets ?? '').split(',').map((a) => a.trim().toUpperCase()).filter(Boolean);
 
   const markets = [];
@@ -279,6 +293,7 @@ export async function cmdRun({ dir, flags }) {
       genericDecoded = await decodeGenericDir(dataRoot, {
         eventsDir,
         markMaxAgeMs: markAge == null ? null : Number(markAge),
+        orderRules: enginePolicy?.order_rules?.mode === 'venue',
       });
       for (const u of genericDecoded.unusable) process.stderr.write(`  ${u.market_id ?? '?'}: ${u.why}\n`);
       markets.push(...genericDecoded.markets);
@@ -292,7 +307,7 @@ export async function cmdRun({ dir, flags }) {
         // The SAME cadence the queue would replay this range at — built from the
         // whole range, not this day, so an asset's density never changes partway
         // through a run. Per asset, not run-wide: see makeBookThrottle.
-        throttle: makeBookThrottle({
+        throttle: throttleFlag === 'off' ? null : makeBookThrottle({
           venue,
           assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
           from: days[0],
@@ -376,7 +391,7 @@ export async function cmdRun({ dir, flags }) {
       const baseJob = {
         entry: manifest.entry,
         hooks: Object.fromEntries(manifest.hooks.map((h) => [h, HOOK_NAMES[languageId][h]])),
-        arities: { on_market_open: 3, on_tick: 3, on_book: 3, on_trade: 3, on_settle: 4 },
+        arities: { on_market_open: 3, on_tick: 3, on_book: 3, on_trade: 3, on_settle: 4, on_timer: 3 },
         params: manifest.params,
         mode: manifest.mode,
         seed: Number(flags.seed ?? 1),
@@ -385,6 +400,7 @@ export async function cmdRun({ dir, flags }) {
         fees: feePolicy,
         // Same rule as the worker: Polymarket with book + trades declared.
         resting: restingPolicyFor({ manifest, venue }),
+        ...(enginePolicy ? { engine: enginePolicy } : {}),
         limits: LIMITS,
       };
       if (languageId === 'python') {
@@ -504,6 +520,8 @@ export async function cmdRun({ dir, flags }) {
         maker: makerReport({
           stats: base.result.maker, fills: fillSummary.makerFills, queueModel: QUEUE_MODEL, printLagMs: PRINT_LAG_MS,
         }),
+        orders: ordersReport({ policy: enginePolicy, stats: base.result.orders }),
+        timers: enginePolicy?.timers ? base.result.timers : null,
         marketSummaries: [...marketMeta.values()],
         marketMeta,
         feesPaid: base.result.feesPaid,
@@ -533,6 +551,14 @@ export async function cmdRun({ dir, flags }) {
         }),
         budget: base.result.budget,
       });
+      if (throttleFlag != null && report.coverage) {
+        // What was actually applied, per asset — asked of the gate itself.
+        const scopeAssets = assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'];
+        const gate = makeBookThrottle({ venue, assets: scopeAssets, from: days[0], to: days[days.length - 1] });
+        report.coverage.book_throttle = throttleFlag === 'off'
+          ? 'off'
+          : Object.fromEntries(scopeAssets.map((a) => [a, gate.windowFor(a)]));
+      }
       if (generic) {
         report = applyGenericExtras(report, genericReportExtras({
           trades: base.trades,

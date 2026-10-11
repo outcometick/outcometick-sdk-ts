@@ -200,6 +200,19 @@ class Ladder:
             self.levels = kept
         return removed
 
+    def best_ts(self):
+        """When the best level was last set, or None. MUST MATCH bestTs in book.mjs."""
+        return self.levels[0][2] if self.levels else None
+
+    def reduce_at(self, ticks: int, size: float) -> None:
+        """MUST MATCH Ladder.reduceAt in book.mjs."""
+        for i, level in enumerate(self.levels):
+            if level[0] == ticks:
+                level[1] -= min(size, level[1])
+                if level[1] <= 0:
+                    del self.levels[i]
+                return
+
     def best(self) -> float | None:
         return from_ticks(self.levels[0][0]) if self.levels else None
 
@@ -315,6 +328,21 @@ class Book:
             return
         self.delta(ts, other, "bids" if kind == "asks" else "asks", m, size)
 
+    def quote_ts(self, side: str) -> dict:
+        """MUST MATCH Book.quoteTs in book.mjs."""
+        lad = self.ladders.get(side)
+        if not lad:
+            return {"bid": None, "ask": None}
+        return {"bid": lad["bids"].best_ts(), "ask": lad["asks"].best_ts()}
+
+    def consume_mirror(self, side: str, kind: str, px: float, size: float) -> None:
+        """MUST MATCH Book.consumeMirror in book.mjs."""
+        other = "DOWN" if side == "UP" else "UP"
+        m = js_to_fixed10(1 - px)
+        if not (0 <= m <= 1):
+            return
+        self.ladders[other]["bids" if kind == "asks" else "asks"].reduce_at(to_ticks(m), size)
+
     def best(self, side: str) -> float | None:
         """The price to BUY that outcome at — the best ask."""
         lad = self.ladders.get(side)
@@ -392,6 +420,16 @@ OUTCOME_TIE = "TIE"
 FEE_MODEL_PM = "polymarket-taker-v1"
 
 
+def floor_cents(x: float) -> float:
+    """MUST MATCH floorCents in portfolio.mjs."""
+    return math.floor(x * 100 + 1e-9) / 100
+
+
+def new_order_stats() -> dict:
+    """MUST MATCH newOrderStats in portfolio.mjs."""
+    return {"rejected": {}, "rebates": 0}
+
+
 def round_fee(x: float) -> float:
     return js_round(x * 1e5) / 1e5
 
@@ -454,7 +492,7 @@ class Leg:
 
 
 class Portfolio:
-    def __init__(self, fee_bps: float = 0, fees: dict | None = None) -> None:
+    def __init__(self, fee_bps: float = 0, fees: dict | None = None, engine=None, order_stats=None) -> None:
         # `fees` is the run's policy; absent, the legacy flat `fee_bps` is.
         self.fee_policy = fees if fees is not None else {"mode": "bps", "bps": float(fee_bps or 0)}
         self.market_fees: dict[str, dict | None] = {}
@@ -467,6 +505,65 @@ class Portfolio:
         # Generic markets only: outcome labels by index. See portfolio.mjs.
         self.market_labels: dict[str, tuple] = {}
         self.marked_value = 0.0
+        # Execution options (job.engine). See portfolio.mjs.
+        self.engine = engine
+        self.quote_guard = (engine or {}).get("quote_guard") if isinstance(engine, dict) else None
+        self.maker_rebate = (engine or {}).get("maker_rebate") if isinstance(engine, dict) else None
+        self.market_rules: dict = {}
+        self.mirrored: set = set()
+        self.order_stats = order_stats if order_stats is not None else (new_order_stats() if engine else None)
+        self.rule_reject = None
+
+    def set_market_rules(self, market_id, rules) -> None:
+        self.market_rules[market_id] = dict(rules)
+
+    def set_mirrored(self, market_id) -> None:
+        self.mirrored.add(market_id)
+
+    def count_reject(self, reason) -> None:
+        if self.order_stats is not None:
+            rj = self.order_stats["rejected"]
+            rj[reason] = rj.get(reason, 0) + 1
+
+    def _rule_rejection(self, reason, eff):
+        self.rejected += 1
+        self.count_reject(reason)
+        self.rule_reject = {"reason": reason, "eff": eff}
+        return None
+
+    def quote_guard_failure(self, book, ts, eff):
+        """MUST MATCH quoteGuardFailure in portfolio.mjs."""
+        g = self.quote_guard
+        if not g or (eff.get("reduce_only") and not g.get("include_exits")):
+            return None
+        up, down = book.best("UP"), book.best("DOWN")
+        if g.get("ask_sum") is not None:
+            if up is None or down is None:
+                return "quote_guard"
+            total = up + down
+            lo, hi = g["ask_sum"]
+            if total < lo - EPS or total > hi + EPS:
+                return "quote_guard"
+        if g.get("max_age_ms") is not None:
+            for side in ("UP", "DOWN"):
+                q = book.quote_ts(side)
+                for t in (q["bid"], q["ask"]):
+                    if t is None or ts - t > g["max_age_ms"]:
+                        return "quote_guard"
+        return None
+
+    def _reject_row(self, ts, market_id, eff, tag, order_id, reason) -> dict:
+        res = {"fills": [], "filled": 0, "unfilled": float(eff.get("size") or 0), "notional": 0,
+               "avg_px": None, "worst_px": None, "quoted_px": None}
+        row = self._fill_row(ts, market_id, eff, res, tag, 0.0, 0.0, order_id)
+        row["reject_reason"] = reason
+        self.fills.append(row)
+        return res
+
+    def refuse(self, ts, market_id, eff, tag, order_id, reason):
+        """MUST MATCH refuse in portfolio.mjs."""
+        self.count_reject(reason)
+        return self._reject_row(ts, market_id, eff, tag, order_id, reason)
 
     def set_market_labels(self, market_id: str, labels) -> None:
         """MUST MATCH setMarketLabels in portfolio.mjs."""
@@ -536,11 +633,14 @@ class Portfolio:
                 tag: str | None = None, how: str = "exit", order_id: str | None = None):
         eff = self.normalize(order, market_id)
         if eff is None:
+            if self.rule_reject is not None:
+                self._reject_row(ts, market_id, self.rule_reject["eff"], tag, order_id, self.rule_reject["reason"])
             return None
         return self.execute_effective(book, eff, ts, market_id, tag, how, order_id)
 
     def normalize(self, order: dict, market_id: str):
         """The one validator. MUST MATCH normalize in portfolio.mjs."""
+        self.rule_reject = None
         side = self.side_of(order.get("side"), market_id) if isinstance(order, dict) else None
         if side is None:
             self.rejected += 1
@@ -578,6 +678,7 @@ class Portfolio:
                 self.rejected += 1
                 return None
 
+        rules = self.market_rules.get(market_id)
         if has_notional:
             budget = _finite(order.get("notional"))
             if budget is None or budget <= 0 or limit is None or limit <= 0:
@@ -593,7 +694,7 @@ class Portfolio:
             if not math.isfinite(q):
                 self.rejected += 1
                 return None
-            size = float(math.floor(q))
+            size = floor_cents(q) if rules is not None else float(math.floor(q))
         else:
             size = _finite(order.get("size"))
         if size is None or not size > 0:
@@ -601,9 +702,24 @@ class Portfolio:
             return None
         if order.get("reduce_only"):
             size = min(size, leg.size)
+            if rules is not None:
+                size = floor_cents(size)
             if not size > EPS:
                 self.rejected += 1
                 return None
+
+        # Venue order rules -- MUST MATCH portfolio.mjs.
+        if rules is not None:
+            eff = {**order, "side": side, "size": size, "limit": limit}
+            cents = size * 100
+            if abs(cents - js_round(cents)) > 1e-6:
+                return self._rule_rejection("size_step", eff)
+            if size < rules["minSize"] - EPS:
+                return self._rule_rejection("below_min_size", eff)
+            if limit is not None:
+                t = to_ticks(limit)
+                if t % rules["tickTicks"] != 0 or abs(from_ticks(t) - limit) > EPS:
+                    return self._rule_rejection("off_tick", eff)
 
         # One effective order from here on -- AFTER the reduce_only clamp, so
         # the row reports what was actually requested of the book rather than
@@ -617,7 +733,20 @@ class Portfolio:
     def execute_effective(self, book: Book, order: dict, ts: int, market_id: str,
                           tag: str | None = None, how: str = "exit", order_id: str | None = None):
         """Take liquidity for an order `normalize` already accepted."""
+        if self.quote_guard:
+            why = self.quote_guard_failure(book, ts, order)
+            if why:
+                return self.refuse(ts, market_id, order, tag, order_id, why)
+        if order.get("tif") == "fok":
+            avail = (book.bid_depth(order["side"], order.get("limit")) if order.get("reduce_only")
+                     else book.depth(order["side"], order.get("limit")))
+            if avail + EPS < order["size"]:
+                return self.refuse(ts, market_id, order, tag, order_id, "fok_unfilled")
         res = match_order(book, order)
+        if res["filled"] > 0 and market_id in self.mirrored:
+            kind = "bids" if order.get("reduce_only") else "asks"
+            for f in res["fills"]:
+                book.consume_mirror(order["side"], kind, f["px"], f["size"])
         if res["filled"] <= 0:
             self.fills.append(self._fill_row(ts, market_id, order, res, tag, 0.0, 0.0, order_id))
             return res
@@ -639,6 +768,18 @@ class Portfolio:
             fee = (notional * (bps if ok else 0)) / 10_000
         else:
             fee = 0
+        # maker_rebate -- MUST MATCH makerFill in portfolio.mjs.
+        rebate = None
+        if self.maker_rebate is not None:
+            rebate = 0
+            mf = self.market_fees.get(market_id)
+            if isinstance(policy, dict) and policy.get("mode") == "venue" and isinstance(mf, dict) \
+                    and mf.get("model") == FEE_MODEL_PM:
+                rebate = round_fee(self.maker_rebate * fee_for(policy, mf, {"fills": [{"px": px, "size": size}],
+                                                                           "notional": notional}))
+            fee -= rebate
+            if self.order_stats is not None:
+                self.order_stats["rebates"] += rebate
         realised = self._apply(market_id, side, reduce, size, notional, fee, ts, "exit")
         row = {
             "ts_ms": ts,
@@ -661,6 +802,8 @@ class Portfolio:
         if extra:
             row.update(extra)
         self._label(market_id, side, row)
+        if rebate is not None:
+            row["rebate"] = rebate
         self.fills.append(row)
         return row
 

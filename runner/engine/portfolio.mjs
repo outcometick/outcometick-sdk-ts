@@ -10,7 +10,7 @@
 // showing lot-level detail the strategy could not see would be describing a
 // different position from the one it traded.
 
-import { matchOrder, isSide } from './book.mjs';
+import { matchOrder, isSide, toTicks, fromTicks } from './book.mjs';
 
 /**
  * A market that settled 50:50. Predict.fun resolves end_price == start_price
@@ -53,6 +53,12 @@ export const FEE_MODEL_PM = 'polymarket-taker-v1';
 
 /** Round a fee to the venue's five decimals, ties toward +Infinity. */
 export const roundFee = (x) => Math.round(x * 1e5) / 1e5;
+
+/** Down to whole hundredths of a share — the venue's size grid — robust to float noise. */
+export const floorCents = (x) => Math.floor(x * 100 + 1e-9) / 100;
+
+/** The run-level order counters reported as `orders`. MUST MATCH new_order_stats in otengine.py. */
+export function newOrderStats() { return { rejected: {}, rebates: 0 }; }
 
 /**
  * The fee for one match result under a run's fee policy.
@@ -125,7 +131,7 @@ export class Portfolio {
    *   strategy gets to assume, and a strategy that set it to zero would be
    *   reporting its own fee holiday.
    */
-  constructor({ feeBps = 0, fees = null } = {}) {
+  constructor({ feeBps = 0, fees = null, engine = null, orderStats = null } = {}) {
     // `fees` is the run's policy. Absent, the legacy run-level `feeBps` is the
     // policy — what every caller passed before venue fees existed.
     this.feePolicy = fees ?? { mode: 'bps', bps: Number(feeBps) || 0 };
@@ -148,6 +154,27 @@ export class Portfolio {
     this.marketLabels = new Map();
     /** Value of positions closed at a mark (pf.mark): never cash. */
     this.markedValue = 0;
+    // Execution options (job.engine, phase 2a; null = all off, the old paths).
+    this.engine = engine;
+    this.quoteGuard = engine?.quote_guard ?? null;
+    this.makerRebate = engine?.maker_rebate ?? null;
+    /** marketId -> {tickTicks, minSize} under order_rules. */
+    this.marketRules = new Map();
+    /** Markets whose two tokens are one book and its mirror (mirror_depth). */
+    this.mirrored = new Set();
+    /** Shared with the harness, which reports it: {rejected: {reason: n}, rebates}. */
+    this.orderStats = orderStats ?? (engine ? newOrderStats() : null);
+    /** The rule a just-normalised order broke, for the caller that writes its row. */
+    this.ruleReject = null;
+  }
+
+  /** MUST MATCH set_market_rules in otengine.py. */
+  setMarketRules(marketId, rules) { this.marketRules.set(marketId, Object.freeze({ ...rules })); }
+
+  setMirrored(marketId) { this.mirrored.add(marketId); }
+
+  countReject(reason) {
+    if (this.orderStats) this.orderStats.rejected[reason] = (this.orderStats.rejected[reason] ?? 0) + 1;
   }
 
   /** MUST MATCH set_market_labels in otengine.py. */
@@ -238,7 +265,11 @@ export class Portfolio {
    */
   execute({ book, order, ts, marketId, tag = null, how = 'exit', orderId = null }) {
     const eff = this.normalize(order, marketId);
-    if (!eff) return null;
+    if (!eff) {
+      // A rule the venue would refuse it on: written as a row, with the reason.
+      if (this.ruleReject) this.#rejectRow({ ts, marketId, eff: this.ruleReject.eff, tag, orderId, reason: this.ruleReject.reason });
+      return null;
+    }
     return this.executeEffective({ book, eff, ts, marketId, tag, how, orderId });
   }
 
@@ -249,6 +280,7 @@ export class Portfolio {
    * IOC is refused as a resting order. MUST MATCH normalize in otengine.py.
    */
   normalize(order, marketId) {
+    this.ruleReject = null;
     const side = this.sideOf(order?.side, marketId);
     if (side == null) { this.rejected += 1; return null; }
 
@@ -297,6 +329,7 @@ export class Portfolio {
       if (limit == null || limit < 0 || limit > 1) { this.rejected += 1; return null; }
     }
 
+    const rules = this.marketRules.get(marketId) ?? null;
     let size;
     if (hasNotional) {
       // MONEY -> CONTRACTS, here rather than in the SDK's Order constructor:
@@ -316,7 +349,9 @@ export class Portfolio {
       // raises.
       const q = budget / limit;
       if (!Number.isFinite(q)) { this.rejected += 1; return null; }
-      size = Math.floor(q);
+      // Under order rules the venue's size grid is 0.01 shares, so money
+      // converts to whole hundredths; otherwise whole contracts, as always.
+      size = rules ? floorCents(q) : Math.floor(q);
     } else {
       size = finite(order.size);
     }
@@ -326,7 +361,22 @@ export class Portfolio {
     // than it holds must not accidentally open the other way.
     if (order.reduce_only) {
       size = Math.min(size, leg.size);
+      // Partial fills can leave a position off the size grid; an exit can only
+      // be sent on it, so it is floored to the grid (then checked like any order).
+      if (rules) size = floorCents(size);
       if (!(size > EPS)) { this.rejected += 1; return null; }
+    }
+
+    // Venue order rules (order_rules), on the size that would actually be sent.
+    if (rules) {
+      const eff = { ...order, side, size, limit };
+      const cents = size * 100;
+      if (Math.abs(cents - Math.round(cents)) > 1e-6) return this.#ruleRejection('size_step', eff);
+      if (size < rules.minSize - EPS) return this.#ruleRejection('below_min_size', eff);
+      if (limit != null) {
+        const t = toTicks(limit);
+        if (t % rules.tickTicks !== 0 || Math.abs(fromTicks(t) - limit) > EPS) return this.#ruleRejection('off_tick', eff);
+      }
     }
 
     // ONE effective order from here on: the derived size has to reach the fill
@@ -337,9 +387,72 @@ export class Portfolio {
     return { ...order, side, size, limit };
   }
 
+  #ruleRejection(reason, eff) {
+    this.rejected += 1;
+    this.countReject(reason);
+    this.ruleReject = { reason, eff };
+    return null;
+  }
+
+  /**
+   * Why the quote guard refuses a taker order right now, or null. Opening
+   * orders only unless the guard says include_exits: by default an exit is
+   * never trapped by it. MUST MATCH quote_guard_failure in otengine.py.
+   */
+  quoteGuardFailure(book, ts, eff) {
+    const g = this.quoteGuard;
+    if (!g || (eff.reduce_only && !g.include_exits)) return null;
+    const up = book.best('UP');
+    const down = book.best('DOWN');
+    if (g.ask_sum) {
+      if (up == null || down == null) return 'quote_guard';
+      const sum = up + down;
+      if (sum < g.ask_sum[0] - EPS || sum > g.ask_sum[1] + EPS) return 'quote_guard';
+    }
+    if (g.max_age_ms != null) {
+      for (const side of ['UP', 'DOWN']) {
+        const q = book.quoteTs(side);
+        for (const t of [q.bid, q.ask]) {
+          if (t == null || ts - t > g.max_age_ms) return 'quote_guard';
+        }
+      }
+    }
+    return null;
+  }
+
+  #rejectRow({ ts, marketId, eff, tag, orderId, reason }) {
+    const res = { fills: [], filled: 0, unfilled: Number(eff.size), notional: 0, avgPx: null, worstPx: null, quotedPx: null };
+    const row = this.#fillRow({ ts, marketId, order: eff, res, tag, realised: 0, fee: 0, orderId });
+    row.reject_reason = reason;
+    this.fills.push(row);
+  }
+
+  /** A taker order that did not execute, written as its row with the reason. */
+  refuse({ ts, marketId, eff, tag = null, orderId = null, reason }) {
+    this.countReject(reason);
+    const res = { fills: [], filled: 0, unfilled: Number(eff.size), notional: 0, avgPx: null, worstPx: null, quotedPx: null };
+    const row = this.#fillRow({ ts, marketId, order: eff, res, tag, realised: 0, fee: 0, orderId });
+    row.reject_reason = reason;
+    this.fills.push(row);
+    return res;
+  }
+
   /** Take liquidity for an order `normalize` already accepted. */
   executeEffective({ book, eff, ts, marketId, tag = null, how = 'exit', orderId = null }) {
+    if (this.quoteGuard) {
+      const why = this.quoteGuardFailure(book, ts, eff);
+      if (why) return this.refuse({ ts, marketId, eff, tag, orderId, reason: why });
+    }
+    if (eff.tif === 'fok') {
+      // All of it within the limit, or none of it — measured before anything is taken.
+      const avail = eff.reduce_only ? book.bidDepth(eff.side, eff.limit) : book.depth(eff.side, eff.limit);
+      if (avail + EPS < eff.size) return this.refuse({ ts, marketId, eff, tag, orderId, reason: 'fok_unfilled' });
+    }
     const res = matchOrder(book, eff);
+    if (res.filled > 0 && this.mirrored.has(marketId)) {
+      const kind = eff.reduce_only ? 'bids' : 'asks';
+      for (const f of res.fills) book.consumeMirror(eff.side, kind, f.px, f.size);
+    }
     if (res.filled <= 0) {
       this.fills.push(this.#fillRow({ ts, marketId, order: eff, res, tag, realised: 0, fee: 0, orderId }));
       return res;
@@ -365,9 +478,22 @@ export class Portfolio {
   makerFill({ marketId, side, reduce, size, px, ts, tag = null, orderId = null, extra = null }) {
     const notional = px * size;
     const policy = this.feePolicy;
-    const fee = policy?.mode === 'bps'
+    let fee = policy?.mode === 'bps'
       ? (notional * (typeof policy.bps === 'number' && Number.isFinite(policy.bps) ? policy.bps : 0)) / 10_000
       : 0;
+    // maker_rebate: a share of what the taker of this same fill paid, credited
+    // as a negative fee. An ESTIMATE — the venue pays rebates pro rata from a
+    // daily pool — and only where the market's taker schedule is known.
+    let rebate = null;
+    if (this.makerRebate != null) {
+      rebate = 0;
+      const mf = this.marketFees.get(marketId) ?? null;
+      if (policy?.mode === 'venue' && mf?.model === FEE_MODEL_PM) {
+        rebate = roundFee(this.makerRebate * feeFor(policy, mf, { fills: [{ px, size }], notional }));
+      }
+      fee -= rebate;
+      if (this.orderStats) this.orderStats.rebates += rebate;
+    }
     const realised = this.#apply(marketId, side, reduce, size, notional, fee, ts, 'exit');
     const row = {
       ts_ms: ts,
@@ -388,6 +514,7 @@ export class Portfolio {
       order_id: orderId,
       ...(extra ?? {}),
       ...this.#label(marketId, side),
+      ...(rebate != null ? { rebate } : {}),
     };
     this.fills.push(row);
     return row;

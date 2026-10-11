@@ -15,7 +15,8 @@ import {
 } from './backtest-contract.mjs';
 import {
   normalizeDatasets, normalizeIntervals, normalizeLatency, normalizeCancelLatency, normalizeFeeBps,
-  assertCoverage,
+  assertCoverage, normalizeFok, normalizeOrderRules, normalizeMakerRebate, normalizeQuoteGuard, normalizeMirrorDepth,
+  normalizeFeedLatency,
 } from './backtest-datasets.mjs';
 // The series parser, so the FREE check rejects a malformed CSV instead of the
 // worker rejecting it after credits are held. One implementation, shared: the
@@ -139,6 +140,16 @@ export function validateManifest(doc) {
   // it with a flat rate on notional; the report says which was used.
   const feeBps = normalizeFeeBps(doc.fee_bps);
 
+  // Execution options (all off by default; see enginePolicyFor). Only shapes are
+  // checked here — which venue or data they can apply to is decided where the
+  // run's venue is known.
+  const fok = normalizeFok(doc.fok);
+  const orderRules = normalizeOrderRules(doc.order_rules);
+  const makerRebate = normalizeMakerRebate(doc.maker_rebate);
+  const quoteGuard = normalizeQuoteGuard(doc.quote_guard);
+  const mirrorDepth = normalizeMirrorDepth(doc.mirror_depth);
+  const feedLatency = normalizeFeedLatency(doc.feed_latency);
+
   // A hook that needs a dataset it was not given would simply never fire, and
   // a strategy that silently never trades looks like a bad strategy rather
   // than a bad manifest. Say so instead.
@@ -258,6 +269,12 @@ export function validateManifest(doc) {
     latency,
     cancel_latency: cancelLatency,
     fee_bps: feeBps,
+    ...(fok ? { fok } : {}),
+    ...(orderRules != null ? { order_rules: orderRules } : {}),
+    ...(makerRebate != null ? { maker_rebate: makerRebate } : {}),
+    ...(quoteGuard != null ? { quote_guard: quoteGuard } : {}),
+    ...(mirrorDepth != null ? { mirror_depth: mirrorDepth } : {}),
+    ...(feedLatency != null ? { feed_latency: feedLatency } : {}),
     mode,
     deps,
     reference,

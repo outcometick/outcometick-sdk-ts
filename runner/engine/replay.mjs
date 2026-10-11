@@ -201,10 +201,13 @@ function bookView(book) {
     bidLevels: (side, n = 10) => book.bidLevels(side, n),
     bid_levels: (side, n = 10) => book.bidLevels(side, n),
     mid: (side) => book.mid(side),
+    // When each best level was last set, exchange time; null for an empty ladder.
+    quoteTs: (side) => book.quoteTs(side),
+    quote_ts: (side) => book.quoteTs(side),
   });
 }
 
-function createCtx({ params, portfolio, marketId, market, logBudget, references, series, rng, resting = null }) {
+function createCtx({ params, portfolio, marketId, market, logBudget, references, series, rng, resting = null, timers = null }) {
   const history = [];
   const logs = [];
   const crosschecks = [];
@@ -282,6 +285,19 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
      * such order.
      */
     cancel(id) { return resting ? resting.cancel(id) : false; },
+
+    /**
+     * Wake on_timer at `at_ms` (phase 2b). Returns the timer's id ("t1", ...).
+     * Needs the on_timer hook declared; at_ms later than now and not past the
+     * market's declared close.
+     */
+    schedule(atMs, tag = null) {
+      if (!timers) throw new RunAbort('E_MANIFEST', 'ctx.schedule needs the on_timer hook declared in the manifest');
+      return timers.schedule(atMs, tag);
+    },
+
+    /** Cancel a pending timer by its id; false when there is none. */
+    unschedule(id) { return timers ? timers.unschedule(id) : false; },
 
     /**
      * A declared reference feed as of now.
@@ -465,6 +481,19 @@ export class MarketReplay {
      * never on the market record a hook is handed — it is a future fact.
      */
     terminal = null,
+    /**
+     * Execution options (job.engine, phase 2a), or null — every option off and
+     * every path the one it always was. See enginePolicyFor.
+     */
+    engine = null,
+    /**
+     * Global scheduler only: the run's clock, `{ t }`, ONE object for every
+     * market of a session and advanced only by the harness (the time of the
+     * line or job it is about to process). A ctx saved from another market
+     * still reads that market's own now; this is what keeps it from acting
+     * in the past of the run.
+     */
+    clock = null,
   }) {
     this.marketId = market.market_id;
     // generic-data.mjs. Every branch that differs from the archive path is
@@ -472,9 +501,15 @@ export class MarketReplay {
     // code they always took.
     this.generic = market.kind === 'generic';
     this.terminal = this.generic ? terminal : null;
-    this.pf = portfolio ?? new Portfolio({ feeBps });
+    this.pf = portfolio ?? new Portfolio({ feeBps, engine });
     this.pf.setMarketFee(this.marketId, market.fee ?? null);
     if (this.generic) this.pf.setMarketLabels(this.marketId, market.labels);
+    this.engine = engine;
+    if (engine?.order_rules) this.pf.setMarketRules(this.marketId, marketRules(engine.order_rules, market));
+    if (engine?.mirror_depth === 'shared'
+        && (engine.mirror_markets === 'all' || market.book_model === 'single_mirrored')) {
+      this.pf.setMirrored(this.marketId);
+    }
     this.book = new Book(this.marketId);
     this.monitor = budget ?? new BudgetMonitor();
     this.strategy = strategy;
@@ -486,7 +521,12 @@ export class MarketReplay {
     // cross-check panel but its own PnL — every position settling the way it
     // said rather than the way the venue did.
     this.market = { ...market };
+    const timerApi = engine?.scheduler === 'global' && engine.timers === true ? {
+      schedule: (at, tag) => this.#scheduleTimer(at, tag),
+      unschedule: (id) => this.#unscheduleTimer(id),
+    } : null;
     const { ctx, control } = createCtx({
+      timers: timerApi,
       params: strategy.p ?? {},
       portfolio: this.pf,
       marketId: this.marketId,
@@ -503,6 +543,19 @@ export class MarketReplay {
     this.ctx = ctx;
     this.control = control;
     control.setBook(this.book);
+    // Phase 2b, global scheduler (engine.scheduler === 'global'): one time line
+    // across markets, timers, and a feed latency with a second (local) book.
+    // Off = none of this exists and every path is the old one.
+    this.global = engine?.scheduler === 'global';
+    this.jobSeq = 0;
+    if (this.global) {
+      this.feedLatency = Number.isInteger(engine.feed_latency) && engine.feed_latency > 0 ? engine.feed_latency : 0;
+      this.localBook = this.feedLatency > 0 ? new Book(this.marketId) : this.book;
+      control.setBook(this.localBook);
+      this.timerStats = { created: 0, fired: 0, dropped: 0 };
+      this.timerIds = 0;
+      this.clock = clock ?? { t: -Infinity };
+    }
 
     this.resting = resting;
     this.cancelLatencyMs = Number.isFinite(resting?.cancelLatencyMs) ? resting.cancelLatencyMs : fillDelayMs;
@@ -563,8 +616,107 @@ export class MarketReplay {
   #schedule(at, kind, payload) {
     const pending = this.pending;
     let i = pending.length;
+    if (this.global) {
+      // Nothing lands before what the run has already processed: a cancel
+      // asked for through another market's saved ctx (whose now lags behind)
+      // happens now, not in the past. Timers are refused instead (#scheduleTimer).
+      if (at < this.clock.t) at = this.clock.t;
+      // (at, rank, seq): exchange jobs before arrivals before timers at one ms;
+      // insertion order within a rank.
+      const rank = JOB_RANK[kind] ?? 0;
+      while (i > 0 && (pending[i - 1].at > at || (pending[i - 1].at === at && pending[i - 1].rank > rank))) i -= 1;
+      pending.splice(i, 0, { at, kind, payload, rank, seq: this.jobSeq++ });
+      return;
+    }
     while (i > 0 && pending[i - 1].at > at) i -= 1;
     pending.splice(i, 0, { at, kind, payload });
+  }
+
+  /** The earliest pending job as (at, rank, seq), or null. Global mode. */
+  nextDue() {
+    const j = this.pending[0];
+    return j ? { at: j.at, rank: j.rank, seq: j.seq } : null;
+  }
+
+  /**
+   * Run exactly the earliest pending job (global mode). ctx.now is the job's
+   * own time before anything the strategy can observe happens.
+   */
+  runOne() {
+    const job = this.pending.shift();
+    if (!job) return;
+    // Past the market's last tradable instant nothing runs: an order that had
+    // not landed did not land, a late event is never heard, a timer is dropped.
+    if (job.at > this.closeTs) {
+      if (job.kind === 'timer') this.timerStats.dropped += 1;
+      return;
+    }
+    // #schedule never files a job before the clock, so this is an invariant,
+    // checked: running one would move ctx.now backwards.
+    if (job.at < this.clock.t) {
+      throw new RunAbort('E_RUNTIME', `engine invariant: a ${job.kind} at ${job.at} after the run reached ${this.clock.t}`);
+    }
+    this.control.setNow(job.at);
+    if (job.kind === 'timer') {
+      this.timerStats.fired += 1;
+      if (this.timerStats.fired > MAX_TIMERS_FIRED) {
+        throw new RunAbort('E_RUNTIME', `more than ${MAX_TIMERS_FIRED} timers fired in market ${this.marketId}`);
+      }
+      const t = job.payload;
+      if (this.hooks.on_timer) this.#emit(this.#call('on_timer', { id: t.id, at_ms: job.at, tag: t.tag }), job.at);
+      this.#checkBudget();
+      return;
+    }
+    if (job.kind === 'arrival') {
+      this.#arrive(job.payload);
+      return;
+    }
+    this.#runExchangeJob(job);
+  }
+
+  #scheduleTimer(atMs, tag) {
+    // After the later of this market's now and the run's: a ctx kept from
+    // another market must not reach back into time already processed.
+    const now = Math.max(this.control.now, this.clock.t);
+    if (!(typeof atMs === 'number' && Number.isSafeInteger(atMs)) || atMs <= now) {
+      throw new RunAbort('E_RUNTIME', `ctx.schedule needs a whole-millisecond time after now (${now}), got ${JSON.stringify(atMs)}`);
+    }
+    // Only what the strategy can see bounds it: a declared close. A private
+    // end of trading (generic data) silently drops later timers instead.
+    const visibleClose = this.generic ? (this.market.trading_end_ts_ms ?? null) : (this.market.close_ts_ms ?? null);
+    if (visibleClose != null && atMs > visibleClose) {
+      throw new RunAbort('E_RUNTIME', `ctx.schedule(${atMs}) is after the market's close (${visibleClose})`);
+    }
+    if (tag != null && !(typeof tag === 'string' && tag.length <= 64)) {
+      throw new RunAbort('E_RUNTIME', 'a timer tag must be a string of at most 64 characters');
+    }
+    if (this.pending.filter((j) => j.kind === 'timer').length >= MAX_PENDING_TIMERS) {
+      throw new RunAbort('E_RUNTIME', `more than ${MAX_PENDING_TIMERS} pending timers in market ${this.marketId}`);
+    }
+    this.timerStats.created += 1;
+    if (this.timerStats.created > MAX_TIMERS_CREATED) {
+      throw new RunAbort('E_RUNTIME', `more than ${MAX_TIMERS_CREATED} timers scheduled in market ${this.marketId}`);
+    }
+    this.timerIds += 1;
+    const id = `t${this.timerIds}`;
+    this.#schedule(atMs, 'timer', { id, tag: tag == null ? null : String(tag) });
+    return id;
+  }
+
+  #unscheduleTimer(id) {
+    const i = this.pending.findIndex((j) => j.kind === 'timer' && j.payload.id === id);
+    if (i < 0) return false;
+    this.pending.splice(i, 1);
+    return true;
+  }
+
+  /** A lagged event reaches the strategy: the local book, the history, the hook. */
+  #arrive(ev) {
+    if (ev.kind === 'book') applyEvent(this.localBook, ev, this.generic);
+    if (ev.kind === 'tick') this.control.pushTick(ev);
+    const hook = ev.bbo ? null : HOOK_FOR[ev.kind];
+    if (hook && this.hooks[hook]) this.#emit(this.#call(hook, ev), this.control.now);
+    this.#checkBudget();
   }
 
   /** Execute everything scheduled at or before `ts`, against this book. */
@@ -572,7 +724,18 @@ export class MarketReplay {
     const pending = this.pending;
     while (pending.length && pending[0].at <= ts) {
       const job = pending.shift();
-      if (job.kind === 'order') {
+      if (this.global && job.kind !== 'order' && job.kind !== 'activate' && job.kind !== 'cancel' && job.kind !== 'flatten') {
+        // Global mode drains only through the scheduler (runOne); a timer or
+        // arrival reached here is past the end of trading: dropped.
+        if (job.kind === 'timer') this.timerStats.dropped += 1;
+        continue;
+      }
+      this.#runExchangeJob(job);
+    }
+  }
+
+  #runExchangeJob(job) {
+    if (job.kind === 'order') {
         const res = this.pf.execute({ book: this.book, order: job.payload, ts: job.at, marketId: this.marketId, how: 'exit' });
         // hold_s is measured from the FILL, not the decision: a fill that
         // landed late has not been held as long.
@@ -583,9 +746,8 @@ export class MarketReplay {
         this.maker.activate(job.payload, job.at, this.book);
       } else if (job.kind === 'cancel') {
         this.maker.cancel(job.payload, job.at);
-      } else {
-        this.pf.flatten(this.marketId, this.book, job.at, 'hold_expired');
-      }
+    } else {
+      this.pf.flatten(this.marketId, this.book, job.at, 'hold_expired');
     }
   }
 
@@ -594,8 +756,11 @@ export class MarketReplay {
     // Resolved NOW, to the record: a client_id reused after this call cannot
     // redirect a cancel already on its way.
     const rec = this.maker.find(id);
-    if (!rec) { this.maker.cancel(null, this.control.now); return false; }
-    this.#schedule(this.control.now + this.cancelLatencyMs, 'cancel', rec);
+    // Asked NOW in the run's time: through a ctx kept from another market this
+    // market's own now lags, and the latency must still be paid in full.
+    const asked = this.global ? Math.max(this.control.now, this.clock.t) : this.control.now;
+    if (!rec) { this.maker.cancel(null, asked); return false; }
+    this.#schedule(asked + this.cancelLatencyMs, 'cancel', rec);
     return true;
   }
 
@@ -632,6 +797,16 @@ export class MarketReplay {
           labels ? ` or an outcome of this market (${labels.map((l) => JSON.stringify(l)).join(', ')})` : ''}`);
       }
       const tif = order.tif ?? 'ioc';
+      if (tif === 'fok') {
+        if (!this.engine?.fok) {
+          throw new RunAbort('E_MANIFEST', 'tif "fok" needs "fok": true in the manifest');
+        }
+        if (order.post_only === true || order.client_id != null) {
+          throw new RunAbort('E_MANIFEST', 'post_only and client_id are for gtc orders, not fok');
+        }
+        this.#schedule(ts + this.fillDelayMs, 'order', order);
+        continue;
+      }
       if (tif === 'gtc') {
         this.#submitResting(order, ts);
         continue;
@@ -666,7 +841,10 @@ export class MarketReplay {
     }
   }
 
-  open() {
+  open(openTs = null) {
+    // Global mode: the market opens AT a time, and nothing it schedules may be
+    // earlier than that — ctx.now is the open, not 0.
+    if (this.global && typeof openTs === 'number' && Number.isFinite(openTs)) this.control.setNow(openTs);
     // A fresh copy per call: whatever the strategy does to it reaches nothing.
     this.#call('on_market_open', this.#preSettleMarket());
     this.#checkBudget();
@@ -683,8 +861,9 @@ export class MarketReplay {
     if (ev.ts_ms > this.closeTs) { this.ended = true; return false; }
     // Everything scheduled strictly BEFORE this event resolves against the book
     // as it stood then — draining after applying the event would fill a delayed
-    // order against depth that arrived after it.
-    this.drainUntil(ev.ts_ms - 1);
+    // order against depth that arrived after it. (Global mode: the harness's
+    // scheduler already ran every job before this instant, in every market.)
+    if (!this.global) this.drainUntil(ev.ts_ms - 1);
     this.control.setNow(ev.ts_ms);
     const maker = this.maker;
     if (maker) {
@@ -697,13 +876,7 @@ export class MarketReplay {
       // would otherwise be applied as a delta with no ladder, no price and no
       // size — which Book.delta rejects by throwing, taking the whole run with
       // it.
-      const generic = this.generic;
-      const apply = () => {
-        if (ev.bbo) this.book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask, generic ? { inclusive: true } : undefined);
-        else if (ev.snapshot) this.book.snapshot(ev.ts_ms, ev.levels);
-        else if (generic && ev.mirror === true) this.book.deltaMirrored(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
-        else this.book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
-      };
+      const apply = () => applyEvent(this.book, ev, this.generic);
       if (maker) maker.bookEvent(ev, this.book, apply);
       else apply();
     } else if (ev.kind === 'trade' && maker) {
@@ -711,7 +884,14 @@ export class MarketReplay {
       // returns now cannot consume it (see PRINT_LAG_MS).
       maker.trade(ev, this.book);
     }
-    this.drainUntil(ev.ts_ms);
+    if (!this.global) this.drainUntil(ev.ts_ms);
+
+    // A feed latency: the strategy hears of this event later, from its own
+    // (local) book — the exchange book above has already moved.
+    if (this.global && this.feedLatency > 0) {
+      this.#schedule(ev.ts_ms + this.feedLatency, 'arrival', ev);
+      return true;
+    }
 
     if (ev.kind === 'tick') this.control.pushTick(ev);
 
@@ -753,8 +933,13 @@ export class MarketReplay {
     this.control.setNow(ts);
     this.drainUntil(ts);
     if (this.maker) this.maker.close(ts, this.book);
-    this.pending.length = 0;
+    this.#dropPending();
     this.marked = this.market.outcome ? [] : this.pf.mark(this.marketId, this.terminal, ts);
+  }
+
+  #dropPending() {
+    if (this.global) this.timerStats.dropped += this.pending.filter((j) => j.kind === 'timer').length;
+    this.pending.length = 0;
   }
 
   /** Generic markets: end trading if not yet, then pay out (resolved) or finish (marked). */
@@ -765,6 +950,7 @@ export class MarketReplay {
     const settleTs = this.declaredClose;
     this.control.setNow(settleTs);
     let settled = this.marked;
+    if (this.closeNow != null && this.closeNow > settleTs) this.control.setNow(this.closeNow);
     if (outcome) {
       // A venue settlement: on_settle is for that and only that.
       this.#call('on_settle', { ...genericView(this.market), outcome, resolved_ts_ms: this.market.resolved_ts_ms }, outcome);
@@ -781,11 +967,18 @@ export class MarketReplay {
       crosschecks: this.control.crosschecks,
       budget: this.monitor.summary(),
       maker: this.maker ? this.maker.stats : null,
+      timers: this.global ? this.timerStats : null,
     };
     return this.closed;
   }
 
-  close() {
+  /**
+   * `nowTs` (global mode, session): the time line's own position when the close
+   * is processed — on_settle never sees the clock go back, while the payout is
+   * still booked at the declared close.
+   */
+  close(nowTs = null) {
+    this.closeNow = this.global && typeof nowTs === 'number' && Number.isFinite(nowTs) ? nowTs : null;
     if (this.generic) return this.#closeGeneric();
     // Anything still queued lands AT THE CLOSE — not at its own future
     // timestamp. Draining to Infinity executed a delayed order stamped after the
@@ -801,8 +994,9 @@ export class MarketReplay {
     // nothing fills after the close.
     if (this.maker) this.maker.close(settleTs, this.book);
     // Whatever is still pending never filled. Dropped, not back-dated.
-    this.pending.length = 0;
+    this.#dropPending();
 
+    if (this.closeNow != null && this.closeNow > settleTs) this.control.setNow(this.closeNow);
     this.#call('on_settle', { ...this.market }, this.market.outcome);
 
     const outcome = this.market.outcome;
@@ -821,8 +1015,41 @@ export class MarketReplay {
       crosschecks: this.control.crosschecks,
       budget: this.monitor.summary(),
       maker: this.maker ? this.maker.stats : null,
+      timers: this.global ? this.timerStats : null,
     };
   }
+}
+
+/** Same-millisecond order of a market's jobs in global mode. MUST MATCH otreplay.py. */
+const JOB_RANK = Object.freeze({ order: 0, activate: 0, cancel: 0, flatten: 0, arrival: 1, timer: 2 });
+export const MAX_PENDING_TIMERS = 64;
+export const MAX_TIMERS_CREATED = 10_000;
+export const MAX_TIMERS_FIRED = 100_000;
+
+/** One book event against a book, with the generic-data rules where they differ. */
+function applyEvent(book, ev, generic) {
+  if (ev.bbo) book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask, generic ? { inclusive: true } : undefined);
+  else if (ev.snapshot) book.snapshot(ev.ts_ms, ev.levels);
+  else if (generic && ev.mirror === true) book.deltaMirrored(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+  else book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
+}
+
+/**
+ * The order rules a market trades under: `{tickTicks, minSize}`.
+ * "assumed" carries the venue constants; "venue" reads the market's own
+ * metadata, which the generic decoder already refused when it was missing or
+ * not representable — this is the second door. MUST MATCH market_rules in
+ * otreplay.py.
+ */
+function marketRules(rules, market) {
+  const tick = rules.mode === 'venue' ? market.tick_size : rules.tick;
+  const minSize = rules.mode === 'venue' ? market.min_size : rules.min_size;
+  const tickTicks = typeof tick === 'number' ? Math.round(tick * 10_000) : Number.NaN;
+  if (!(tick > 0) || !(tickTicks >= 1) || Math.abs(tickTicks - tick * 10_000) > 1e-6
+      || !(typeof minSize === 'number' && Number.isFinite(minSize) && minSize > 0)) {
+    throw new RunAbort('E_RUNTIME', `market ${market.market_id}: order_rules need a tick on a 0.0001 grid and a positive minimum size`);
+  }
+  return { tickTicks, minSize };
 }
 
 /**

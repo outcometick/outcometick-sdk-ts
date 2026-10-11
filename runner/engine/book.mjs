@@ -144,6 +144,21 @@ class Ladder {
   /** Best resting price, or null when empty. */
   best() { return this.levels.length ? fromTicks(this.levels[0].ticks) : null; }
 
+  /** When the best level was last set (its ts), or null when empty. */
+  bestTs() { return this.levels.length ? this.levels[0].ts : null; }
+
+  /**
+   * Remove up to `size` resting at exactly `ticks` — the other half of a
+   * mirrored level an order just took (mirror_depth "shared"). Removes only,
+   * never adds; a level that is not there is nothing to remove.
+   */
+  reduceAt(ticks, size) {
+    const i = this.levels.findIndex((l) => l.ticks === ticks);
+    if (i < 0) return;
+    this.levels[i].size -= Math.min(size, this.levels[i].size);
+    if (this.levels[i].size <= 0) this.levels.splice(i, 1);
+  }
+
   /**
    * Size resting at prices at least as good as `bound`.
    *
@@ -286,6 +301,27 @@ export class Book {
   levels(side, n = 10) { return this.ladders[side]?.asks.view(n) ?? []; }
 
   bidLevels(side, n = 10) { return this.ladders[side]?.bids.view(n) ?? []; }
+
+  /**
+   * `{bid, ask}`: the exchange time each best level of `side` was last set,
+   * null for an empty ladder. MUST MATCH quote_ts in otengine.py.
+   */
+  quoteTs(side) {
+    const l = this.ladders[side];
+    return l ? { bid: l.bids.bestTs(), ask: l.asks.bestTs() } : { bid: null, ask: null };
+  }
+
+  /**
+   * A taker took `size` at `px` from `side`'s `kind` ladder of a SINGLE book
+   * published with its mirror: the same liquidity rests on the other token's
+   * opposite ladder at 1 - px, and is gone there too.
+   */
+  consumeMirror(side, kind, px, size) {
+    const other = side === 'UP' ? 'DOWN' : 'UP';
+    const m = Number((1 - px).toFixed(10));
+    if (!(m >= 0 && m <= 1)) return;
+    this.ladders[other][kind === 'asks' ? 'bids' : 'asks'].reduceAt(toTicks(m), size);
+  }
 
   /** Mid price of a token, or null when either ladder is empty. */
   mid(side) {

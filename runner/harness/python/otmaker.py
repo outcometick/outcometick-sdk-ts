@@ -184,10 +184,17 @@ class MakerBook:
             rec.side = eff["side"]
         limit = eff.get("limit") if eff is not None else None
         ticks = None if limit is None else to_ticks(limit)
+        rules = self.pf.market_rules.get(self.market_id)
+        grid = rules["tickTicks"] if rules is not None else TICK_GRID
         if (eff is None or limit is None or not (0 < limit < 1)
-                or ticks % TICK_GRID != 0 or abs(from_ticks(ticks) - limit) > EPS):
+                or ticks % grid != 0 or abs(from_ticks(ticks) - limit) > EPS):
             rec.state = "rejected"
             self.stats["rejected_invalid"] += 1
+            return
+        # quote_guard refuses the WHOLE order -- see activate in maker.mjs.
+        if self.pf.quote_guard and self.pf.quote_guard_failure(book, ts, eff):
+            rec.state = "rejected"
+            self.pf.count_reject("quote_guard")
             return
         kind, q = canonical_of(rec.side, rec.reduce, ticks)
         opp = "bids" if kind == "asks" else "asks"

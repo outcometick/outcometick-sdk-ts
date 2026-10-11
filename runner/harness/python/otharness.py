@@ -25,7 +25,7 @@ import datetime as _datetime
 import json
 import math
 
-from otengine import Book as _Book, BudgetMonitor, Portfolio, RunAbort
+from otengine import Book as _Book, BudgetMonitor, Portfolio, RunAbort, new_order_stats
 from otfeed import build_feeds
 from otmaker import add_maker_stats, new_maker_stats, row_pending
 from otreplay import MarketReplay, make_log_budget, LOG_BYTES_PER_RUN, LOG_LINE_CHARS
@@ -161,6 +161,24 @@ def fee_policy(job: dict) -> dict:
 _NO_RESTING = "resting (gtc) orders are not available for this run"
 
 
+def engine_policy(job: dict):
+    """MUST MATCH enginePolicy in runner/harness/node/harness.mjs."""
+    e = job.get("engine")
+    return e if isinstance(e, dict) else None
+
+
+def engine_fill_fields(engine) -> tuple:
+    """MUST MATCH engineFillFields in runner/harness/node/harness.mjs."""
+    if not engine:
+        return ()
+    out = ()
+    if engine.get("fok") or engine.get("order_rules") or engine.get("quote_guard"):
+        out += ("reject_reason",)
+    if engine.get("maker_rebate") is not None:
+        out += ("rebate",)
+    return out
+
+
 def resting_policy(job: dict) -> dict:
     """The run's resting-order policy as the writer decided it; anything
     malformed is "not allowed". MUST MATCH restingPolicy in the Node harness."""
@@ -189,10 +207,12 @@ def _log_prefix(market: dict) -> str:
 class _Market:
     """What the loop tracks for one open market, besides the replay itself."""
 
-    __slots__ = ("entry", "replay", "seen", "book", "open_quotes", "feed_rows", "before")
+    __slots__ = ("entry", "replay", "seen", "book", "open_quotes", "feed_rows", "before", "open_ts", "clock")
 
-    def __init__(self, entry: dict) -> None:
+    def __init__(self, entry: dict, clock: dict | None = None) -> None:
         self.entry = entry
+        # Global scheduler: the run's clock (one per session, else per market).
+        self.clock = clock if clock is not None else {"t": float("-inf")}
         self.replay = None
         self.seen = 0
         # The book as the ENGINE sees it, advanced by the same class, for the
@@ -201,6 +221,7 @@ class _Market:
         self.open_quotes = None
         self.feed_rows: dict = {}
         self.before = None
+        self.open_ts = None
 
     def rows_for(self, name):
         return self.feed_rows.setdefault(name, [])
@@ -247,6 +268,9 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
     )
     fees = fee_policy(job)
     resting = resting_policy(job)
+    engine = engine_policy(job)
+    order_stats = new_order_stats() if engine else None
+    fill_extras = engine_fill_fields(engine)
     hooks = job.get("hooks") or {}
     session = job.get("mode") == "session"
 
@@ -267,6 +291,8 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
 
     def finish(code: int) -> int:
         result["budget"] = monitor.summary()
+        if order_stats is not None:
+            result["orders"] = order_stats
         emit(CHANNEL_RESULT, _DUMPS(result))
         return code
 
@@ -280,7 +306,8 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             if market_id is True and row_pending(row):
                 held.append(row)
                 continue
-            emit(CHANNEL_FILL, _DUMPS(project_row(row, GENERIC_FILL_FIELDS if "label" in row else FILL_FIELDS)))
+            base = GENERIC_FILL_FIELDS if "label" in row else FILL_FIELDS
+            emit(CHANNEL_FILL, _DUMPS(project_row(row, base + fill_extras if fill_extras else base)))
         if market_id:
             del pf.trades[before["trades"]:]
             del pf.fills[before["fills"]:]
@@ -292,14 +319,14 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
         result["rejection"] = {"code": err.code, "detail": err.detail}
         return finish(EXIT_REJECTED)
 
-    shared = Portfolio(fees=fees) if session else None
+    shared = Portfolio(fees=fees, engine=engine, order_stats=order_stats) if session else None
     shared_instance = None
 
     def start(m: _Market) -> None:
         """Build the replay for a market and open it (on_market_open)."""
         nonlocal shared_instance
         entry = m.entry
-        pf = shared if shared is not None else Portfolio(fees=fees)
+        pf = shared if shared is not None else Portfolio(fees=fees, engine=engine, order_stats=order_stats)
         if shared is not None:
             if shared_instance is None:
                 shared_instance = klass()
@@ -325,8 +352,10 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             series=build_feeds(series, {n: m.rows_for(n) for n in series}, entry.get("lags") or {}),
             resting=resting,
             terminal=entry.get("terminal"),
+            engine=engine,
+            clock=m.clock,
         )
-        m.replay.open()
+        m.replay.open(m.open_ts)
 
     def finished(m: _Market, out: dict) -> None:
         """Book-keeping once a market has been replayed and settled."""
@@ -345,6 +374,10 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
         result["crosschecks"].extend(out["crosschecks"])
         if out.get("maker"):
             result["maker"] = add_maker_stats(result["maker"] or new_maker_stats(), out["maker"])
+        if engine and engine.get("timers") and out.get("timers"):
+            t = result.setdefault("timers", {"created": 0, "fired": 0, "dropped": 0})
+            for k in ("created", "fired", "dropped"):
+                t[k] += out["timers"].get(k, 0)
         oq = m.open_quotes
         result["market_summaries"].append({
             "market_id": entry["market"]["market_id"],
@@ -376,8 +409,9 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
         result["rejection"] = {"code": "E_RUNTIME", "detail": f"{mid}: {err}"}
         return finish(EXIT_REJECTED)
 
+    is_global = bool(engine) and engine.get("scheduler") == "global"
     if session:
-        code = _run_session(next_line, start, finished, rejected, log)
+        code = _run_session(next_line, start, finished, rejected, log, is_global)
         if code is not None:
             return code
         flush(shared, {"trades": 0, "fills": 0}, None)
@@ -394,9 +428,12 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             log(f"[runner] malformed market header: {err}\n")
             break
         m = _Market(entry)
+        m.open_ts = (entry.get("market") or {}).get("open_ts_ms")
         remaining = {"n": int(entry.get("n") or 0)}
+        one = [(m, 0)]
+        lags = entry.get("lags") or {}
 
-        def event_stream(m=m, remaining=remaining):
+        def event_stream(m=m, remaining=remaining, one=one, lags=lags):
             while remaining["n"] > 0:
                 remaining["n"] -= 1
                 line = next_line()
@@ -406,6 +443,18 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
                     ev = _LOADS(line)
                 except json.JSONDecodeError:
                     continue
+                if is_global:
+                    # MUST MATCH the Node harness: feed rows at stamp + lag.
+                    if ev.get("kind") in ("ref", "ext"):
+                        lag = lags.get(ev.get("name"))
+                        ok = isinstance(lag, (int, float)) and not isinstance(lag, bool) and lag == lag
+                        t = float(ev.get("ts_ms")) + (lag if ok else 0)
+                    else:
+                        t = ev.get("ts_ms")
+                    if isinstance(t, (int, float)) and t > m.replay.close_ts:
+                        return
+                    run_due(one, t, False)
+                    advance_clock(m.clock, t)
                 if m.observe(ev):
                     yield ev
 
@@ -421,6 +470,11 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             for ev in event_stream():
                 if not m.replay.step(ev):
                     break
+            if is_global:
+                r = m.replay
+                end = r.trade_until if r.generic else (r.declared_close if r.declared_close else r.last_ts)
+                run_due(one, end, True)
+                advance_clock(m.clock, end)
             out = m.replay.close()
         except Exception as err:  # noqa: BLE001
             drain_rest()
@@ -431,7 +485,99 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
     return finish(EXIT_OK)
 
 
-def _run_session(next_line, start, finished, rejected, log):
+def run_due(markets, t, inclusive) -> None:
+    """MUST MATCH runDue in runner/harness/node/harness.mjs."""
+    if not isinstance(t, (int, float)) or isinstance(t, bool) or t != t:
+        return
+    while True:
+        best = None
+        for m, k in markets:
+            r = m.replay
+            d = r.next_due() if r is not None and hasattr(r, "next_due") else None
+            if d is None or (d["at"] > t if inclusive else d["at"] >= t):
+                continue
+            if best is None or (d["at"], d["rank"], k, d["seq"]) < (best[0]["at"], best[0]["rank"], best[2], best[0]["seq"]):
+                best = (d, m, k)
+        if best is None:
+            return
+        advance_clock(best[1].clock, best[0]["at"])
+        best[1].replay.run_one()
+
+
+def advance_clock(clock, t) -> None:
+    """The run has reached `t`. MUST MATCH advanceClock in harness.mjs."""
+    if clock is None or not isinstance(t, (int, float)) or isinstance(t, bool) or t != t:
+        return
+    if isinstance(t, float) and t.is_integer():
+        t = int(t)
+    if t > clock["t"]:
+        clock["t"] = t
+
+def _session_global(msg, active, ending, start, finished, rejected, clock):
+    """One session line under the global scheduler -- MUST MATCH sessionGlobal."""
+    def everyone():
+        return [(m, k) for k, m in active.items()] + [(m, k) for k, m in ending.items()]
+
+    t = msg.get("t") if isinstance(msg.get("t"), (int, float)) and not isinstance(msg.get("t"), bool) else None
+    if "open" in msg:
+        entry = msg["open"]
+        m = _Market(entry, clock)
+        m.open_ts = t
+        try:
+            if t is not None:
+                run_due(everyone(), t, False)
+            advance_clock(clock, t)
+            active[entry.get("i")] = m
+            start(m)
+        except Exception as err:  # noqa: BLE001
+            return rejected(m, err)
+        return None
+    if "end" in msg:
+        m = active.get(msg["end"])
+        if m is None:
+            return None
+        try:
+            run_due(everyone(), t if t is not None else m.replay.trade_until, True)
+            advance_clock(clock, t if t is not None else m.replay.trade_until)
+            active.pop(msg["end"], None)
+            ending[msg["end"]] = m
+            m.replay.end_trading()
+        except Exception as err:  # noqa: BLE001
+            return rejected(m, err)
+        return None
+    if "close" in msg:
+        m = active.get(msg["close"])
+        if m is None:
+            m = ending.get(msg["close"])
+        if m is None:
+            return None
+        try:
+            r = m.replay
+            run_due(everyone(), t if t is not None else (r.declared_close if r.declared_close else r.last_ts), True)
+            advance_clock(clock, t if t is not None else (r.declared_close if r.declared_close else r.last_ts))
+            active.pop(msg["close"], None)
+            ending.pop(msg["close"], None)
+            out = r.close(t)
+        except Exception as err:  # noqa: BLE001
+            return rejected(m, err)
+        finished(m, out)
+        return None
+    m = active.get(msg.get("i"))
+    ev = msg.get("e")
+    if m is None or not isinstance(ev, dict):
+        return None
+    try:
+        if t is not None:
+            run_due(everyone(), t, False)
+        advance_clock(m.clock, t)
+        if m.observe(ev):
+            m.replay.step(ev)
+    except Exception as err:  # noqa: BLE001
+        return rejected(m, err)
+    return None
+
+
+def _run_session(next_line, start, finished, rejected, log, is_global=False):
     """The session stream: every open market replayed from one time order.
 
     Returns an exit code if the run ended early, None when the stream ended
@@ -440,6 +586,8 @@ def _run_session(next_line, start, finished, rejected, log):
     active: dict = {}
     # Generic markets past `end` and before `close` -- see runSession.
     ending: dict = {}
+    # Global scheduler: ONE clock for every market of the session.
+    clock = {"t": float("-inf")}
 
     def settle_earlier(except_, ts):
         """Before ANY hook at instant `ts` -- an opening, an event, a closing --
@@ -461,6 +609,11 @@ def _run_session(next_line, start, finished, rejected, log):
             log(f"[runner] malformed session line: {err}\n")
             break
         if not isinstance(msg, dict):
+            continue
+        if is_global:
+            code = _session_global(msg, active, ending, start, finished, rejected, clock)
+            if code is not None:
+                return code
             continue
         if "open" in msg:
             entry = msg["open"]

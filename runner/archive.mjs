@@ -287,8 +287,29 @@ const GENERIC_TRADE_COLUMNS = [
   ...TRADE_COLUMNS, 'label', 'mark_px', 'marked_size', 'marked_pnl', 'mark_source',
   'mark_ts_ms', 'mark_age_ms', 'mark_missing',
 ];
-const GENERIC_FILL_COLUMNS = [...FILL_COLUMNS, 'label'];
 const isGeneric = (report) => report?.data_kind === 'generic';
+
+/**
+ * The fills.csv columns of a run, fixed before its first row: the base set,
+ * `label` for generic data, and the execution options' fields (engine policy,
+ * see enginePolicyFor). MUST MATCH engineFillFields in the harnesses.
+ */
+export function fillColumnsFor({ generic = false, engine = null } = {}) {
+  const cols = [...FILL_COLUMNS];
+  if (generic) cols.push('label');
+  if (engine && (engine.fok || engine.order_rules || engine.quote_guard)) cols.push('reject_reason');
+  if (engine && engine.maker_rebate != null) cols.push('rebate');
+  return cols;
+}
+
+/** The same, read back from a finished report. */
+const fillColumnsOf = (report) => fillColumnsFor({
+  generic: isGeneric(report),
+  engine: report?.orders ? {
+    fok: report.orders.fok, order_rules: report.orders.order_rules, quote_guard: report.orders.quote_guard,
+    maker_rebate: report.orders.maker_rebate == null ? null : report.orders.maker_rebate.rate,
+  } : null,
+});
 
 /** One CSV line in the format toCsv writes. */
 const csvLine = (row, columns) => columns.map((c) => csvField(row[c])).join(',');
@@ -312,7 +333,9 @@ export async function writeCsvFile(file, rows, columns) {
 
 export const FILLS_CSV_HEADER = `${BOM}${FILL_COLUMNS.join(',')}`;
 /** A fill as one fills.csv line (no newline), for writers that stream. */
-export const fillCsvLine = (fill) => csvLine(fill, FILL_COLUMNS);
+export const fillCsvLine = (fill, columns = FILL_COLUMNS) => csvLine(fill, columns);
+/** The header line for a run's own columns (fillColumnsFor). */
+export const fillsCsvHeader = (columns) => `${BOM}${columns.join(',')}`;
 
 /**
  * The whole equity curve, rounded as report.equity is; that one is thinned.
@@ -396,7 +419,7 @@ export async function buildArchive({ report, trades, fills, logs }) {
   const dir = await mkdtemp(path.join(tmpdir(), 'ot-archive-'));
   try {
     const fillsCsv = path.join(dir, 'fills.csv');
-    await writeCsvFile(fillsCsv, fills ?? [], isGeneric(report) ? GENERIC_FILL_COLUMNS : FILL_COLUMNS);
+    await writeCsvFile(fillsCsv, fills ?? [], fillColumnsOf(report));
     const outPath = path.join(dir, 'report.zip');
     await writeArchive({ outPath, report, trades, fillsCsv, logs });
     return await readFile(outPath);

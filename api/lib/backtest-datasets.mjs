@@ -493,6 +493,147 @@ export function restingPolicyFor({ manifest, venue }) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Execution options (phase 2a). Every one is OFF by default, and off means the
+// engine takes exactly the path it always took: no new branch, row field,
+// column or report block. MUST MATCH the same functions in
+// client/backtest/datasets.py.
+
+/** `fok: true` — the run may return fill-or-kill orders. Declared, so the
+ * output columns are known before the first row. */
+export function normalizeFok(value) {
+  if (value == null || value === false) return false;
+  if (value === true) return true;
+  throw new BacktestRejection('E_MANIFEST', `fok must be true or false, got ${JSON.stringify(value)}`);
+}
+
+/** `order_rules`: null | "venue" (from the market's own metadata) | "assumed"
+ * (archive Polymarket: tick 0.001 and minimum 5 shares, measured, not read). */
+export function normalizeOrderRules(value) {
+  if (value == null) return null;
+  if (value === 'venue' || value === 'assumed') return value;
+  throw new BacktestRejection('E_MANIFEST',
+    `order_rules must be "venue" or "assumed", got ${JSON.stringify(value)}`);
+}
+
+/** `maker_rebate`: the fraction of the taker fee credited to a resting fill. */
+export function normalizeMakerRebate(value) {
+  if (value == null) return null;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new BacktestRejection('E_MANIFEST',
+      `maker_rebate must be a number between 0 and 1, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/** `quote_guard`: {max_age_ms?, ask_sum?: [lo, hi]}, at least one. */
+export function normalizeQuoteGuard(value) {
+  if (value == null) return null;
+  const bad = (why) => new BacktestRejection('E_MANIFEST', `quote_guard ${why}`);
+  if (typeof value !== 'object' || Array.isArray(value)) throw bad('must be an object');
+  for (const k of Object.keys(value)) {
+    if (k !== 'max_age_ms' && k !== 'ask_sum' && k !== 'include_exits') throw bad(`has an unknown key ${JSON.stringify(k)}`);
+  }
+  const out = {};
+  if (value.max_age_ms != null) {
+    const ms = value.max_age_ms;
+    if (typeof ms !== 'number' || !Number.isInteger(ms) || ms < 0 || ms > 86_400_000) {
+      throw bad('max_age_ms must be a whole number of milliseconds between 0 and 86400000');
+    }
+    out.max_age_ms = ms;
+  }
+  if (value.ask_sum != null) {
+    const r = value.ask_sum;
+    const num = (x) => typeof x === 'number' && Number.isFinite(x);
+    if (!Array.isArray(r) || r.length !== 2 || !num(r[0]) || !num(r[1]) || r[0] < 0 || r[0] > r[1] || r[1] > 2) {
+      throw bad('ask_sum must be [lo, hi] with 0 <= lo <= hi <= 2');
+    }
+    out.ask_sum = [r[0], r[1]];
+  }
+  if (!Object.keys(out).length) throw bad('needs max_age_ms or ask_sum');
+  // Exits are not guarded unless asked: a guard that blocks an exit holds the
+  // position to settlement, which is a bigger bet than a stale exit price.
+  if (value.include_exits != null) {
+    if (typeof value.include_exits !== 'boolean') throw bad('include_exits must be true or false');
+    if (value.include_exits) out.include_exits = true;
+  }
+  return out;
+}
+
+/**
+ * `feed_latency`: ms between an event happening on the venue and the strategy
+ * seeing it (phase 2b). 0/absent = none, the old path.
+ */
+export function normalizeFeedLatency(value) {
+  if (value == null || value === 0) return null;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > MAX_LATENCY_MS) {
+    throw new BacktestRejection('E_MANIFEST',
+      `feed_latency must be a whole number of milliseconds between 0 and ${MAX_LATENCY_MS}, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/** `mirror_depth: "shared"` — single-book markets consume one depth for both tokens. */
+export function normalizeMirrorDepth(value) {
+  if (value == null) return null;
+  if (value === 'shared') return value;
+  throw new BacktestRejection('E_MANIFEST', `mirror_depth must be "shared", got ${JSON.stringify(value)}`);
+}
+
+/** The venue constants behind `order_rules: "assumed"` (archive Polymarket). */
+export const ASSUMED_ORDER_RULES = Object.freeze({ tick: 0.001, min_size: 5, size_step: 0.01 });
+
+/**
+ * The engine options a run hands both harnesses as `job.engine`, or null when
+ * every option is off (the job then carries no `engine` key at all).
+ *
+ * `data`: 'archive' (the outcometick archive, hosted or `ot run`) or 'generic'
+ * (the user's own data, local only). Combinations that cannot be honoured are
+ * refused here, worded for the person fixing the manifest.
+ */
+export function enginePolicyFor({ manifest, venue, data = 'archive' }) {
+  const fok = normalizeFok(manifest?.fok);
+  const rules = normalizeOrderRules(manifest?.order_rules);
+  const rebate = normalizeMakerRebate(manifest?.maker_rebate);
+  const guard = normalizeQuoteGuard(manifest?.quote_guard);
+  const mirror = normalizeMirrorDepth(manifest?.mirror_depth);
+  const feedLatency = normalizeFeedLatency(manifest?.feed_latency);
+  const timers = (manifest?.hooks ?? []).includes('on_timer');
+  const global = timers || feedLatency != null;
+  if (!fok && rules == null && rebate == null && guard == null && mirror == null && !global) return null;
+  const refuse = (why) => { throw new BacktestRejection('E_MANIFEST', why); };
+  let orderRules = null;
+  if (rules === 'venue') {
+    if (data !== 'generic') {
+      refuse('order_rules "venue" needs each market\'s tick and minimum size, which archive markets do not carry; '
+        + 'use "assumed" (tick 0.001, minimum 5 shares — measured on the archive, not read per market)');
+    }
+    orderRules = { mode: 'venue' };
+  } else if (rules === 'assumed') {
+    if (data === 'generic') refuse('order_rules "assumed" is for archive markets; your own data carries its tick and minimum — use "venue"');
+    if (venue !== 'polymarket') refuse(`order_rules "assumed" is Polymarket's; the ${venue} archive publishes no order rules`);
+    orderRules = { mode: 'assumed', ...ASSUMED_ORDER_RULES };
+  }
+  if (rebate != null && manifest?.fee_bps != null) {
+    refuse('maker_rebate is a share of the venue\'s taker fee; it cannot be combined with a flat fee_bps');
+  }
+  if (mirror != null && data === 'archive' && venue === 'polymarket') {
+    refuse('mirror_depth "shared" is for single-book markets (Predict.fun); Polymarket publishes two separate books');
+  }
+  return {
+    fok,
+    order_rules: orderRules,
+    maker_rebate: rebate,
+    quote_guard: guard,
+    // Archive Predict: every market is one book and its mirror. Generic data:
+    // only markets the pmdata entry marked single_mirrored (MarketReplay checks).
+    mirror_depth: mirror,
+    mirror_markets: mirror == null ? null : (data === 'archive' ? 'all' : 'single_mirrored'),
+    // Phase 2b: one time line across markets (timers and/or a feed latency).
+    ...(global ? { scheduler: 'global', timers, feed_latency: feedLatency ?? 0 } : {}),
+  };
+}
+
 /** The highest flat fee override a manifest may declare: 10% of notional. */
 export const MAX_FEE_BPS = 1000;
 

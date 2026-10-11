@@ -120,7 +120,11 @@ class CursorHeap {
  * order, then closings — so a market can trade on the instant it opens, and
  * every event stamped at a market's close reaches it before it settles.
  */
-export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = null }) {
+export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = null, timed = false }) {
+  // `timed` (phase 2b, the global scheduler): every line carries the time it was
+  // ordered by as "t", and the harness schedules by that and nothing else — so
+  // producer and consumer cannot disagree about when a line happened.
+  const T = (t) => (timed ? `,"t":${Number.isFinite(t) ? t : 'null'}` : '');
   const heap = new CursorHeap();
   const openAt = (m) => {
     const v = m?.market?.open_ts_ms;
@@ -180,7 +184,8 @@ export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = nul
       const header = headerOf(m);
       if (m?.market?.kind === 'generic') {
         if (!cursorOf) throw new Error('a generic market needs a streaming cursor (cursorOf)');
-        yield JSON.stringify({ open: { i: k, ...header } });
+        yield timed ? JSON.stringify({ open: { i: k, ...header }, t: Number.isFinite(openAt(m)) ? openAt(m) : null })
+          : JSON.stringify({ open: { i: k, ...header } });
         await advanceGeneric({
           k,
           generic: true,
@@ -211,7 +216,8 @@ export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = nul
       const closeAt = typeof declared === 'number' && Number.isFinite(declared)
         ? Math.max(declared, run)
         : run;
-      yield JSON.stringify({ open: { i: k, ...header } });
+      yield timed ? JSON.stringify({ open: { i: k, ...header }, t: Number.isFinite(openAt(m)) ? openAt(m) : null })
+        : JSON.stringify({ open: { i: k, ...header } });
       advance({ k, lines, times, i: 0, closeAt, t: 0, phase: 0 });
       continue;
     }
@@ -219,22 +225,22 @@ export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = nul
     const c = heap.pop();
     if (c.generic) {
       if (c.phase === 1) {
-        yield `{"i":${c.k},"e":${c.line}}`;
+        yield `{"i":${c.k}${T(c.t)},"e":${c.line}}`;
       } else if (c.phase === 2) {
-        yield `{"end":${c.k}}`;
+        yield `{"end":${c.k}${T(c.t)}}`;
         c.endSent = true;
       } else {
-        yield `{"close":${c.k}}`;
+        yield `{"close":${c.k}${T(c.t)}}`;
         continue;
       }
       await advanceGeneric(c);
       continue;
     }
     if (c.phase === 2) {
-      yield `{"close":${c.k}}`;
+      yield `{"close":${c.k}${T(c.t)}}`;
       continue;
     }
-    yield `{"i":${c.k},"e":${c.lines[c.i]}}`;
+    yield `{"i":${c.k}${T(c.t)},"e":${c.lines[c.i]}}`;
     c.i += 1;
     advance(c);
   }

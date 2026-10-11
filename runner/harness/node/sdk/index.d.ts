@@ -45,6 +45,9 @@ export interface BookView {
   bidLevels(side: Side, n?: number): Level[];
   bid_levels(side: Side, n?: number): Level[];
   mid(side: Side): number | null;
+  /** When each best level of `side` was last set (exchange ms); null for an empty ladder. */
+  quoteTs(side: Side): { bid: number | null; ask: number | null };
+  quote_ts(side: Side): { bid: number | null; ask: number | null };
 }
 
 /** A settlement-stream observation — what on_tick receives. */
@@ -188,6 +191,17 @@ export interface Ctx<P = Record<string, unknown>> {
    */
   cancel(id: string): boolean;
 
+  /**
+   * Wake `onTimer` at `atMs` (a whole millisecond after `now`, not past the
+   * market's declared close). Needs `on_timer` in the manifest's hooks.
+   * Returns the timer's id. At most 64 pending, 10,000 set, 100,000 fired per
+   * market.
+   */
+  schedule(atMs: number, tag?: string | null): string;
+
+  /** Cancel a pending timer by its id. False when there is none. */
+  unschedule(id: string): boolean;
+
   /** A reference feed declared in the manifest. Throws if undeclared. */
   ref(name: string): FeedView;
 
@@ -252,8 +266,12 @@ export type OrderInit = OrderSizing & {
   tag?: string | null;
 } & (
   | {
-    /** Take what is resting now; anything unfilled is dropped. The default. */
-    tif?: 'ioc';
+    /**
+     * `ioc` (the default): take what is resting now; anything unfilled is
+     * dropped. `fok`: all of it within the limit, or none of it — the
+     * manifest must declare `"fok": true`.
+     */
+    tif?: 'ioc' | 'fok';
     postOnly?: never;
     post_only?: never;
     clientId?: never;
@@ -309,11 +327,18 @@ export declare class Order {
   readonly limit: number | null;
   readonly hold_s: number | null;
   readonly reduce_only: boolean;
-  readonly tif: 'ioc' | 'gtc';
+  readonly tif: 'ioc' | 'gtc' | 'fok';
   readonly tag: string | null;
   /** Present on gtc orders only. */
   readonly post_only?: boolean;
   readonly client_id?: string | null;
+}
+
+/** A timer set with ctx.schedule(), as onTimer receives it. */
+export interface TimerEvent {
+  readonly id: string;
+  readonly at_ms: number;
+  readonly tag: string | null;
 }
 
 /**
@@ -329,6 +354,7 @@ export declare class Order {
  *     onBook(ctx: Ctx, event: BookEvent): Order | null   // the book itself: ctx.book()
  *     onTrade(ctx: Ctx, trade: TradeEvent): Order | null
  *     onSettle(ctx: Ctx, market: Market, outcome: Outcome): void
+ *     onTimer(ctx: Ctx, timer: TimerEvent): Order | null   // ctx.schedule(atMs, tag)
  */
 export declare class Strategy<P = Record<string, unknown>> {
   /** Params from the manifest, injected by the runner before the first hook. */

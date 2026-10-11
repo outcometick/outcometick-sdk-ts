@@ -19,7 +19,7 @@ import os
 import time
 from typing import Any, Callable
 
-from otengine import Book, BudgetMonitor, Portfolio, Rec, RunAbort, contract_value, make_rng
+from otengine import Book, BudgetMonitor, Portfolio, Rec, RunAbort, contract_value, js_round, make_rng
 from otmaker import MAX_RESTING, MakerBook
 
 
@@ -117,6 +117,10 @@ class BookView:
     def mid(self, side):
         return _BOOKS[id(self)].mid(side)
 
+    def quote_ts(self, side):
+        """When each best level was last set (exchange time); None when empty."""
+        return Rec(_BOOKS[id(self)].quote_ts(side))
+
 
 # Engine internals, keyed by the Ctx that fronts them.
 #
@@ -186,6 +190,8 @@ class Ctx:
             "market": None,
             # Set by MarketReplay: {orders(), cancel(id)}; None outside a replay.
             "resting": None,
+            # Set by MarketReplay in global mode with on_timer: {schedule, unschedule}.
+            "timers": None,
         }
 
     @property
@@ -257,6 +263,17 @@ class Ctx:
         queue position. Mirrors ctx.orders() in replay.mjs."""
         r = _INTERNALS[id(self)]["resting"]
         return [Rec(v) for v in r["orders"]()] if r else []
+
+    def schedule(self, at_ms, tag=None):
+        """Wake on_timer at `at_ms`; returns the timer id. MUST MATCH ctx.schedule in replay.mjs."""
+        t = _INTERNALS[id(self)]["timers"]
+        if t is None:
+            raise RunAbort("E_MANIFEST", "ctx.schedule needs the on_timer hook declared in the manifest")
+        return t["schedule"](at_ms, tag)
+
+    def unschedule(self, timer_id) -> bool:
+        t = _INTERNALS[id(self)]["timers"]
+        return t["unschedule"](timer_id) if t is not None else False
 
     def cancel(self, order_id) -> bool:
         """Cancel a resting order by engine id or client_id, after the cancel
@@ -355,7 +372,8 @@ class MarketReplay:
                  portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
                  log_budget: dict | None = None, budget: BudgetMonitor | None = None,
                  references=None, series=None, seed: int = 1,
-                 fee_bps: float = 0, resting: dict | None = None, terminal=None) -> None:
+                 fee_bps: float = 0, resting: dict | None = None, terminal=None, engine=None,
+                 clock: dict | None = None) -> None:
         self.market_id = market["market_id"]
         self.market = market
         # generic-data.mjs; see the matching comment in replay.mjs.
@@ -376,10 +394,16 @@ class MarketReplay:
         else:
             self._market_rec = Rec({k: v for k, v in market.items() if k != "outcome"})
             self._settle_rec = Rec(market)
-        self.pf = portfolio if portfolio is not None else Portfolio(fee_bps=fee_bps)
+        self.pf = portfolio if portfolio is not None else Portfolio(fee_bps=fee_bps, engine=engine)
         self.pf.set_market_fee(self.market_id, market.get("fee"))
         if self.generic:
             self.pf.set_market_labels(self.market_id, market.get("labels"))
+        self.engine = engine
+        if engine and engine.get("order_rules"):
+            self.pf.set_market_rules(self.market_id, market_rules(engine["order_rules"], market))
+        if engine and engine.get("mirror_depth") == "shared" and (
+                engine.get("mirror_markets") == "all" or market.get("book_model") == "single_mirrored"):
+            self.pf.set_mirrored(self.market_id)
         self.book = Book(self.market_id)
         self.monitor = budget if budget is not None else BudgetMonitor()
         self.strategy = strategy
@@ -392,7 +416,23 @@ class MarketReplay:
         self.state["book"] = self.book
         # The engine's own copy of the market, for assert_outcome.
         self.state["market"] = dict(market)
-        self.state["view"] = BookView(self.book)
+        # Phase 2b global scheduler -- see replay.mjs.
+        self.global_ = isinstance(engine, dict) and engine.get("scheduler") == "global"
+        self.job_seq = 0
+        self.local_book = self.book
+        if self.global_:
+            fl = engine.get("feed_latency")
+            self.feed_latency = fl if isinstance(fl, int) and not isinstance(fl, bool) and fl > 0 else 0
+            if self.feed_latency > 0:
+                self.local_book = Book(self.market_id)
+                self.state["book"] = self.local_book
+            self.timer_stats = {"created": 0, "fired": 0, "dropped": 0}
+            self.timer_ids = 0
+            # The run's clock {"t"}, advanced only by the harness -- see replay.mjs.
+            self.clock = clock if clock is not None else {"t": float("-inf")}
+            if engine.get("timers") is True:
+                self.state["timers"] = {"schedule": self._schedule_timer, "unschedule": self._unschedule_timer}
+        self.state["view"] = BookView(self.local_book)
         self.state["resting"] = {"orders": self._orders_view, "cancel": self._request_cancel}
         # Resting-order policy; see the matching comment in replay.mjs.
         self.resting = resting
@@ -417,14 +457,114 @@ class MarketReplay:
 
     def _schedule(self, at: int, kind: str, payload) -> None:
         i = len(self.pending)
+        if self.global_:
+            # Nothing lands before what the run has processed -- see replay.mjs.
+            if at < self.clock["t"]:
+                at = self.clock["t"]
+            rank = _JOB_RANK.get(kind, 0)
+            while i > 0 and (self.pending[i - 1]["at"] > at
+                             or (self.pending[i - 1]["at"] == at and self.pending[i - 1]["rank"] > rank)):
+                i -= 1
+            self.pending.insert(i, {"at": at, "kind": kind, "payload": payload, "rank": rank, "seq": self.job_seq})
+            self.job_seq += 1
+            return
         while i > 0 and self.pending[i - 1]["at"] > at:
             i -= 1
         self.pending.insert(i, {"at": at, "kind": kind, "payload": payload})
+
+    def next_due(self):
+        """MUST MATCH nextDue in replay.mjs."""
+        if not self.pending:
+            return None
+        j = self.pending[0]
+        return {"at": j["at"], "rank": j["rank"], "seq": j["seq"]}
+
+    def run_one(self) -> None:
+        """MUST MATCH runOne in replay.mjs."""
+        if not self.pending:
+            return
+        job = self.pending.pop(0)
+        if job["at"] > self.close_ts:
+            if job["kind"] == "timer":
+                self.timer_stats["dropped"] += 1
+            return
+        if job["at"] < self.clock["t"]:
+            raise RunAbort("E_RUNTIME", f"engine invariant: a {job['kind']} at {job['at']} after the run reached {self.clock['t']}")
+        self.state["now"] = job["at"]
+        if job["kind"] == "timer":
+            self.timer_stats["fired"] += 1
+            if self.timer_stats["fired"] > MAX_TIMERS_FIRED:
+                raise RunAbort("E_RUNTIME", f"more than {MAX_TIMERS_FIRED} timers fired in market {self.market_id}")
+            t = job["payload"]
+            if self.hooks.get("on_timer"):
+                self._emit(self._call("on_timer", Rec({"id": t["id"], "at_ms": job["at"], "tag": t["tag"]})), job["at"])
+            self._check_budget()
+            return
+        if job["kind"] == "arrival":
+            self._arrive(job["payload"])
+            return
+        self._run_exchange_job(job)
+
+    def _schedule_timer(self, at_ms, tag):
+        # After the later of this market's now and the run's -- see replay.mjs.
+        now = max(self.state["now"], self.clock["t"])
+        ok = isinstance(at_ms, int) and not isinstance(at_ms, bool) and abs(at_ms) <= 9007199254740991
+        if isinstance(at_ms, float) and at_ms.is_integer() and abs(at_ms) <= 9007199254740991:
+            at_ms, ok = int(at_ms), True
+        if not ok or at_ms <= now:
+            raise RunAbort("E_RUNTIME", f"ctx.schedule needs a whole-millisecond time after now ({now}), got {_js_json(at_ms)}")
+        visible = self.market.get("trading_end_ts_ms") if self.generic else self.market.get("close_ts_ms")
+        if visible is not None and at_ms > visible:
+            raise RunAbort("E_RUNTIME", f"ctx.schedule({at_ms}) is after the market's close ({visible})")
+        if tag is not None and not (isinstance(tag, str) and len(tag.encode("utf-16-le")) // 2 <= 64):
+            raise RunAbort("E_RUNTIME", "a timer tag must be a string of at most 64 characters")
+        if sum(1 for j in self.pending if j["kind"] == "timer") >= MAX_PENDING_TIMERS:
+            raise RunAbort("E_RUNTIME", f"more than {MAX_PENDING_TIMERS} pending timers in market {self.market_id}")
+        self.timer_stats["created"] += 1
+        if self.timer_stats["created"] > MAX_TIMERS_CREATED:
+            raise RunAbort("E_RUNTIME", f"more than {MAX_TIMERS_CREATED} timers scheduled in market {self.market_id}")
+        self.timer_ids += 1
+        tid = f"t{self.timer_ids}"
+        self._schedule(at_ms, "timer", {"id": tid, "tag": tag})
+        return tid
+
+    def _unschedule_timer(self, timer_id) -> bool:
+        for i, j in enumerate(self.pending):
+            if j["kind"] == "timer" and j["payload"]["id"] == timer_id:
+                del self.pending[i]
+                return True
+        return False
+
+    def _arrive(self, ev) -> None:
+        """A lagged event reaches the strategy. MUST MATCH #arrive in replay.mjs."""
+        kind = ev.get("kind")
+        if kind == "book":
+            apply_event(self.local_book, ev, self.generic)
+        if kind == "tick":
+            self.state["history"].append(Rec(ev))
+        bbo = ev.get("bbo")
+        hook = None if bbo else HOOK_FOR.get(kind)
+        if hook and self.hooks.get(hook):
+            self._emit(self._call(hook, Rec(ev)), self.state["now"])
+        self._check_budget()
+
+    def _drop_pending(self) -> None:
+        if self.global_:
+            self.timer_stats["dropped"] += sum(1 for j in self.pending if j["kind"] == "timer")
+        self.pending.clear()
 
     def drain_until(self, ts) -> None:
         """Execute everything scheduled at or before `ts`, against this book."""
         while self.pending and self.pending[0]["at"] <= ts:
             job = self.pending.pop(0)
+            if self.global_ and job["kind"] not in ("order", "activate", "cancel", "flatten"):
+                if job["kind"] == "timer":
+                    self.timer_stats["dropped"] += 1
+                continue
+            self._run_exchange_job(job)
+
+    def _run_exchange_job(self, job) -> None:
+        if True:
             if job["kind"] == "order":
                 order = job["payload"]
                 res = self.pf.execute(self.book, order, job["at"], self.market_id, how="exit")
@@ -446,10 +586,12 @@ class MarketReplay:
             return False
         # Resolved NOW, to the record -- see replay.mjs.
         rec = self.maker.find(order_id)
+        # Asked now in the run's time -- see replay.mjs.
+        asked = max(self.state["now"], self.clock["t"]) if self.global_ else self.state["now"]
         if rec is None:
-            self.maker.cancel(None, self.state["now"])
+            self.maker.cancel(None, asked)
             return False
-        self._schedule(self.state["now"] + self.cancel_latency_ms, "cancel", rec)
+        self._schedule(asked + self.cancel_latency_ms, "cancel", rec)
         return True
 
     def _call(self, canonical: str, *args):
@@ -484,6 +626,13 @@ class MarketReplay:
             tif = row.get("tif")
             if tif is None:
                 tif = "ioc"
+            if tif == "fok":
+                if not (self.engine and self.engine.get("fok")):
+                    raise RunAbort("E_MANIFEST", 'tif "fok" needs "fok": true in the manifest')
+                if row.get("post_only") is True or row.get("client_id") is not None:
+                    raise RunAbort("E_MANIFEST", "post_only and client_id are for gtc orders, not fok")
+                self._schedule(ts + self.fill_delay_ms, "order", row)
+                continue
             if tif == "gtc":
                 self._submit_resting(row, ts)
                 continue
@@ -508,7 +657,10 @@ class MarketReplay:
         if self.monitor.breached:
             raise RunAbort("E_BUDGET", f"per-event budget exceeded: {self.monitor.summary()}")
 
-    def open(self) -> None:
+    def open(self, open_ts=None) -> None:
+        if self.global_ and isinstance(open_ts, (int, float)) and not isinstance(open_ts, bool) \
+                and open_ts == open_ts and open_ts not in (float("inf"), float("-inf")):
+            self.state["now"] = open_ts
         self._call("on_market_open", self._market_rec)
         self._check_budget()
 
@@ -525,8 +677,9 @@ class MarketReplay:
             return False
         state = self.state
         # Everything scheduled strictly before this event resolves against the
-        # book as it stood then.
-        self.drain_until(ts - 1)
+        # book as it stood then. (Global mode: the harness scheduler did.)
+        if not self.global_:
+            self.drain_until(ts - 1)
         state["now"] = ts
         maker = self.maker
         if maker is not None:
@@ -541,24 +694,19 @@ class MarketReplay:
             # and no size -- which Book.delta rejects by raising, taking the
             # whole run with it. MUST MATCH the same ordering in
             # runner/engine/replay.mjs.
-            generic = self.generic
-
             def apply():
-                if bbo:
-                    self.book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"), generic)
-                elif ev.get("snapshot"):
-                    self.book.snapshot(ts, ev.get("levels") or {})
-                elif generic and ev.get("mirror") is True:
-                    self.book.delta_mirrored(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
-                else:
-                    self.book.delta(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
+                apply_event(self.book, ev, self.generic)
             if maker is not None:
                 maker.book_event(ev, self.book, apply)
             else:
                 apply()
         elif kind == "trade" and maker is not None:
             maker.trade(ev, self.book)
-        self.drain_until(ts)
+        if not self.global_:
+            self.drain_until(ts)
+        if self.global_ and self.feed_latency > 0:
+            self._schedule(ts + self.feed_latency, "arrival", ev)
+            return True
 
         ev_rec = Rec(ev)
         if kind == "tick":
@@ -587,7 +735,7 @@ class MarketReplay:
         self.drain_until(ts)
         if self.maker is not None:
             self.maker.close(ts, self.book)
-        self.pending.clear()
+        self._drop_pending()
         self.marked = [] if self.market.get("outcome") else self.pf.mark(self.market_id, self.terminal, ts)
 
     def _close_generic(self) -> dict:
@@ -599,6 +747,8 @@ class MarketReplay:
         settle_ts = self.declared_close
         state["now"] = settle_ts
         settled = self.marked
+        if self.close_now is not None and self.close_now > settle_ts:
+            state["now"] = self.close_now
         if outcome:
             self._call("on_settle", self._settle_rec, outcome)
             settled = self.pf.settle(self.market_id, outcome, settle_ts)
@@ -618,10 +768,13 @@ class MarketReplay:
             "crosschecks": state["crosschecks"],
             "budget": self.monitor.summary(),
             "maker": self.maker.stats if self.maker is not None else None,
+            "timers": self.timer_stats if self.global_ else None,
         }
         return self.closed
 
-    def close(self) -> dict:
+    def close(self, now_ts=None) -> dict:
+        self.close_now = now_ts if (self.global_ and isinstance(now_ts, (int, float))
+                                    and not isinstance(now_ts, bool) and now_ts == now_ts) else None
         if self.generic:
             return self._close_generic()
         state = self.state
@@ -632,9 +785,11 @@ class MarketReplay:
         self.drain_until(settle_ts)
         if self.maker is not None:
             self.maker.close(settle_ts, self.book)
-        self.pending.clear()
+        self._drop_pending()
 
         market = self.market
+        if self.close_now is not None and self.close_now > settle_ts:
+            state["now"] = self.close_now
         self._call("on_settle", self._settle_rec, market.get("outcome"))
         outcome = market.get("outcome")
         settled = self.pf.settle(self.market_id, market["outcome"], settle_ts) if outcome else []
@@ -657,7 +812,42 @@ class MarketReplay:
             "crosschecks": state["crosschecks"],
             "budget": self.monitor.summary(),
             "maker": self.maker.stats if self.maker is not None else None,
+            "timers": self.timer_stats if self.global_ else None,
         }
+
+
+# Same-millisecond order of a market's jobs in global mode. MUST MATCH replay.mjs.
+_JOB_RANK = {"order": 0, "activate": 0, "cancel": 0, "flatten": 0, "arrival": 1, "timer": 2}
+MAX_PENDING_TIMERS = 64
+MAX_TIMERS_CREATED = 10_000
+MAX_TIMERS_FIRED = 100_000
+
+
+def apply_event(book, ev, generic) -> None:
+    """MUST MATCH applyEvent in replay.mjs."""
+    ts = ev["ts_ms"]
+    if ev.get("bbo"):
+        book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"), generic)
+    elif ev.get("snapshot"):
+        book.snapshot(ts, ev.get("levels") or {})
+    elif generic and ev.get("mirror") is True:
+        book.delta_mirrored(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
+    else:
+        book.delta(ts, ev.get("side"), ev.get("ladder"), ev.get("px"), ev.get("size"))
+
+
+def market_rules(rules: dict, market: dict) -> dict:
+    """MUST MATCH marketRules in replay.mjs."""
+    venue = rules.get("mode") == "venue"
+    tick = market.get("tick_size") if venue else rules.get("tick")
+    min_size = market.get("min_size") if venue else rules.get("min_size")
+    ok_num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and v not in (float("inf"), float("-inf"))  # noqa: E731
+    tick_ticks = js_round(tick * 10_000) if ok_num(tick) else None
+    if (not ok_num(tick) or not tick > 0 or tick_ticks is None or not tick_ticks >= 1
+            or abs(tick_ticks - tick * 10_000) > 1e-6 or not ok_num(min_size) or not min_size > 0):
+        raise RunAbort("E_RUNTIME", f"market {market.get('market_id')}: order_rules need a tick on a 0.0001 grid "
+                                    "and a positive minimum size")
+    return {"tickTicks": tick_ticks, "minSize": min_size}
 
 
 _GENERIC_VIEW = (

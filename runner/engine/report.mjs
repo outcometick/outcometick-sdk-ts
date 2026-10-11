@@ -560,6 +560,38 @@ export function makerReport({ stats, fills, queueModel, printLagMs }) {
   };
 }
 
+/**
+ * The report's `orders` block: which execution options the run used, what they
+ * refused, and the rebate estimate. Null when the run enabled none.
+ * MUST MATCH orders_report in client/backtest/report.py.
+ */
+export function ordersReport({ policy, stats }) {
+  if (!policy || (!policy.fok && !policy.order_rules && policy.maker_rebate == null
+    && !policy.quote_guard && !policy.mirror_depth)) return null;
+  const rules = policy.order_rules;
+  return {
+    fok: Boolean(policy.fok),
+    order_rules: rules == null ? null : (rules.mode === 'assumed'
+      ? {
+        mode: 'assumed', assumed_tick: rules.tick, assumed_min_size: rules.min_size, size_step: rules.size_step,
+        note: 'archive markets do not carry their tick or minimum size: these are values measured on the archive, '
+          + 'not read per market — a market quoting in 0.01 would accept a 0.001 limit, one quoting finer would refuse it',
+      }
+      : { mode: 'venue', size_step: 0.01, note: 'tick and minimum size read from each market' }),
+    quote_guard: policy.quote_guard == null ? null : {
+      ...policy.quote_guard,
+      applies_to: policy.quote_guard.include_exits ? 'opening and exit taker orders' : 'opening taker orders (exits are never blocked)',
+    },
+    mirror_depth: policy.mirror_depth ?? null,
+    maker_rebate: policy.maker_rebate == null ? null : {
+      rate: policy.maker_rebate,
+      total: r2(stats?.rebates ?? 0),
+      note: 'an estimate: the venue pays maker rebates from a daily pool, pro rata, not per fill',
+    },
+    rejected: { ...(stats?.rejected ?? {}) },
+  };
+}
+
 /** PnL split by asset and market period, for the by-market panel. */
 export function splitByMarket(trades, marketMeta = new Map()) {
   const groups = new Map();
@@ -652,7 +684,7 @@ export function buildReport({
   runId, submittedAt, manifest, scope, sourceSha256 = null,
   trades, fillStats: fillSummary, marketSummaries, marketMeta,
   feesPaid = 0, fillDelayMs = 0, feeModel = null, sweep = null, coverage = null,
-  crosschecks = [], budget = null, seed = null, scanned = {}, maker = null,
+  crosschecks = [], budget = null, seed = null, scanned = {}, maker = null, orders = null, timers = null,
 }) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
   const equity = equityCurve(closed);
@@ -719,6 +751,12 @@ export function buildReport({
     fee_model: feeModel,
     // Resting orders, when the strategy used any (makerReport).
     maker,
+    // Execution options and what they refused (ordersReport) — only when the
+    // run enabled any, so a run without them has the same bytes as always.
+    ...(orders ? { orders } : {}),
+    // Timers (on_timer): how many were set, fired, and dropped at the end of
+    // trading — only when the strategy declared the hook.
+    ...(timers ? { timers } : {}),
     sweep,
     coverage,
     budget,

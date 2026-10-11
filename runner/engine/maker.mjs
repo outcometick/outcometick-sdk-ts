@@ -280,11 +280,19 @@ export class MakerBook {
     const limit = eff?.limit;
     const ticks = limit == null ? null : toTicks(limit);
     // A resting order needs a price to rest at, on the venue's grid, strictly
-    // inside (0, 1).
+    // inside (0, 1). Under order_rules the grid is the market's own tick.
+    const grid = this.pf.marketRules.get(this.marketId)?.tickTicks ?? TICK_GRID;
     if (!eff || limit == null || !(limit > 0 && limit < 1)
-        || ticks % TICK_GRID !== 0 || Math.abs(fromTicks(ticks) - limit) > EPS) {
+        || ticks % grid !== 0 || Math.abs(fromTicks(ticks) - limit) > EPS) {
       rec.state = 'rejected';
       this.stats.rejected_invalid += 1;
+      return;
+    }
+    // quote_guard refuses the WHOLE order: a guarded order that may not take
+    // must not rest and fill later either.
+    if (this.pf.quoteGuard && this.pf.quoteGuardFailure(book, ts, eff)) {
+      rec.state = 'rejected';
+      this.pf.countReject('quote_guard');
       return;
     }
     const { kind, q } = canonicalOf(rec.side, rec.reduce, ticks);

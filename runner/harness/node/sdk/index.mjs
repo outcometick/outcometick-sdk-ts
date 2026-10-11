@@ -102,8 +102,10 @@ export class Order {
       // never asked for.
       throw new Error(`limit must be between 0 and 1, got ${JSON.stringify(limit)}`);
     }
-    if (tif !== 'ioc' && tif !== 'gtc') {
-      throw new Error(`tif must be "ioc" or "gtc", got ${JSON.stringify(tif)}`);
+    // fok: all of it within the limit on arrival, or none of it. The run must
+    // declare it ("fok": true in the manifest).
+    if (tif !== 'ioc' && tif !== 'gtc' && tif !== 'fok') {
+      throw new Error(`tif must be "ioc", "gtc" or "fok", got ${JSON.stringify(tif)}`);
     }
     const postOnlyFlag = Boolean(postOnly || post_only);
     const cid = clientId ?? client_id;

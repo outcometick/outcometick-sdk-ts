@@ -89,7 +89,7 @@ const MUST_NOT_COMPILE = [
   `],
   ['a time-in-force the engine does not model', `
     import { Order } from './sdk/index.js';
-    export const o = new Order({ side: 'UP', size: 1, limit: 0.4, tif: 'fok' });
+    export const o = new Order({ side: 'UP', size: 1, limit: 0.4, tif: 'day' });
   `],
   ['a resting order with no price to rest at', `
     import { Order } from './sdk/index.js';

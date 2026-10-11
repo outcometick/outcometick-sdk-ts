@@ -834,7 +834,7 @@ function finalRecord(rec, { start, tradeUntil, resolution }) {
  * pmdata adapter). Returns entries shaped like the archive path's, plus the
  * dataset counts.
  */
-export async function decodeGeneric({ entries, frames = null, feed = null, eventsDir, markMaxAgeMs = null }) {
+export async function decodeGeneric({ entries, frames = null, feed = null, eventsDir, markMaxAgeMs = null, orderRules = false }) {
   const { markets, rejected, bySlug, byToken } = indexGenericMarkets(entries);
   if (markets.size === 0) {
     throw new DatasetError(`no usable market in the markets file${rejected.length ? ` (${rejected[0].market_id ?? '?'}: ${rejected[0].why})` : ''}`);
@@ -942,6 +942,11 @@ export async function decodeGeneric({ entries, frames = null, feed = null, event
       unusable.push({ market_id: id, why: 'no book inside the trading window' });
       continue;
     }
+    if (orderRules && !rulesReadable(rec)) {
+      await rm(dest, { force: true });
+      unusable.push({ market_id: id, why: 'order_rules "venue" needs this market\'s tick_size (on a 0.0001 grid) and min_size' });
+      continue;
+    }
     let terminal = null;
     if (!resolution) {
       const m = quotes.mark(tradeUntil, markMaxAgeMs);
@@ -964,8 +969,18 @@ export async function decodeGeneric({ entries, frames = null, feed = null, event
   return { markets: out, unusable, counts: { ...router.counts, ...dropped } };
 }
 
+/** Can order_rules "venue" read this market's tick and minimum? MUST MATCH rules_readable in generic.py. */
+export function rulesReadable(rec) {
+  const tick = rec.tick_size;
+  const min = rec.min_size;
+  if (typeof tick !== 'number' || !Number.isFinite(tick) || !(tick > 0)) return false;
+  const t = Math.round(tick * 10_000);
+  if (!(t >= 1) || Math.abs(t - tick * 10_000) > 1e-6) return false;
+  return typeof min === 'number' && Number.isFinite(min) && min > 0;
+}
+
 /** A generic dataset directory -> decodeGeneric. */
-export async function decodeGenericDir(root, { eventsDir, markMaxAgeMs = null } = {}) {
+export async function decodeGenericDir(root, { eventsDir, markMaxAgeMs = null, orderRules = false } = {}) {
   const entries = await readMarketsFile(root);
   const files = await datasetFiles(root);
   async function* frames() {
@@ -977,6 +992,6 @@ export async function decodeGenericDir(root, { eventsDir, markMaxAgeMs = null } 
       }
     }
   }
-  const out = await decodeGeneric({ entries, frames: frames(), eventsDir, markMaxAgeMs });
+  const out = await decodeGeneric({ entries, frames: frames(), eventsDir, markMaxAgeMs, orderRules });
   return { ...out, inputs: files };
 }

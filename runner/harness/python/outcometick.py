@@ -100,8 +100,9 @@ class Order:
             # that is not a price, and silently clamping it would fill an order
             # the strategy never asked for.
             raise ValueError(f"limit must be between 0 and 1, got {limit!r}")
-        if tif not in ("ioc", "gtc"):
-            raise ValueError(f'tif must be "ioc" or "gtc", got {tif!r}')
+        # fok: all of it within the limit, or none of it -- see index.mjs.
+        if tif not in ("ioc", "gtc", "fok"):
+            raise ValueError(f'tif must be "ioc", "gtc" or "fok", got {tif!r}')
         # Mirrors index.mjs: a resting order rests AT a price; hold_s has no
         # single fill to time from; post_only and client_id mean nothing to an ioc.
         if tif == "gtc":

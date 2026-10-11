@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.5.0';
+export const SDK_VERSION = '2.6.0';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -26,6 +26,13 @@ export const SDK_VERSION = '2.5.0';
  * runs the old harness under the new worker — and the failure is silent. The
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
+ *
+ * 1.23.0: execution options (job.engine): fok, order rules, quote guard and
+ * BookView.quote_ts, maker rebate estimate, shared mirrored depth; optional
+ * fill fields (reject_reason, rebate) and result `orders`, only when enabled.
+ * Global scheduler (on_timer hook, ctx.schedule, feed_latency with a local
+ * book) and timed session lines ("t"), only when the on_timer hook or a feed
+ * latency is declared. Every option off = the 1.22.0 behaviour, byte for byte.
  *
  * 1.22.0: no protocol change for archive runs. Engine and harness learn
  * generic-data markets (kind 'generic': labels as order sides, trading ending
@@ -101,7 +108,7 @@ export const SDK_VERSION = '2.5.0';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.22.0';
+export const SANDBOX_IMAGE_TAG = '1.23.0';
 
 // ---------------------------------------------------------------------------
 // Languages
@@ -150,6 +157,7 @@ export const HOOK_NAMES = Object.freeze({
     on_book: 'on_book',
     on_trade: 'on_trade',
     on_settle: 'on_settle',
+    on_timer: 'on_timer',
   }),
   nodejs: Object.freeze({
     on_market_open: 'onMarketOpen',
@@ -157,6 +165,7 @@ export const HOOK_NAMES = Object.freeze({
     on_book: 'onBook',
     on_trade: 'onTrade',
     on_settle: 'onSettle',
+    on_timer: 'onTimer',
   }),
 });
 
@@ -175,6 +184,9 @@ export const HOOKS = Object.freeze({
   on_book: Object.freeze({ arity: 3, emitsOrders: true, requiresDataset: 'book' }),
   on_trade: Object.freeze({ arity: 3, emitsOrders: true, requiresDataset: 'trades' }),
   on_settle: Object.freeze({ arity: 4, emitsOrders: false, requiresDataset: null }),
+  // A timer the strategy set with ctx.schedule(at_ms) — phase 2b. Declaring it
+  // puts the run on the global scheduler (enginePolicyFor).
+  on_timer: Object.freeze({ arity: 3, emitsOrders: true, requiresDataset: null }),
 });
 
 export const KNOWN_HOOKS = Object.freeze(Object.keys(HOOKS));

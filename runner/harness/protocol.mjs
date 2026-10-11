@@ -231,7 +231,24 @@ export function parseFill(raw) {
     markout_60s: px(raw.markout_60s),
     markout_settle: px(raw.markout_settle),
     ...(typeof raw.label === 'string' ? { label: label(raw.label) } : {}),
+    // Execution options (phase 2a): present exactly when the run enabled them.
+    ...('reject_reason' in raw ? { reject_reason: REJECT_REASONS.includes(raw.reject_reason) ? raw.reject_reason : null } : {}),
+    ...('rebate' in raw ? { rebate: finite(raw.rebate) ? raw.rebate : 0 } : {}),
   };
+}
+
+/** Why an order did not execute, as the engines write it. MUST MATCH the Python report parser. */
+export const REJECT_REASONS = Object.freeze(['fok_unfilled', 'quote_guard', 'below_min_size', 'size_step', 'off_tick']);
+
+/** A harness's run-wide order counters (job.engine), or null. */
+function parseOrderStats(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const rejected = {};
+  for (const k of REJECT_REASONS) {
+    const v = raw.rejected?.[k];
+    if (finite(v) && v > 0) rejected[k] = v;
+  }
+  return { rejected, rebates: finite(raw.rebates) ? raw.rebates : 0 };
 }
 
 /** A harness's summed maker counters: finite non-negative numbers, or null. */
@@ -284,6 +301,10 @@ export function parseResult(raw) {
     logTruncated: Boolean(r.log_truncated),
     budget: r.budget && typeof r.budget === 'object' ? r.budget : null,
     maker: parseMakerStats(r.maker),
+    orders: parseOrderStats(r.orders),
+    timers: r.timers && typeof r.timers === 'object'
+      ? { created: finite(r.timers.created) ? r.timers.created : 0, fired: finite(r.timers.fired) ? r.timers.fired : 0, dropped: finite(r.timers.dropped) ? r.timers.dropped : 0 }
+      : null,
     marketSummaries: marketSummaries.filter((m) => m && typeof m === 'object').map((m) => ({
       market_id: typeof m.market_id === 'string' ? m.market_id : null,
       asset: typeof m.asset === 'string' ? m.asset : null,
