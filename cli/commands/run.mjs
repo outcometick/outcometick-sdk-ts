@@ -207,7 +207,7 @@ export async function cmdRun({ dir, flags }) {
       + '  They come from an archive held on the worker, so `ot run` would hand\n'
       + '  your strategy empty feeds and a report that does not match the queued\n'
       + '  one. Submit it instead:\n'
-      + '    ot submit .  --assets btc --range "30 days"',
+      + '    ot submit . --assets btc --days 20',
     );
   }
 
