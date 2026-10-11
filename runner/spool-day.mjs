@@ -92,6 +92,21 @@ export async function readEventLines(file, { dropTrades = false } = {}) {
  * `feed` is [{ path, bytes, rows: () => AsyncIterable<row> }], in read order.
  * Writes `<day>-<market>.jsonl.gz` into `eventsDir` for every usable market.
  */
+// Lines joined into ~1 MB strings before they reach gzip. Handing zlib one
+// line per chunk made every line its own threadpool round trip: on a polymarket
+// BTC day (two million lines) the decode spent ~80% of its wall clock waiting on
+// those, against 4% parsing JSON. Deflate without flushes does not depend on how
+// its input is chunked, so the file is byte-for-byte the same.
+const GZIP_CHUNK_CHARS = 1 << 20;
+export function* gzipChunks(events, max = GZIP_CHUNK_CHARS) {
+  let buf = '';
+  for (const e of events) {
+    buf += `${JSON.stringify(e)}\n`;
+    if (buf.length >= max) { yield buf; buf = ''; }
+  }
+  if (buf) yield buf;
+}
+
 export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDir, feed, pause = null }) {
   // SPOOLED TO DISK, not accumulated in memory.
   //
@@ -212,7 +227,7 @@ export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDi
     // someone else's link.
     const tmpFile = `${file}.${process.pid}.tmp`;
     await pipeline(
-      Readable.from(inWindow.map((e) => `${JSON.stringify(e)}\n`)),
+      Readable.from(gzipChunks(inWindow)),
       createGzip(),
       createWriteStream(path.join(eventsDir, tmpFile)),
     );

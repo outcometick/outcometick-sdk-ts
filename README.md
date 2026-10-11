@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 5487c79deb7332a6c2c0ecf0ec310d5c0e62bc77.
+  Generated from monorepo revision 7524c889e4744f045974f54ad88db9dcf7641ebb.
 -->
 
 # outcometick
