@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.7.0';
+export const SDK_VERSION = '2.8.0';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -112,6 +112,15 @@ export const SDK_VERSION = '2.7.0';
  * containerised run had ever returned anything.
  */
 export const SANDBOX_IMAGE_TAG = '1.24.0';
+
+/**
+ * The archive decoder's semantics, as part of a run's identity (the
+ * pre-registration fingerprint). The image tag above covers the engine and the
+ * harness; this covers what the decoder makes of the archive. Bump it with any
+ * change that alters the events a strategy is fed or the market records
+ * (runner/events.mjs, spool-day.mjs, generic-data.mjs and their Python ports).
+ */
+export const DECODE_SEMANTICS = 1;
 
 // ---------------------------------------------------------------------------
 // Languages

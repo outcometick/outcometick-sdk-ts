@@ -52,6 +52,14 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
       Every market in it is replayed; an unresolved one is valued at the
       external mid when trading ends (--mark-max-age-ms refuses older quotes).
 
+  ot fingerprint <dir> --assets btc,eth --from <day> --to <day> [--venue polymarket] [--seed 1]
+                [--book-throttle on|off] [--fee-bps <n>]
+  ot fingerprint <dir> --data <your-dataset> [--mark-max-age-ms <ms>]
+      The run's pre-registration fingerprint, without running it: one sha256
+      over the code, manifest, params, options, the days (every one of them),
+      your own data's bytes, replay settings and the seed. Publish it first;
+      the report of the same run carries the same value.
+
   ot submit <dir> --assets btc,eth --days <n> [--venue polymarket]
   ot submit <dir> --assets btc,eth --from <day> --to <day> [--venue polymarket]
       Send it to the queue. Needs OT_BACKTEST_KEY.
@@ -238,6 +246,10 @@ async function main(argv) {
     if (command === 'run') {
       const { cmdRun } = await import('./commands/run.mjs');
       return await cmdRun(parsed);
+    }
+    if (command === 'fingerprint') {
+      const { cmdFingerprint } = await import('./commands/fingerprint.mjs');
+      return await cmdFingerprint(parsed);
     }
     if (command === 'submit') {
       const { cmdSubmit } = await import('./commands/submit.mjs');

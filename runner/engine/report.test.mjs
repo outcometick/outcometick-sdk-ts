@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   metrics, brier, edgePerContract, equityCurve, maxDrawdown, worstLosingRun,
   calibration, baselines, slippage, splitByMarket, sweepPanel,
-  buildReport, fillStats, slippageAccumulator,
+  buildReport, fillStats, slippageAccumulator, marketRows, bySettlement,
 } from './report.mjs';
 
 const day = (d) => Date.parse(`2026-07-${String(d).padStart(2, '0')}T12:00:00Z`);
@@ -545,8 +545,63 @@ test('the streaming slippage panel equals the array version, bit for bit', () =>
   const acc = slippageAccumulator();
   for (const f of fills) acc.add(f);
   assert.deepEqual(acc.result(), reference(fills));
-  const { makerFills, ...rest } = fillStats(fills);
+  const { makerFills, activity, ...rest } = fillStats(fills);
   assert.deepEqual(rest, { count: 5000, slippage: reference(fills) });
+  // Activity: every fill that moved contracts, at its average price.
+  const moved = fills.filter((f) => f.filled > 0);
+  const r2 = (x) => Number(x.toFixed(2));
+  assert.deepEqual(activity, {
+    fills: moved.length,
+    contracts: r2(moved.reduce((a, f) => a + f.filled, 0)),
+    value: r2(moved.reduce((a, f) => a + f.filled * f.avg_px, 0)),
+    taker_contracts: r2(moved.reduce((a, f) => a + f.filled, 0)),
+    maker_contracts: 0,
+  });
   // None of these fixture rows is a maker fill.
   assert.equal(makerFills.fills, 0);
+});
+
+test('3a: sortino, return over drawdown, day counts, and the two edges with opposite signs', () => {
+  const D = 86_400_000;
+  const day0 = Date.UTC(2026, 9, 1);
+  // Days: +10, -5, -3. Equity by close 10, 5, 2: worst fall 8.
+  const t = (d, pnl, extra = {}) => ({ market_id: `m${d}`, side: 'UP', size: 1, entry_px: 0.5, pnl, opened_ms: day0 + d * D, closed_ms: day0 + d * D + 1, how: 'exit', ...extra });
+  const m = metrics([t(0, 10), t(1, -5), t(2, -3)]);
+  // mean 2/3; downside sqrt((25 + 9) / 3); x sqrt(365)
+  assert.equal(m.sortino, Number(((2 / 3) / Math.sqrt(34 / 3) * Math.sqrt(365)).toFixed(2)));
+  assert.equal(m.return_over_max_drawdown, 0.25);
+  assert.deepEqual([m.trading_days, m.winning_days, m.best_day, m.worst_day], [3, 1, 10, -5]);
+  // One big loser, two small winners: per contract (-60 + 0.6 + 0.6) / 102 < 0,
+  // per trade (-0.6 + 0.6 + 0.6) / 3 = 0.2 > 0.
+  const settled = [
+    { market_id: 'a', side: 'UP', size: 100, entry_px: 0.6, outcome: 'DOWN', how: 'settled', pnl: -60, closed_ms: day0 },
+    { market_id: 'b', side: 'UP', size: 1, entry_px: 0.4, outcome: 'UP', how: 'settled', pnl: 0.6, closed_ms: day0 },
+    { market_id: 'c', side: 'DOWN', size: 1, entry_px: 0.4, outcome: 'DOWN', how: 'settled', pnl: 0.6, closed_ms: day0 },
+  ];
+  const e = metrics(settled);
+  assert.equal(e.edge_per_contract, Number(((-60 + 0.6 + 0.6) / 102).toFixed(4)));
+  assert.equal(e.edge_per_trade, 0.2);
+  assert.equal(metrics([t(0, 1)]).sortino, null, 'one day has no dispersion');
+});
+
+test('3a: one row per market replayed, entered or not; results by settlement rule', () => {
+  const meta = new Map([
+    ['a', { asset: 'BTC', interval: '5m', stream: 'twap60s', outcome: 'DOWN', open_ts_ms: 1, close_ts_ms: 2, strike: 65000, up_px: 0.6, down_px: 0.41 }],
+    ['b', { asset: 'BTC', interval: '5m', stream: 'twap60s', outcome: 'UP', open_ts_ms: 3, close_ts_ms: 4, strike: 65100, up_px: 0.5, down_px: 0.51 }],
+    ['c', { asset: 'ETH', interval: '15m', stream: 'prices', outcome: 'UP', open_ts_ms: 5, close_ts_ms: 6, strike: 3000, up_px: 0.4, down_px: 0.61 }],
+  ]);
+  const trades = [
+    { market_id: 'a', side: 'UP', size: 10, entry_px: 0.6, outcome: 'DOWN', how: 'settled', pnl: -6, fees: 0.1, opened_ms: 1 },
+    { market_id: 'c', side: 'UP', size: 5, entry_px: 0.4, outcome: 'UP', how: 'settled', pnl: 3, fees: 0, opened_ms: 5 },
+    { market_id: 'c', side: 'UP', size: 5, entry_px: 0.5, pnl: 1, how: 'exit', fees: 0, opened_ms: 5.5 },
+  ];
+  const rows = marketRows(trades, meta);
+  assert.deepEqual(rows.map((r) => [r.market_id, r.entered, r.trades, r.contracts, r.net_pnl, r.first_entry_ms]),
+    [['a', true, 1, 10, -6, 1], ['b', false, 0, 0, 0, null], ['c', true, 2, 10, 4, 5]]);
+  assert.deepEqual([rows[1].settlement, rows[1].strike, rows[1].outcome], ['twap60s', 65100, 'UP']);
+  assert.equal(rows[2].edge_per_contract, 0.6, 'only the settled trade scores an edge');
+  assert.deepEqual(bySettlement(rows, trades), [
+    { settlement: 'prices', markets: 1, markets_entered: 1, trades: 2, net_pnl: 4, edge_per_contract: 0.6, edge_per_trade: 0.6 },
+    { settlement: 'twap60s', markets: 2, markets_entered: 1, trades: 1, net_pnl: -6, edge_per_contract: -0.6, edge_per_trade: -0.6 },
+  ]);
 });

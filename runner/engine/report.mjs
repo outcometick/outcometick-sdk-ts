@@ -134,6 +134,20 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
   const daily = [...byDay.values()];
   const sd = stdev(daily);
   const sharpe = sd === 0 ? null : (mean(daily) / sd) * Math.sqrt(365);
+  // Sortino: the same daily P&L, scored against its downside only (target 0,
+  // over every day). MUST MATCH metrics in client/backtest/report.py.
+  let downSq = 0;
+  let winningDays = 0;
+  let bestDay = null;
+  let worstDay = null;
+  for (const d of daily) {
+    if (d < 0) downSq += d * d;
+    if (d > 0) winningDays += 1;
+    if (bestDay == null || d > bestDay) bestDay = d;
+    if (worstDay == null || d < worstDay) worstDay = d;
+  }
+  const downside = daily.length ? Math.sqrt(downSq / daily.length) : 0;
+  const sortino = daily.length < 2 || downside === 0 ? null : (mean(daily) / downside) * Math.sqrt(365);
 
   const holds = closed
     .filter((t) => t.opened_ms != null && t.closed_ms != null)
@@ -153,6 +167,14 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
     max_drawdown: dd.pct == null ? null : r4(dd.pct),
     max_drawdown_abs: r2(dd.abs),
     sharpe: sharpe == null ? null : r2(sharpe),
+    sortino: sortino == null ? null : r2(sortino),
+    // Net P&L over the worst peak-to-trough fall, both in dollars: comparable
+    // across runs without a capital base we were never told.
+    return_over_max_drawdown: dd.abs > 0 ? r2(netPnl / dd.abs) : null,
+    trading_days: daily.length,
+    winning_days: winningDays,
+    best_day: bestDay == null ? null : r2(bestDay),
+    worst_day: worstDay == null ? null : r2(worstDay),
     trades: closed.length,
     // Distinct markets the strategy actually took a position in. The engine
     // does not stop a strategy trading a market twice, so `trades / markets`
@@ -177,6 +199,10 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
     // paid, averaged. This is the number that says whether there was an edge
     // at all, as opposed to a lucky run of variance.
     edge_per_contract: closed.length ? r4(edgePerContract(closed)) : null,
+    // The same edge with every settled trade counting once, whatever its
+    // size. The two can have opposite signs: a few large losing trades and
+    // many small winners.
+    edge_per_trade: edgePerTrade(closed),
     brier_score: r4(brier(closed)),
     fees: r2(-Math.abs(feesPaid)),
     avg_hold_ms: holds.length ? Math.round(mean(holds)) : null,
@@ -205,6 +231,15 @@ export function edgePerContract(trades) {
     contracts += t.size;
   }
   return contracts > 0 ? edge / contracts : 0;
+}
+
+/** Mean (outcome value - entry price) per settled trade, unweighted; null with none. */
+export function edgePerTrade(trades) {
+  const settled = trades.filter((t) => t.how === 'settled' && t.entry_px != null && t.outcome);
+  if (!settled.length) return null;
+  let edge = 0;
+  for (const t of settled) edge += contractValue(t.side, t.outcome) - t.entry_px;
+  return r4(edge / settled.length);
 }
 
 /**
@@ -501,7 +536,9 @@ export function makerFillAccumulator() {
 export function fillStats(fills) {
   const maker = makerFillAccumulator();
   for (const f of fills) maker.add(f);
-  return { count: fills.length, slippage: slippage(fills), makerFills: maker.result() };
+  const activity = activityAccumulator();
+  for (const f of fills) activity.add(f);
+  return { count: fills.length, slippage: slippage(fills), makerFills: maker.result(), activity: activity.result() };
 }
 
 /**
@@ -611,6 +648,133 @@ export function splitByMarket(trades, marketMeta = new Map()) {
 }
 
 
+/** markets.csv columns: one row per market replayed, entered or not. */
+export const MARKET_COLUMNS = Object.freeze([
+  'market_id', 'asset', 'interval', 'settlement', 'open_ts_ms', 'close_ts_ms', 'strike', 'outcome',
+  'up_px', 'down_px', 'entered', 'trades', 'contracts', 'net_pnl', 'fees', 'first_entry_ms',
+  'edge_per_contract', 'edge_per_trade',
+]);
+
+/**
+ * One row per market the run replayed — including every market the strategy
+ * never entered, which a per-trade file cannot show and which any
+ * market-level statistic (a confidence interval over markets, a permutation
+ * test on outcomes) needs. In the order the run listed its markets.
+ * MUST MATCH market_rows in client/backtest/report.py.
+ */
+export function marketRows(trades, marketMeta = new Map()) {
+  const byMarket = new Map();
+  for (const t of trades) {
+    if (!Number.isFinite(t.pnl)) continue;
+    let g = byMarket.get(t.market_id);
+    if (!g) { g = []; byMarket.set(t.market_id, g); }
+    g.push(t);
+  }
+  const rows = [];
+  for (const [id, m] of marketMeta) {
+    const ts = byMarket.get(id) ?? [];
+    let pnl = 0;
+    let fees = 0;
+    let contracts = 0;
+    let first = null;
+    for (const t of ts) {
+      pnl += t.pnl;
+      fees += t.fees ?? 0;
+      contracts += t.size ?? 0;
+      if (t.opened_ms != null && (first == null || t.opened_ms < first)) first = t.opened_ms;
+    }
+    const settled = ts.filter((t) => t.how === 'settled' && t.entry_px != null && t.outcome);
+    rows.push({
+      market_id: id,
+      asset: m.asset ?? null,
+      interval: m.interval ?? null,
+      settlement: m.stream ?? null,
+      open_ts_ms: m.open_ts_ms ?? null,
+      close_ts_ms: m.close_ts_ms ?? null,
+      strike: m.strike ?? null,
+      outcome: m.outcome ?? null,
+      up_px: m.up_px ?? null,
+      down_px: m.down_px ?? null,
+      entered: ts.length > 0,
+      trades: ts.length,
+      contracts: r4(contracts),
+      net_pnl: r4(pnl),
+      fees: r4(fees),
+      first_entry_ms: first,
+      edge_per_contract: settled.length ? r4(edgePerContract(settled)) : null,
+      edge_per_trade: edgePerTrade(settled),
+    });
+  }
+  return rows;
+}
+
+/**
+ * Results by settlement rule (the stream each market settles on). Markets on
+ * different rules are different games — a strategy tuned on the instantaneous
+ * stream says little about a TWAP market — so they are reported side by side
+ * and never only blended. Built from marketRows; sorted by rule.
+ */
+export function bySettlement(rows, trades) {
+  const rule = new Map(rows.map((r) => [r.market_id, r.settlement ?? 'unknown']));
+  const groups = new Map();
+  const group = (k) => {
+    let g = groups.get(k);
+    if (!g) { g = { settlement: k, markets: 0, markets_entered: 0, trades: [] }; groups.set(k, g); }
+    return g;
+  };
+  for (const r of rows) {
+    const g = group(r.settlement ?? 'unknown');
+    g.markets += 1;
+    if (r.entered) g.markets_entered += 1;
+  }
+  for (const t of trades) {
+    if (!Number.isFinite(t.pnl) || !rule.has(t.market_id)) continue;
+    group(rule.get(t.market_id)).trades.push(t);
+  }
+  return [...groups.values()]
+    .sort((a, b) => (a.settlement < b.settlement ? -1 : a.settlement > b.settlement ? 1 : 0))
+    .map((g) => {
+      let pnl = 0;
+      for (const t of g.trades) pnl += t.pnl;
+      const settled = g.trades.filter((t) => t.how === 'settled' && t.entry_px != null && t.outcome);
+      return {
+        settlement: g.settlement,
+        markets: g.markets,
+        markets_entered: g.markets_entered,
+        trades: g.trades.length,
+        net_pnl: r2(pnl),
+        edge_per_contract: settled.length ? r4(edgePerContract(settled)) : null,
+        edge_per_trade: edgePerTrade(settled),
+      };
+    });
+}
+
+/**
+ * Trading activity off the fill log, one fill at a time: contracts and dollars
+ * that changed hands, taker and maker. MUST MATCH ActivityAccumulator in
+ * client/backtest/report.py.
+ */
+export function activityAccumulator() {
+  let contracts = 0;
+  let value = 0;
+  let taker = 0;
+  let maker = 0;
+  let fills = 0;
+  return {
+    add(f) {
+      if (!(f.filled > 0) || !Number.isFinite(f.avg_px)) return;
+      fills += 1;
+      contracts += f.filled;
+      value += f.filled * f.avg_px;
+      if (f.liquidity === 'maker') maker += f.filled;
+      else taker += f.filled;
+    },
+    result() {
+      return { fills, contracts: r2(contracts), value: r2(value), taker_contracts: r2(taker), maker_contracts: r2(maker) };
+    },
+  };
+}
+
 /**
  * The parameter sweep grid.
  *
@@ -687,6 +851,7 @@ export function buildReport({
   trades, fillStats: fillSummary, marketSummaries, marketMeta,
   feesPaid = 0, fillDelayMs = 0, feeModel = null, sweep = null, coverage = null,
   crosschecks = [], budget = null, seed = null, scanned = {}, maker = null, orders = null, timers = null,
+  fingerprint = null,
 }) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
   const equity = equityCurve(closed);
@@ -698,6 +863,9 @@ export function buildReport({
     // — a report is a thing you forward to someone and the strategy is not —
     // so this is what answers "which version of my strategy was this?".
     source_sha256: sourceSha256,
+    // Pre-registration: code + manifest + params + options + scope + seed, one
+    // sha256 (api/lib/backtest-fingerprint.mjs). Null where it cannot be formed.
+    fingerprint,
     generated_ms: submittedAt,
     sdk_schema: manifest?.schema ?? null,
     language: manifest?.language ?? null,
@@ -736,6 +904,10 @@ export function buildReport({
       size: closed.length ? closed.reduce((a, t) => a + (t.size ?? 0), 0) / closed.length : 1,
     }),
     split: splitByMarket(closed, marketMeta ?? new Map()),
+    // By settlement rule, every market counted (entered or not) — see bySettlement.
+    by_settlement: bySettlement(marketRows(closed, marketMeta ?? new Map()), closed),
+    // Contracts and dollars traded, from the fill log.
+    activity: fillSummary.activity ?? null,
     // From the caller's pass over the fill log (fillStats / the worker's
     // streaming pass): the log itself is never handed to the report.
     slippage: fillSummary.slippage,

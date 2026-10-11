@@ -25,10 +25,11 @@ import {
   sortMarketsForReplay,
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
-import { buildReport, fillStats, feeModelReport, makerReport, ordersReport } from '../../runner/engine/report.mjs';
+import { buildReport, fillStats, marketRows, feeModelReport, makerReport, ordersReport } from '../../runner/engine/report.mjs';
 import { queueModelName, PRINT_LAG_MS } from '../../runner/engine/maker.mjs';
 import { sessionLines } from '../../runner/session-feed.mjs';
 import { feePolicyFor, restingPolicyFor, enginePolicyFor } from '../../api/lib/backtest-datasets.mjs';
+import { fingerprintOfFiles, datasetDigest, localInputs } from '../../api/lib/backtest-fingerprint.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
 import { createLineWriter } from '../../runner/stdin-writer.mjs';
 import { readEventLines } from '../../runner/spool-day.mjs';
@@ -36,7 +37,7 @@ import {
   loadLocalDay, localDays, looksLikeArchive, archiveVenues, defaultVenue,
 } from '../local-data.mjs';
 import { readSubmission, validate } from '../ot.mjs';
-import { looksLikeGenericDataset, decodeGenericDir, fileLines } from '../../runner/generic-data.mjs';
+import { looksLikeGenericDataset, decodeGenericDir, fileLines, datasetFiles, marketsFileOf } from '../../runner/generic-data.mjs';
 import { genericReportExtras, applyGenericExtras } from '../../runner/generic-report.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -298,6 +299,7 @@ export async function cmdRun({ dir, flags }) {
       for (const u of genericDecoded.unusable) process.stderr.write(`  ${u.market_id ?? '?'}: ${u.why}\n`);
       markets.push(...genericDecoded.markets);
     }
+    const runInputs = [];
     for (const day of days) {
       const loaded = await loadLocalDay({
         root: dataRoot, day, venue, eventsDir,
@@ -316,6 +318,8 @@ export async function cmdRun({ dir, flags }) {
       });
       // Measured from EVENTS, keyed by market-day — the same fact the queue
       // records, produced by the same decoder. See fetchDay's bboKeys.
+      // Every archive file this day was read from (the fingerprint's inputs_sha256).
+      runInputs.push(...(loaded.inputs ?? []));
       if (loaded.bboKeys?.length) {
         const acc = bboApplied.get(day) ?? new Set();
         for (const k of loaded.bboKeys) acc.add(k);
@@ -485,11 +489,15 @@ export async function cmdRun({ dir, flags }) {
         asset: m.market.asset,
         interval: m.market.interval,
         outcome: m.market.outcome,
+        open_ts_ms: m.market.open_ts_ms ?? null,
+        close_ts_ms: m.market.close_ts_ms ?? null,
+        strike: m.market.strike ?? null,
         up_px: m.up_px,
         down_px: m.down_px,
         stream: m.stream,
       }]));
 
+      const localMarkets = marketRows(base.trades, marketMeta);
       const fillSummary = fillStats(base.fills);
       let report = buildReport({
         runId: generic ? 'local_generic' : `local_${days[0]}`,
@@ -498,6 +506,25 @@ export async function cmdRun({ dir, flags }) {
         // Local runs have no stored submission to hash, and saying null is
         // truthful: this report is not tied to a submission at all.
         sourceSha256: null,
+        fingerprint: fingerprintOfFiles(files, {
+          // Your own data has no archive scope: its bytes are its scope.
+          scope: generic ? { venue: 'polymarket', assets: [], days: [] } : {
+            venue,
+            assets: assets.length ? assets : [...new Set(markets.map((m) => m.market.asset).filter(Boolean))],
+            days,
+          },
+          seed: Number(flags.seed ?? 1),
+          data: generic ? 'generic' : 'archive',
+          dataSha256: generic
+            ? await datasetDigest(dataRoot, { marketsFile: await marketsFileOf(dataRoot), files: await datasetFiles(dataRoot) })
+            : null,
+          replay: {
+            bookThrottle: throttleFlag !== 'off',
+            markMaxAgeMs: flags['mark-max-age-ms'] == null ? null : Number(flags['mark-max-age-ms']),
+          },
+          inputs: generic ? null : await localInputs(dataRoot, runInputs),
+          feeBpsOverride: (() => { const v = Number(flags['fee-bps']); return flags['fee-bps'] != null && flags['fee-bps'] !== '' && Number.isFinite(v) && v >= 0 ? v : null; })(),
+        }),
         scope: {
           venue,
           assets: assets.length ? assets : [...new Set(markets.map((m) => m.market.asset).filter(Boolean))],
@@ -592,6 +619,7 @@ export async function cmdRun({ dir, flags }) {
         trades: base.trades,
         fills: base.fills,
         logs: base.logs,
+        markets: localMarkets,
         source: checked.files,
       });
       await writeFile(outFile, zip);

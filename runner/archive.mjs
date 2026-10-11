@@ -19,6 +19,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { MARKET_COLUMNS } from './engine/report.mjs';
 
 /** CRC-32, the checksum the zip format uses. Table built once. */
 const CRC_TABLE = (() => {
@@ -369,7 +370,7 @@ function* fullEquity(trades) {
  * fillCsvLine per row): the worker writes it while it streams the fill log off
  * disk, so the fills are never all in memory at once.
  */
-export async function writeArchive({ outPath, report, trades, fillsCsv, logs }) {
+export async function writeArchive({ outPath, report, trades, fillsCsv, logs, markets = null }) {
   const scratch = await mkdtemp(path.join(path.dirname(outPath), '.archive-'));
   try {
     const tradesCsv = path.join(scratch, 'trades.csv');
@@ -383,6 +384,9 @@ export async function writeArchive({ outPath, report, trades, fillsCsv, logs }) 
       { name: 'trades.csv', file: tradesCsv },
       { name: 'fills.csv', file: fillsCsv },
       { name: 'equity.csv', file: equityCsv },
+      // One row per market replayed, entered or not (marketRows); absent only
+      // for a caller that has no market list.
+      ...(markets ? [{ name: 'markets.csv', data: toCsv(markets, MARKET_COLUMNS) }] : []),
       {
         name: 'calibration.csv',
         data: toCsv(report.calibration ?? [], ['bucket', 'implied', 'realized', 'edge_cents', 'trades']),
@@ -415,13 +419,13 @@ export async function writeArchive({ outPath, report, trades, fillsCsv, logs }) 
  * tests; the worker uses writeArchive directly. Same bytes either way — this
  * is writeArchive with the fills spelled out to a file first.
  */
-export async function buildArchive({ report, trades, fills, logs }) {
+export async function buildArchive({ report, trades, fills, logs, markets = null }) {
   const dir = await mkdtemp(path.join(tmpdir(), 'ot-archive-'));
   try {
     const fillsCsv = path.join(dir, 'fills.csv');
     await writeCsvFile(fillsCsv, fills ?? [], fillColumnsOf(report));
     const outPath = path.join(dir, 'report.zip');
-    await writeArchive({ outPath, report, trades, fillsCsv, logs });
+    await writeArchive({ outPath, report, trades, fillsCsv, logs, markets });
     return await readFile(outPath);
   } finally {
     await rm(dir, { recursive: true, force: true });
