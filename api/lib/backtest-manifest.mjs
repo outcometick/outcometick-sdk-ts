@@ -18,6 +18,7 @@ import {
   assertCoverage, normalizeFok, normalizeOrderRules, normalizeMakerRebate, normalizeQuoteGuard, normalizeMirrorDepth,
   normalizeFeedLatency,
   normalizeQueueModel,
+  normalizeRecordMs,
 } from './backtest-datasets.mjs';
 // The series parser, so the FREE check rejects a malformed CSV instead of the
 // worker rejecting it after credits are held. One implementation, shared: the
@@ -151,6 +152,7 @@ export function validateManifest(doc) {
   const mirrorDepth = normalizeMirrorDepth(doc.mirror_depth);
   const feedLatency = normalizeFeedLatency(doc.feed_latency);
   const queueModel = normalizeQueueModel(doc.queue_model);
+  const recordMs = normalizeRecordMs(doc.record_ms);
 
   // A hook that needs a dataset it was not given would simply never fire, and
   // a strategy that silently never trades looks like a bad strategy rather
@@ -278,6 +280,7 @@ export function validateManifest(doc) {
     ...(mirrorDepth != null ? { mirror_depth: mirrorDepth } : {}),
     ...(feedLatency != null ? { feed_latency: feedLatency } : {}),
     ...(queueModel != null ? { queue_model: queueModel.n == null ? { prob: queueModel.prob } : queueModel } : {}),
+    ...(recordMs != null ? { record_ms: recordMs } : {}),
     mode,
     deps,
     reference,

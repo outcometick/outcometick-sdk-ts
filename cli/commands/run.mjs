@@ -19,13 +19,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { LANGUAGES, HOOK_NAMES, LIMITS } from '../../api/lib/backtest-contract.mjs';
-import { CHANNEL, EXIT, parseTrade, parseFill, parseResult, parseOutputLine } from '../../runner/harness/protocol.mjs';
+import { CHANNEL, EXIT, parseTrade, parseFill, parseResult, parseOutputLine, parseRecord, MAX_RECORD_ROWS } from '../../runner/harness/protocol.mjs';
 import {
   countMarketDays, countStreams, buildCoverage, bboCoverage, mergeReferenceRows, makeBookThrottle,
   sortMarketsForReplay,
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
-import { buildReport, fillStats, marketRows, feeModelReport, makerReport, ordersReport } from '../../runner/engine/report.mjs';
+import { buildReport, fillStats, marketRows, feeModelReport, makerReport, ordersReport, recordReport } from '../../runner/engine/report.mjs';
 import { queueModelName, PRINT_LAG_MS } from '../../runner/engine/maker.mjs';
 import { sessionLines } from '../../runner/session-feed.mjs';
 import { feePolicyFor, restingPolicyFor, enginePolicyFor } from '../../api/lib/backtest-datasets.mjs';
@@ -115,9 +115,12 @@ function runHarness({
         ? mergeReferenceRows(lines, seriesRows, m.market, 'ext', seriesLags)
         : lines;
     };
+    // The recorder keys samples by the market's place in the run (record_ms).
+    const instanceOf = job.engine?.record_ms ? new Map(markets.map((m, i) => [m, i])) : null;
     const headerOf = (m) => ({
       market: m.market,
       stream: m.stream,
+      ...(instanceOf ? { instance: instanceOf.get(m) } : {}),
       ...(m.market?.kind === 'generic' ? { terminal: m.terminal ?? null } : {}),
       ...(seriesNames.length ? { series: seriesNames } : {}),
       ...(Object.keys(seriesLags).length ? { lags: seriesLags } : {}),
@@ -152,6 +155,7 @@ function runHarness({
 function demux(lines) {
   const trades = [];
   const fills = [];
+  const records = [];
   const logs = [];
   // Counted, not swallowed. The queue publishes `dropped_rows`, and a local run
   // that discarded the same rows in silence reported a clean report over the
@@ -168,11 +172,16 @@ function demux(lines) {
     }
     let raw;
     try { raw = JSON.parse(payload); } catch { malformed += 1; continue; }
+    if (channel === CHANNEL.record) {
+      const rec = parseRecord(raw);
+      if (rec) records.push(rec); else malformed += 1;
+      continue;
+    }
     const row = channel === CHANNEL.trade ? parseTrade(raw) : parseFill(raw);
     if (!row) { malformed += 1; continue; }
     (channel === CHANNEL.trade ? trades : fills).push(row);
   }
-  return { trades, fills, logs: logs.join('\n'), result, malformed };
+  return { trades, fills, records, logs: logs.join('\n'), result, malformed };
 }
 
 export async function cmdRun({ dir, flags }) {
@@ -499,6 +508,11 @@ export async function cmdRun({ dir, flags }) {
 
       const localMarkets = marketRows(base.trades, marketMeta);
       const fillSummary = fillStats(base.fills);
+      // The time-grid mark-to-market, when the manifest asked for it (record_ms).
+      const rec = recordReport({
+        samples: base.records ?? [], recordMs: enginePolicy?.record_ms ?? null, harness: base.result.record,
+        maxRows: MAX_RECORD_ROWS,
+      });
       let report = buildReport({
         runId: generic ? 'local_generic' : `local_${days[0]}`,
         submittedAt: 0,
@@ -549,6 +563,7 @@ export async function cmdRun({ dir, flags }) {
         }),
         orders: ordersReport({ policy: enginePolicy, stats: base.result.orders }),
         timers: enginePolicy?.timers ? base.result.timers : null,
+        record: rec.block,
         marketSummaries: [...marketMeta.values()],
         marketMeta,
         feesPaid: base.result.feesPaid,
@@ -614,6 +629,7 @@ export async function cmdRun({ dir, flags }) {
 
       const outFile = flags.out ?? `${path.basename(path.resolve(dir))}-local.zip`;
       const zip = await buildArchive({
+        record: rec,
         runId: report.run_id,
         report,
         trades: base.trades,

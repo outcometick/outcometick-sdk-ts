@@ -775,6 +775,113 @@ export function activityAccumulator() {
   };
 }
 
+/** What the recorder's values mean, stated in every report that has them. */
+export const RECORD_VALUATION = 'liquidation at the best bid; a leg with no bid counts 0; quotes are not checked for freshness';
+
+/**
+ * The account's value on the record grid, from the per-instance samples the
+ * harness wrote (engine.record_ms; see replay.mjs). Grid points are absolute,
+ * so instances align: at each point an instance contributes nothing before its
+ * first sample, then its latest sample at or before the point (its FINAL after
+ * it ends). Built by one sweep over the samples in (ts, write order), adding
+ * each instance's change to running sums.
+ *
+ * `maxRows` bounds samples + account points TOGETHER and is checked BEFORE a
+ * point is built (W6): over it, the result is { truncated: true } and nothing
+ * else. MUST MATCH account_series in client/backtest/report.py.
+ */
+export function accountSeries(samples, recordMs, { maxRows = Infinity } = {}) {
+  const n = samples.length;
+  if (!n || !(recordMs > 0)) return { truncated: false, points: [] };
+  let first = Infinity;
+  let last = -Infinity;
+  for (const s of samples) {
+    if (s.ts < first) first = s.ts;
+    if (s.final && s.ts > last) last = s.ts;
+  }
+  if (last === -Infinity) for (const s of samples) if (s.ts > last) last = s.ts;
+  const g0 = Math.ceil(first / recordMs) * recordMs;
+  const gridCount = Math.max(0, Math.floor(last / recordMs) - Math.ceil(first / recordMs) + 1);
+  const total = gridCount + (last % recordMs === 0 ? 0 : 1);
+  if (n + total > maxRows) return { truncated: true, points: [] };
+  const order = samples.map((_, i) => i).sort((a, b) => (samples[a].ts - samples[b].ts) || (a - b));
+  const latest = new Map();
+  let value = 0;
+  let position = 0;
+  let open = 0;
+  let i = 0;
+  const points = [];
+  const advanceTo = (t) => {
+    while (i < n && samples[order[i]].ts <= t) {
+      const s = samples[order[i]];
+      const v = (s.cash + s.marked) + s.position_value;
+      const prev = latest.get(s.key);
+      if (prev) {
+        value += v - prev.v;
+        position += s.position_value - prev.p;
+        if (prev.p > 0) open -= 1;
+      } else {
+        value += v;
+        position += s.position_value;
+      }
+      if (s.position_value > 0) open += 1;
+      latest.set(s.key, { v, p: s.position_value });
+      i += 1;
+    }
+    points.push({ ts: t, value, position_value: position, open_positions: open });
+  };
+  for (let k = 0; k < gridCount; k += 1) advanceTo(g0 + k * recordMs);
+  if (last % recordMs !== 0) advanceTo(last);
+  return { truncated: false, points };
+}
+
+/**
+ * The report's `record` block (and the rows for record.csv /
+ * record_markets.csv). `harness` is the result's `record`
+ * ({rows, bytes, truncated}); a truncated run reports that and nothing else.
+ */
+export function recordReport({ samples, recordMs, harness, maxRows }) {
+  if (!recordMs) return { block: null, points: [], samples: [] };
+  if (!harness || harness.truncated) {
+    return { block: { interval_ms: recordMs, truncated: true }, points: [], samples: [] };
+  }
+  const series = accountSeries(samples, recordMs, { maxRows });
+  if (series.truncated) {
+    return { block: { interval_ms: recordMs, truncated: true }, points: [], samples: [] };
+  }
+  const pts = series.points;
+  let peak = 0;
+  let maxDd = 0;
+  let ddAt = null;
+  let worst = null;
+  let maxPos = 0;
+  let sumPos = 0;
+  for (const p of pts) {
+    if (p.value > peak) peak = p.value;
+    if (peak - p.value > maxDd) { maxDd = peak - p.value; ddAt = p.ts; }
+    if (worst == null || p.value < worst.value) worst = { ts: p.ts, value: p.value };
+    if (p.position_value > maxPos) maxPos = p.position_value;
+    sumPos += p.position_value;
+  }
+  return {
+    block: {
+      interval_ms: recordMs,
+      truncated: false,
+      valuation: RECORD_VALUATION,
+      points: pts.length,
+      instances: new Set(samples.map((s) => s.key)).size,
+      final_value: pts.length ? r2(pts[pts.length - 1].value) : null,
+      max_drawdown_abs: r2(maxDd),
+      max_drawdown_at: ddAt,
+      worst_point: worst ? { ts: worst.ts, value: r2(worst.value) } : null,
+      max_position_value: r2(maxPos),
+      mean_position_value: pts.length ? r2(sumPos / pts.length) : null,
+    },
+    points: pts,
+    samples,
+  };
+}
+
 /**
  * The parameter sweep grid.
  *
@@ -851,7 +958,7 @@ export function buildReport({
   trades, fillStats: fillSummary, marketSummaries, marketMeta,
   feesPaid = 0, fillDelayMs = 0, feeModel = null, sweep = null, coverage = null,
   crosschecks = [], budget = null, seed = null, scanned = {}, maker = null, orders = null, timers = null,
-  fingerprint = null,
+  fingerprint = null, record = null,
 }) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
   const equity = equityCurve(closed);
@@ -931,6 +1038,8 @@ export function buildReport({
     // Timers (on_timer): how many were set, fired, and dropped at the end of
     // trading — only when the strategy declared the hook.
     ...(timers ? { timers } : {}),
+    // The time-grid mark-to-market (record_ms) — only when the run asked for it.
+    ...(record ? { record } : {}),
     sweep,
     coverage,
     budget,

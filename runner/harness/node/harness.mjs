@@ -21,7 +21,7 @@ import { Book as BookCls } from '../../engine/book.mjs';
 import { buildFeeds } from '../../engine/feed.mjs';
 import { Portfolio, newOrderStats } from '../../engine/portfolio.mjs';
 import { rowPending, newMakerStats, addMakerStats } from '../../engine/maker.mjs';
-import { CHANNEL, RESULT_FD, EXIT } from '../protocol.mjs';
+import { CHANNEL, RESULT_FD, EXIT, RECORD_FIELDS, MAX_RECORD_ROWS, MAX_RECORD_BYTES, lineBytes } from '../protocol.mjs';
 
 /**
  * REPLACE `console`, before any strategy code is imported. Do not patch it.
@@ -456,8 +456,37 @@ async function main() {
     maker: null,
   };
 
+  // The recorder (engine.record_ms, market mode): each finished market's
+  // samples, keyed by instance, within the run's row and byte budgets.
+  // Reaching either stops recording for the whole run; the report then shows
+  // no series at all. MUST MATCH otharness.py.
+  const record = engine?.record_ms ? { rows: 0, bytes: 0, truncated: false, instance: 0 } : null;
+  // Counted where samples are MADE (MarketReplay recordBudget), one for the
+  // run: memory stays bounded however long a market is.
+  const recordBudget = record ? { rows: 0, limit: MAX_RECORD_ROWS, truncated: false } : null;
+  const emitRecord = (entry, rows) => {
+    if (recordBudget.truncated) { record.truncated = true; return; }
+    // The instance is the market's place in the run, sent in its header, so a
+    // market split across processes still gets the key a single run gives it.
+    const key = `${entry.market.market_id}#${Number.isInteger(entry.instance) ? entry.instance : record.instance}`;
+    record.instance += 1;
+    for (const r of rows ?? []) {
+      if (record.truncated) return;
+      const payload = stringify(projectRow({ key, ...r }, RECORD_FIELDS));
+      const bytes = lineBytes(CHANNEL.record, payload);
+      if (record.rows + 1 > MAX_RECORD_ROWS || record.bytes + bytes > MAX_RECORD_BYTES) {
+        record.truncated = true;
+        return;
+      }
+      record.rows += 1;
+      record.bytes += bytes;
+      emit(CHANNEL.record, payload);
+    }
+  };
+
   const finish = (code) => {
     result.budget = monitor.summary();
+    if (record) result.record = { rows: record.rows, bytes: record.bytes, truncated: record.truncated || recordBudget.truncated };
     if (orderStats) result.orders = orderStats;
     // Projected like the rows: `result` is an ordinary object built AFTER
     // untrusted code has run, and Object.prototype.toJSON reaches every
@@ -620,6 +649,7 @@ async function main() {
       terminal: entry.terminal ?? null,
       engine,
       clock: m.clock,
+      recordBudget,
     });
     m.replay.open(m.openTs ?? null);
   };
@@ -688,6 +718,7 @@ async function main() {
       down_px: m.openQuotes?.down ?? null,
       stream: entry.stream ?? null,
     });
+    if (record && !shared) emitRecord(entry, out.record);
     if (!shared) {
       flush(m.replay.pf, m.before, emit, entry.market.market_id, fillExtras);
       result.fees_paid += m.replay.pf.feesPaid;

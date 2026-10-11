@@ -494,6 +494,13 @@ export class MarketReplay {
      * in the past of the run.
      */
     clock = null,
+    /**
+     * Recorder only: the run's row budget, `{ rows, limit, truncated }`, ONE
+     * object for every market (the harness makes it). Samples are counted as
+     * they are made, so a long market cannot build an unbounded array before
+     * anything checks it; once spent, no market samples again.
+     */
+    recordBudget = null,
   }) {
     this.marketId = market.market_id;
     // generic-data.mjs. Every branch that differs from the archive path is
@@ -593,6 +600,63 @@ export class MarketReplay {
     this.seen = 0;
     this.lastTs = 0;
     this.ended = false;
+
+    // Phase 3b recorder (engine.record_ms, market mode): the market's value on
+    // a fixed time grid. ONE rule: before any change at time t — a job, an
+    // event, a terminal mark, the settlement — every grid point g < t not yet
+    // written is written, so each point is the state after everything at times
+    // <= g and nothing later; after the last change, one FINAL sample. Reads
+    // the ledger and the exchange book only; changes nothing.
+    this.recordMs = Number.isInteger(engine?.record_ms) && engine.record_ms > 0 ? engine.record_ms : null;
+    this.recordRows = this.recordMs ? [] : null;
+    this.recordBudget = this.recordMs ? (recordBudget ?? { rows: 0, limit: Infinity, truncated: false }) : null;
+    this.recNext = null;
+    if (this.recordMs && typeof this.market.open_ts_ms === 'number' && Number.isFinite(this.market.open_ts_ms)) {
+      this.#recordStart(this.market.open_ts_ms);
+    }
+  }
+
+  /** First grid point at or after `ts`. */
+  #recordStart(ts) {
+    if (this.recNext == null) this.recNext = Math.ceil(ts / this.recordMs) * this.recordMs;
+  }
+
+  #recordSample(g, final) {
+    const b = this.recordBudget;
+    if (b.truncated) return false;
+    if (b.rows + 1 > b.limit) {
+      b.truncated = true;
+      return false;
+    }
+    b.rows += 1;
+    this.recordRows.push({
+      ts: g,
+      cash: this.pf.marketCash.get(this.marketId) ?? 0,
+      marked: this.pf.marketMarked.get(this.marketId) ?? 0,
+      position_value: this.pf.liquidationValue(this.marketId, this.book),
+      final,
+    });
+    return true;
+  }
+
+  /** Before a change at `t`: every grid point g < t not yet written. */
+  #recordBefore(t) {
+    if (!this.recordMs || this.recNext == null) return;
+    while (this.recNext < t) {
+      // Budget spent: the rest of the grid is skipped, not walked.
+      if (!this.#recordSample(this.recNext, false)) { this.recNext = Number.POSITIVE_INFINITY; return; }
+      this.recNext += this.recordMs;
+    }
+  }
+
+  /** After the last change, at `ts`: the FINAL sample (a grid point when one falls there). */
+  #recordFinal(ts) {
+    if (!this.recordMs) return;
+    this.#recordStart(ts);
+    this.#recordBefore(ts);
+    if (this.recordBudget.truncated) return;
+    this.#recordSample(ts, true);
+    if (this.recNext === ts) this.recNext += this.recordMs;
   }
 
   /**
@@ -658,6 +722,7 @@ export class MarketReplay {
     if (job.at < this.clock.t) {
       throw new RunAbort('E_RUNTIME', `engine invariant: a ${job.kind} at ${job.at} after the run reached ${this.clock.t}`);
     }
+    this.#recordBefore(job.at);
     this.control.setNow(job.at);
     if (job.kind === 'timer') {
       this.timerStats.fired += 1;
@@ -732,6 +797,7 @@ export class MarketReplay {
         if (job.kind === 'timer') this.timerStats.dropped += 1;
         continue;
       }
+      this.#recordBefore(job.at);
       this.#runExchangeJob(job);
     }
   }
@@ -861,11 +927,13 @@ export class MarketReplay {
     this.seen += 1;
     this.lastTs = ev.ts_ms;
     if (ev.ts_ms > this.closeTs) { this.ended = true; return false; }
+    if (this.recordMs) this.#recordStart(ev.ts_ms);
     // Everything scheduled strictly BEFORE this event resolves against the book
     // as it stood then — draining after applying the event would fill a delayed
     // order against depth that arrived after it. (Global mode: the harness's
     // scheduler already ran every job before this instant, in every market.)
     if (!this.global) this.drainUntil(ev.ts_ms - 1);
+    this.#recordBefore(ev.ts_ms);
     this.control.setNow(ev.ts_ms);
     const maker = this.maker;
     if (maker) {
@@ -936,6 +1004,7 @@ export class MarketReplay {
     this.drainUntil(ts);
     if (this.maker) this.maker.close(ts, this.book);
     this.#dropPending();
+    this.#recordBefore(ts);
     this.marked = this.market.outcome ? [] : this.pf.mark(this.marketId, this.terminal, ts);
   }
 
@@ -956,8 +1025,10 @@ export class MarketReplay {
     if (outcome) {
       // A venue settlement: on_settle is for that and only that.
       this.#call('on_settle', { ...genericView(this.market), outcome, resolved_ts_ms: this.market.resolved_ts_ms }, outcome);
+      this.#recordBefore(settleTs);
       settled = this.pf.settle(this.marketId, outcome, settleTs);
     }
+    this.#recordFinal(settleTs);
     if (this.maker) this.maker.releaseRows(outcome ? (side) => contractValue(side, outcome) : null);
     this.closed = {
       marketId: this.marketId,
@@ -970,6 +1041,7 @@ export class MarketReplay {
       budget: this.monitor.summary(),
       maker: this.maker ? this.maker.stats : null,
       timers: this.global ? this.timerStats : null,
+      ...(this.recordMs ? { record: this.recordRows } : {}),
     };
     return this.closed;
   }
@@ -1002,7 +1074,9 @@ export class MarketReplay {
     this.#call('on_settle', { ...this.market }, this.market.outcome);
 
     const outcome = this.market.outcome;
+    this.#recordBefore(settleTs);
     const settled = outcome ? this.pf.settle(this.marketId, outcome, settleTs) : [];
+    this.#recordFinal(settleTs);
     if (this.maker) this.maker.releaseRows(outcome ? (side) => contractValue(side, outcome) : null);
 
     return {
@@ -1018,6 +1092,7 @@ export class MarketReplay {
       budget: this.monitor.summary(),
       maker: this.maker ? this.maker.stats : null,
       timers: this.global ? this.timerStats : null,
+      ...(this.recordMs ? { record: this.recordRows } : {}),
     };
   }
 }

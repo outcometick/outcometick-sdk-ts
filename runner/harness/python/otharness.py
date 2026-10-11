@@ -38,6 +38,76 @@ CHANNEL_RESULT = "r"
 # CHANNEL.progress in protocol.mjs -- see the long note there. Both engines or
 # neither: runner/conformance compares them line by line.
 CHANNEL_PROGRESS = "p"
+# The recorder -- CHANNEL.record, RECORD_FIELDS and the budgets in protocol.mjs
+# (a test pins the copies).
+CHANNEL_RECORD = "v"
+RECORD_FIELDS = ("key", "ts", "cash", "marked", "position_value", "final")
+MAX_RECORD_ROWS = 1_000_000
+MAX_RECORD_BYTES = 256 * 1024 * 1024
+
+
+def _js_num(x) -> str:
+    """Number.prototype.toString() -- a copy of _number_to_string in
+    client/backtest/_js.py (the harness imports nothing from outside runner/;
+    a test pins the two). Record lines are written exactly as JavaScript writes
+    them, so the byte budget cuts both engines at the same row."""
+    if isinstance(x, bool):
+        return "true" if x else "false"
+    x = float(x)
+    if math.isnan(x) or math.isinf(x):
+        return "null"
+    if x == 0:
+        return "0"
+    if x < 0:
+        return "-" + _js_num(-x)
+    r = repr(x)
+    if "e" in r:
+        mant, exp = r.split("e")
+        e = int(exp)
+    else:
+        mant, e = r, 0
+    if "." in mant:
+        ip, fp = mant.split(".")
+    else:
+        ip, fp = mant, ""
+    digits = (ip + fp).lstrip("0")
+    lead_zeros = len(ip + fp) - len((ip + fp).lstrip("0"))
+    n = len(ip) - lead_zeros + e
+    digits = digits.rstrip("0") or "0"
+    k = len(digits)
+    if k <= n <= 21:
+        return digits + "0" * (n - k)
+    if 0 < n <= 21:
+        return digits[:n] + "." + digits[n:]
+    if -6 < n <= 0:
+        return "0." + "0" * (-n) + digits
+    exp_val = n - 1
+    sign = "+" if exp_val >= 0 else "-"
+    if k == 1:
+        return f"{digits}e{sign}{abs(exp_val)}"
+    return f"{digits[0]}.{digits[1:]}e{sign}{abs(exp_val)}"
+
+
+def _record_payload(row) -> str:
+    """One record line's JSON, as JSON.stringify writes the projected row."""
+    parts = []
+    for f in RECORD_FIELDS:
+        v = row.get(f)
+        if v is None:
+            val = "null"
+        elif isinstance(v, bool):
+            val = "true" if v else "false"
+        elif isinstance(v, (int, float)):
+            val = _js_num(v)
+        else:
+            val = _json_string(v)
+        parts.append(_json_string(f) + ":" + val)
+    return "{" + ",".join(parts) + "}"
+
+
+def line_bytes(channel: str, payload: str) -> int:
+    """lineBytes in protocol.mjs."""
+    return 32 + 1 + len(channel) + 1 + len(payload.encode("utf-8")) + 1
 
 EXIT_OK = 0
 EXIT_REJECTED = 10
@@ -289,8 +359,35 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
     def log(text):
         emit(CHANNEL_LOG, text.replace("\n", " ").rstrip())
 
+    # The recorder -- see emitRecord in harness.mjs.
+    record = {"rows": 0, "bytes": 0, "truncated": False, "instance": 0} if engine and engine.get("record_ms") else None
+    # Counted where samples are made -- see recordBudget in harness.mjs.
+    record_budget = {"rows": 0, "limit": MAX_RECORD_ROWS, "truncated": False} if record is not None else None
+
+    def emit_record(entry, rows):
+        if record_budget["truncated"]:
+            record["truncated"] = True
+            return
+        inst = entry.get("instance")
+        key = (f"{entry['market']['market_id']}#"
+               f"{inst if isinstance(inst, int) and not isinstance(inst, bool) else record['instance']}")
+        record["instance"] += 1
+        for r in rows or []:
+            if record["truncated"]:
+                return
+            payload = _record_payload(project_row({"key": key, **r}, RECORD_FIELDS))
+            nbytes = line_bytes(CHANNEL_RECORD, payload)
+            if record["rows"] + 1 > MAX_RECORD_ROWS or record["bytes"] + nbytes > MAX_RECORD_BYTES:
+                record["truncated"] = True
+                return
+            record["rows"] += 1
+            record["bytes"] += nbytes
+            emit(CHANNEL_RECORD, payload)
+
     def finish(code: int) -> int:
         result["budget"] = monitor.summary()
+        if record is not None:
+            result["record"] = {"rows": record["rows"], "bytes": record["bytes"], "truncated": record["truncated"] or record_budget["truncated"]}
         if order_stats is not None:
             result["orders"] = order_stats
         emit(CHANNEL_RESULT, _DUMPS(result))
@@ -354,6 +451,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             terminal=entry.get("terminal"),
             engine=engine,
             clock=m.clock,
+            record_budget=record_budget,
         )
         m.replay.open(m.open_ts)
 
@@ -388,6 +486,8 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             "down_px": oq[1] if oq else None,
             "stream": entry.get("stream"),
         })
+        if record is not None and shared is None:
+            emit_record(entry, out.get("record"))
         if shared is None:
             flush(m.replay.pf, m.before, entry["market"]["market_id"])
             result["fees_paid"] += m.replay.pf.fees_paid

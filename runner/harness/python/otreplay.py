@@ -15,6 +15,7 @@ the conformance vectors compare them row for row. In particular:
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from typing import Any, Callable
@@ -373,7 +374,7 @@ class MarketReplay:
                  log_budget: dict | None = None, budget: BudgetMonitor | None = None,
                  references=None, series=None, seed: int = 1,
                  fee_bps: float = 0, resting: dict | None = None, terminal=None, engine=None,
-                 clock: dict | None = None) -> None:
+                 clock: dict | None = None, record_budget: dict | None = None) -> None:
         self.market_id = market["market_id"]
         self.market = market
         # generic-data.mjs; see the matching comment in replay.mjs.
@@ -449,6 +450,18 @@ class MarketReplay:
         self.seen = 0
         self.last_ts = 0
         self.ended = False
+        # Phase 3b recorder -- see replay.mjs.
+        rm = (engine or {}).get("record_ms")
+        self.record_ms = rm if isinstance(rm, int) and not isinstance(rm, bool) and rm > 0 else None
+        self.record_rows = [] if self.record_ms else None
+        # The run's row budget, shared by every market -- see replay.mjs.
+        self.record_budget = ((record_budget if record_budget is not None
+                               else {"rows": 0, "limit": math.inf, "truncated": False})
+                              if self.record_ms else None)
+        self.rec_next = None
+        op = market.get("open_ts_ms")
+        if self.record_ms and isinstance(op, (int, float)) and not isinstance(op, bool) and math.isfinite(op):
+            self._record_start(op)
         if self.generic:
             self.trade_until = market.get("trade_until_ts_ms")
             self.close_ts = self.trade_until
@@ -491,6 +504,7 @@ class MarketReplay:
             return
         if job["at"] < self.clock["t"]:
             raise RunAbort("E_RUNTIME", f"engine invariant: a {job['kind']} at {job['at']} after the run reached {self.clock['t']}")
+        self._record_before(job["at"])
         self.state["now"] = job["at"]
         if job["kind"] == "timer":
             self.timer_stats["fired"] += 1
@@ -562,6 +576,7 @@ class MarketReplay:
                 if job["kind"] == "timer":
                     self.timer_stats["dropped"] += 1
                 continue
+            self._record_before(job["at"])
             self._run_exchange_job(job)
 
     def _run_exchange_job(self, job) -> None:
@@ -665,6 +680,47 @@ class MarketReplay:
         self._call("on_market_open", self._market_rec)
         self._check_budget()
 
+    def _record_start(self, ts) -> None:
+        if self.rec_next is None:
+            self.rec_next = math.ceil(ts / self.record_ms) * self.record_ms
+
+    def _record_sample(self, g, final) -> bool:
+        b = self.record_budget
+        if b["truncated"]:
+            return False
+        if b["rows"] + 1 > b["limit"]:
+            b["truncated"] = True
+            return False
+        b["rows"] += 1
+        self.record_rows.append({
+            "ts": g,
+            "cash": self.pf.market_cash.get(self.market_id, 0),
+            "marked": self.pf.market_marked.get(self.market_id, 0),
+            "position_value": self.pf.liquidation_value(self.market_id, self.book),
+            "final": final,
+        })
+        return True
+
+    def _record_before(self, t) -> None:
+        if not self.record_ms or self.rec_next is None:
+            return
+        while self.rec_next < t:
+            if not self._record_sample(self.rec_next, False):
+                self.rec_next = math.inf
+                return
+            self.rec_next += self.record_ms
+
+    def _record_final(self, ts) -> None:
+        if not self.record_ms:
+            return
+        self._record_start(ts)
+        self._record_before(ts)
+        if self.record_budget["truncated"]:
+            return
+        self._record_sample(ts, True)
+        if self.rec_next == ts:
+            self.rec_next += self.record_ms
+
     def step(self, ev) -> bool:
         """Apply one event. False once the market is past its close: nothing
         past the close reaches a hook, the book, or the history."""
@@ -677,10 +733,13 @@ class MarketReplay:
             self.ended = True
             return False
         state = self.state
+        if self.record_ms:
+            self._record_start(ts)
         # Everything scheduled strictly before this event resolves against the
         # book as it stood then. (Global mode: the harness scheduler did.)
         if not self.global_:
             self.drain_until(ts - 1)
+        self._record_before(ts)
         state["now"] = ts
         maker = self.maker
         if maker is not None:
@@ -737,6 +796,7 @@ class MarketReplay:
         if self.maker is not None:
             self.maker.close(ts, self.book)
         self._drop_pending()
+        self._record_before(ts)
         self.marked = [] if self.market.get("outcome") else self.pf.mark(self.market_id, self.terminal, ts)
 
     def _close_generic(self) -> dict:
@@ -752,7 +812,9 @@ class MarketReplay:
             state["now"] = self.close_now
         if outcome:
             self._call("on_settle", self._settle_rec, outcome)
+            self._record_before(settle_ts)
             settled = self.pf.settle(self.market_id, outcome, settle_ts)
+        self._record_final(settle_ts)
         if self.maker is not None:
             self.maker.release_rows((lambda side: contract_value(side, outcome)) if outcome else None)
         view = state.pop("view", None)
@@ -770,6 +832,7 @@ class MarketReplay:
             "budget": self.monitor.summary(),
             "maker": self.maker.stats if self.maker is not None else None,
             "timers": self.timer_stats if self.global_ else None,
+            **({"record": self.record_rows} if self.record_ms else {}),
         }
         return self.closed
 
@@ -793,7 +856,9 @@ class MarketReplay:
             state["now"] = self.close_now
         self._call("on_settle", self._settle_rec, market.get("outcome"))
         outcome = market.get("outcome")
+        self._record_before(settle_ts)
         settled = self.pf.settle(self.market_id, market["outcome"], settle_ts) if outcome else []
+        self._record_final(settle_ts)
         if self.maker is not None:
             self.maker.release_rows((lambda side: contract_value(side, outcome)) if outcome else None)
 
@@ -814,6 +879,7 @@ class MarketReplay:
             "budget": self.monitor.summary(),
             "maker": self.maker.stats if self.maker is not None else None,
             "timers": self.timer_stats if self.global_ else None,
+            **({"record": self.record_rows} if self.record_ms else {}),
         }
 
 

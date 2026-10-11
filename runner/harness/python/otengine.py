@@ -505,6 +505,9 @@ class Portfolio:
         # Generic markets only: outcome labels by index. See portfolio.mjs.
         self.market_labels: dict[str, tuple] = {}
         self.marked_value = 0.0
+        # Per market, the same sums as cash / marked_value -- see portfolio.mjs.
+        self.market_cash: dict = {}
+        self.market_marked: dict = {}
         # Execution options (job.engine). See portfolio.mjs.
         self.engine = engine
         self.quote_guard = (engine or {}).get("quote_guard") if isinstance(engine, dict) else None
@@ -609,6 +612,21 @@ class Portfolio:
 
     def size_of(self, market_id: str, side: str) -> float:
         return self._legs(market_id)[side].size
+
+    def liquidation_value(self, market_id: str, book) -> float:
+        """liquidationValue in portfolio.mjs."""
+        legs = self.legs.get(market_id)
+        if legs is None:
+            return 0
+        v = 0
+        for side in ("UP", "DOWN"):
+            leg = legs[side]
+            if not leg.size > EPS:
+                continue
+            bid = book.best_bid(side)
+            if bid is not None:
+                v += leg.size * bid
+        return v
 
     def position(self, market_id: str, book: Book | None = None) -> dict:
         legs = self._legs(market_id)
@@ -826,6 +844,7 @@ class Portfolio:
             leg.exit_size += filled
             leg.exit_notional += notional
             self.cash += notional - fee
+            self.market_cash[market_id] = self.market_cash.get(market_id, 0) + (notional - fee)
             if leg.size == 0.0:
                 self._close_trade(market_id, leg, ts, how)
         else:
@@ -840,6 +859,7 @@ class Portfolio:
             # matching comment in portfolio.mjs. Both engines or neither.
             leg.realised -= fee
             self.cash -= notional + fee
+            self.market_cash[market_id] = self.market_cash.get(market_id, 0) - (notional + fee)
         return realised
 
     def _fill_row(self, ts, market_id, order, res, tag, realised, fee, order_id=None) -> dict:
@@ -898,6 +918,7 @@ class Portfolio:
             leg.exit_size += leg.size
             leg.exit_notional += value
             self.cash += value
+            self.market_cash[market_id] = self.market_cash.get(market_id, 0) + value
             before = len(self.trades)
             self._close_trade(market_id, leg, ts, "settled", outcome=outcome)
             closed.append(self.trades[before])
@@ -928,6 +949,7 @@ class Portfolio:
             leg.exit_size += q
             leg.exit_notional += value
             self.marked_value += value
+            self.market_marked[market_id] = self.market_marked.get(market_id, 0) + value
             before = len(self.trades)
             self._close_trade(
                 market_id, leg, ts, "marked",

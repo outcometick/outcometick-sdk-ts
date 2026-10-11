@@ -598,6 +598,57 @@ export function normalizeQueueModel(value) {
   return { prob, n: null };
 }
 
+/**
+ * `record_ms`: the recorder's grid in whole milliseconds, 1000..3_600_000
+ * (phase 3b). Absent = off. Market mode only (enginePolicyFor refuses session).
+ */
+export const RECORD_MS_MIN = 1000;
+export const RECORD_MS_MAX = 3_600_000;
+export function normalizeRecordMs(value) {
+  if (value == null) return null;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < RECORD_MS_MIN || value > RECORD_MS_MAX) {
+    throw new BacktestRejection('E_MANIFEST',
+      `record_ms must be a whole number of milliseconds between ${RECORD_MS_MIN} and ${RECORD_MS_MAX}, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/**
+ * A conservative upper bound on the rows a record_ms run writes (market samples
+ * + account points; protocol.mjs MAX_RECORD_ROWS): per market-day, the
+ * interval's markets x (points across one market + 3 for its ends and FINAL),
+ * plus the account grid across the days. Used at submit to refuse a scope the
+ * recorder could not finish, naming the smallest record_ms that fits.
+ */
+const RECORD_MARKETS_PER_DAY = Object.freeze({ '5m': 288, '15m': 96 });
+const RECORD_INTERVAL_MS = Object.freeze({ '5m': 300_000, '15m': 900_000 });
+export function recordRowsBound({ recordMs, assets, days, intervals }) {
+  let rows = 0;
+  for (const iv of intervals ?? []) {
+    const per = RECORD_MARKETS_PER_DAY[iv] ?? 288;
+    const len = RECORD_INTERVAL_MS[iv] ?? 300_000;
+    rows += assets * days * per * (Math.ceil(len / recordMs) + 3);
+  }
+  return rows + Math.ceil((days * 86_400_000) / recordMs) + 2;
+}
+export function assertRecordFits({ recordMs, assets, days, intervals, maxRows }) {
+  if (recordMs == null) return;
+  const fits = (r) => recordRowsBound({ recordMs: r, assets, days, intervals }) <= maxRows;
+  if (fits(recordMs)) return;
+  let lo = recordMs;
+  let hi = RECORD_MS_MAX;
+  if (!fits(hi)) {
+    throw new BacktestRejection('E_SCOPE', `record_ms cannot cover ${days} day(s) x ${assets} asset(s) within the ${maxRows}-row limit; record a smaller scope`);
+  }
+  while (lo + 1 < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (fits(mid)) hi = mid; else lo = mid;
+  }
+  throw new BacktestRejection('E_SCOPE',
+    `record_ms ${recordMs} would write about ${recordRowsBound({ recordMs, assets, days, intervals })} rows over this scope `
+    + `(limit ${maxRows}); use record_ms ${hi} or more, or a smaller scope`);
+}
+
 /** `mirror_depth: "shared"` — single-book markets consume one depth for both tokens. */
 export function normalizeMirrorDepth(value) {
   if (value == null) return null;
@@ -624,9 +675,10 @@ export function enginePolicyFor({ manifest, venue, data = 'archive' }) {
   const mirror = normalizeMirrorDepth(manifest?.mirror_depth);
   const feedLatency = normalizeFeedLatency(manifest?.feed_latency);
   const queue = normalizeQueueModel(manifest?.queue_model);
+  const recordMs = normalizeRecordMs(manifest?.record_ms);
   const timers = (manifest?.hooks ?? []).includes('on_timer');
   const global = timers || feedLatency != null;
-  if (!fok && rules == null && rebate == null && guard == null && mirror == null && !global && queue == null) return null;
+  if (!fok && rules == null && rebate == null && guard == null && mirror == null && !global && queue == null && recordMs == null) return null;
   const refuse = (why) => { throw new BacktestRejection('E_MANIFEST', why); };
   let orderRules = null;
   if (rules === 'venue') {
@@ -646,6 +698,9 @@ export function enginePolicyFor({ manifest, venue, data = 'archive' }) {
   if (mirror != null && data === 'archive' && venue === 'polymarket') {
     refuse('mirror_depth "shared" is for single-book markets (Predict.fun); Polymarket publishes two separate books');
   }
+  if (recordMs != null && (manifest?.mode ?? 'market') !== 'market') {
+    refuse('record_ms needs mode "market": in a session one portfolio is shared by every market, and this recorder samples one market at a time');
+  }
   if (queue != null && data === 'archive' && venue !== 'polymarket') {
     refuse(`queue_model is for resting (gtc) orders, which need a trade stream; the ${venue} archive has none`);
   }
@@ -662,6 +717,8 @@ export function enginePolicyFor({ manifest, venue, data = 'archive' }) {
     ...(global ? { scheduler: 'global', timers, feed_latency: feedLatency ?? 0 } : {}),
     // Phase 2c: absent unless declared, so 2a/2b jobs keep their exact shape.
     ...(queue != null ? { queue_prob: queue } : {}),
+    // Phase 3b: the mark-to-market grid (market mode only).
+    ...(recordMs != null ? { record_ms: recordMs } : {}),
   };
 }
 

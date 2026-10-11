@@ -88,7 +88,44 @@ export const CHANNEL = Object.freeze({
    * worker itself fetched and fed.
    */
   progress: 'p',
+  /**
+   * The recorder (engine.record_ms): one market's value at one grid point, or
+   * its FINAL sample — `{key, ts, cash, marked, position_value, final}`. Engine
+   * output like markouts; only an input to the report's `record` block.
+   */
+  record: 'v',
 });
+
+/** Fields of a record line, in order. MUST MATCH RECORD_FIELDS in otharness.py. */
+export const RECORD_FIELDS = Object.freeze(['key', 'ts', 'cash', 'marked', 'position_value', 'final']);
+
+/**
+ * The recorder's budgets for a whole run. Rows: market samples plus the
+ * account grid the report builds from them (counted before it is built).
+ * Bytes: the encoded record lines, MAC and channel included. Either reached ->
+ * recording stops for the run and the report carries no series at all.
+ * MUST MATCH otharness.py.
+ */
+export const MAX_RECORD_ROWS = 1_000_000;
+export const MAX_RECORD_BYTES = 256 * 1024 * 1024;
+
+/**
+ * One record line, validated: a finite number for every value, a boolean
+ * final, a string key. Anything else is not a sample. MUST MATCH parse_record.
+ */
+export function parseRecord(raw) {
+  if (!raw || typeof raw !== 'object' || typeof raw.key !== 'string') return null;
+  for (const f of ['ts', 'cash', 'marked', 'position_value']) {
+    if (typeof raw[f] !== 'number' || !Number.isFinite(raw[f])) return null;
+  }
+  if (typeof raw.final !== 'boolean') return null;
+  return { key: raw.key, ts: raw.ts, cash: raw.cash, marked: raw.marked, position_value: raw.position_value, final: raw.final };
+}
+
+/** Bytes one result line takes on the stream: `<mac32> <channel> <payload>\n`. */
+export function lineBytes(channel, payload) {
+  return 32 + 1 + channel.length + 1 + new TextEncoder().encode(payload).length + 1;
+}
 
 /**
  * The authenticated result channel: the container's stdout.
@@ -304,6 +341,10 @@ export function parseResult(raw) {
     orders: parseOrderStats(r.orders),
     timers: r.timers && typeof r.timers === 'object'
       ? { created: finite(r.timers.created) ? r.timers.created : 0, fired: finite(r.timers.fired) ? r.timers.fired : 0, dropped: finite(r.timers.dropped) ? r.timers.dropped : 0 }
+      : null,
+    // The recorder's budgets as the harness spent them (null when off).
+    record: r.record && typeof r.record === 'object'
+      ? { rows: finite(r.record.rows) ? r.record.rows : 0, bytes: finite(r.record.bytes) ? r.record.bytes : 0, truncated: r.record.truncated === true }
       : null,
     marketSummaries: marketSummaries.filter((m) => m && typeof m === 'object').map((m) => ({
       market_id: typeof m.market_id === 'string' ? m.market_id : null,

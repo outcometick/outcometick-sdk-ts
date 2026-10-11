@@ -154,6 +154,11 @@ export class Portfolio {
     this.marketLabels = new Map();
     /** Value of positions closed at a mark (pf.mark): never cash. */
     this.markedValue = 0;
+    // Per market, the same sums as `cash` and `markedValue`, over the market's
+    // whole life (closing and reopening keep them). Read only by the recorder
+    // (record_ms); they change no other number. MUST MATCH otengine.py.
+    this.marketCash = new Map();
+    this.marketMarked = new Map();
     // Execution options (job.engine, phase 2a; null = all off, the old paths).
     this.engine = engine;
     this.quoteGuard = engine?.quote_guard ?? null;
@@ -228,6 +233,24 @@ export class Portfolio {
   }
 
   sizeOf(marketId, side) { return this.#legs(marketId)[side]?.size ?? 0; }
+
+  /**
+   * The recorder's valuation of a market's open legs: each at its token's best
+   * bid in `book` (depth ignored), a leg with no bid at 0 — what selling now
+   * would fetch, never a mid or a cost. MUST MATCH liquidation_value.
+   */
+  liquidationValue(marketId, book) {
+    const l = this.legs.get(marketId);
+    if (!l) return 0;
+    let v = 0;
+    for (const side of ['UP', 'DOWN']) {
+      const leg = l[side];
+      if (!(leg.size > EPS)) continue;
+      const bid = book.bestBid(side);
+      if (bid != null) v += leg.size * bid;
+    }
+    return v;
+  }
 
   /**
    * What ctx.position() reports: the leg the strategy is actually carrying.
@@ -537,6 +560,7 @@ export class Portfolio {
       leg.exitSize += filled;
       leg.exitNotional += notional;
       this.cash += notional - fee;
+      this.marketCash.set(marketId, (this.marketCash.get(marketId) ?? 0) + (notional - fee));
       if (leg.size === 0) this.#closeTrade(marketId, leg, ts, how);
     } else {
       if (leg.size <= EPS && leg.entryTs == null) leg.entryTs = ts;
@@ -552,6 +576,7 @@ export class Portfolio {
       // the first panel a paying customer looks at.
       leg.realised -= fee;
       this.cash -= notional + fee;
+      this.marketCash.set(marketId, (this.marketCash.get(marketId) ?? 0) - (notional + fee));
     }
     return realised;
   }
@@ -617,6 +642,7 @@ export class Portfolio {
       leg.exitSize += leg.size;
       leg.exitNotional += value;
       this.cash += value;
+      this.marketCash.set(marketId, (this.marketCash.get(marketId) ?? 0) + value);
 
       const before = this.trades.length;
       this.#closeTrade(marketId, leg, ts, 'settled', { outcome });
@@ -658,6 +684,7 @@ export class Portfolio {
       leg.exitSize += q;
       leg.exitNotional += value;
       this.markedValue += value;
+      this.marketMarked.set(marketId, (this.marketMarked.get(marketId) ?? 0) + value);
 
       const before = this.trades.length;
       this.#closeTrade(marketId, leg, ts, 'marked', {
