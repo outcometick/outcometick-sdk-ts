@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.6.0';
+export const SDK_VERSION = '2.7.0';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -27,6 +27,9 @@ export const SDK_VERSION = '2.6.0';
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
  *
+ * 1.24.0: probabilistic queue models for resting orders (job.engine.queue_prob:
+ * power / power2 / power3 / log / log2), with print/book reconciliation on the
+ * archive level; absent = the 1.23.0 queue, byte for byte.
  * 1.23.0: execution options (job.engine): fok, order rules, quote guard and
  * BookView.quote_ts, maker rebate estimate, shared mirrored depth; optional
  * fill fields (reject_reason, rebate) and result `orders`, only when enabled.
@@ -108,7 +111,7 @@ export const SDK_VERSION = '2.6.0';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.23.0';
+export const SANDBOX_IMAGE_TAG = '1.24.0';
 
 // ---------------------------------------------------------------------------
 // Languages

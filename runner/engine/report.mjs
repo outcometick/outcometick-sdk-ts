@@ -516,12 +516,14 @@ export function fillStats(fills) {
  * fee_model does: a forwarded report must say how its fills were produced.
  * MUST MATCH maker_report in client/backtest/report.py.
  */
-export function makerReport({ stats, fills, queueModel, printLagMs }) {
+export function makerReport({ stats, fills, queueModel, queueProb = null, printLagMs }) {
   if (!stats || !(stats.submitted > 0)) return null;
   const rate = (a, b) => (b > 0 ? r4(a / b) : null);
   const f = fills ?? makerFillAccumulator().result();
   return {
     queue_model: queueModel,
+    // Phase 2c: the probability function behind queue_model, only when one was used.
+    ...(queueProb ? { queue_prob: { prob: queueProb.prob, n: queueProb.n ?? null } } : {}),
     print_lag_ms: printLagMs,
     orders: {
       submitted: stats.submitted,

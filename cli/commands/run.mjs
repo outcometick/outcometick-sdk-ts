@@ -26,7 +26,7 @@ import {
 } from '../../runner/events.mjs';
 import { loadSeries } from '../../runner/series-data.mjs';
 import { buildReport, fillStats, feeModelReport, makerReport, ordersReport } from '../../runner/engine/report.mjs';
-import { QUEUE_MODEL, PRINT_LAG_MS } from '../../runner/engine/maker.mjs';
+import { queueModelName, PRINT_LAG_MS } from '../../runner/engine/maker.mjs';
 import { sessionLines } from '../../runner/session-feed.mjs';
 import { feePolicyFor, restingPolicyFor, enginePolicyFor } from '../../api/lib/backtest-datasets.mjs';
 import { buildArchive } from '../../runner/archive.mjs';
@@ -518,7 +518,7 @@ export async function cmdRun({ dir, flags }) {
         trades: base.trades,
         fillStats: fillSummary,
         maker: makerReport({
-          stats: base.result.maker, fills: fillSummary.makerFills, queueModel: QUEUE_MODEL, printLagMs: PRINT_LAG_MS,
+          stats: base.result.maker, fills: fillSummary.makerFills, queueModel: queueModelName(enginePolicy?.queue_prob), queueProb: enginePolicy?.queue_prob ?? null, printLagMs: PRINT_LAG_MS,
         }),
         orders: ordersReport({ policy: enginePolicy, stats: base.result.orders }),
         timers: enginePolicy?.timers ? base.result.timers : null,

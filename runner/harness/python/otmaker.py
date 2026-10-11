@@ -17,6 +17,12 @@ from otengine import PRICE_SCALE, to_ticks, from_ticks
 
 QUEUE_MODEL = "polymarket-queue-v1"
 PRINT_LAG_MS = 800
+# Probabilistic queue models -- see QUEUE_PROB_VERSION in maker.mjs.
+QUEUE_PROB_VERSION = "prob-v1"
+QUEUE_PROBS = ("power", "power2", "power3", "log", "log2")
+_PROB_INPUT_MAX = 1e15
+_LN2 = 0.6931471805599453
+_SMALL_X = 2.0 ** -20
 MAX_RESTING = 50
 TICK_GRID = 10
 MARKOUT_HORIZONS = (("markout_1s", 1_000), ("markout_10s", 10_000), ("markout_60s", 60_000))
@@ -26,6 +32,64 @@ _CLIENT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 _ENGINE_ID = re.compile(r"o[0-9]+")
 
 EPS = 1e-9
+
+
+def queue_model_name(queue_prob) -> str:
+    """queueModelName in maker.mjs."""
+    return f"{QUEUE_MODEL}+{QUEUE_PROB_VERSION}" if queue_prob else QUEUE_MODEL
+
+
+def _pow_n(r, n):
+    x = r
+    for _ in range(1, n):
+        x = x * r
+    return x
+
+
+def ln1p(x):
+    """ln(1 + x) by + - * / alone -- MUST MATCH ln1p in maker.mjs bit for bit."""
+    if x == 0:
+        return 0
+    if x < _SMALL_X:
+        return x - x * x / 2
+    y = 1 + x
+    k = 0
+    while y >= 2:
+        y = y / 2
+        k += 1
+    s = (y - 1) / (y + 1)
+    t = s * s
+    h = 1 / 39
+    for j in range(37, 0, -2):
+        h = h * t + 1 / j
+    return 2 * s * h + k * _LN2
+
+
+def queue_prob(model, a, b):
+    """queueProb in maker.mjs: share of a cancellation from behind, or None."""
+    if not (_num(a) and _num(b)) or not (math.isfinite(a) and math.isfinite(b)) \
+            or not a > 0 or not b >= 0 or a > _PROB_INPUT_MAX or b > _PROB_INPUT_MAX:
+        return None
+    n = model.get("n")
+    prob = model.get("prob")
+    if prob == "power":
+        if a <= b:
+            p = 1 / (1 + _pow_n(a / b, n))
+        else:
+            u = _pow_n(b / a, n)
+            p = u / (u + 1)
+    elif prob == "power2":
+        p = _pow_n(b / (a + b), n)
+    elif prob == "power3":
+        p = 1 - _pow_n(a / (a + b), n)
+    elif prob == "log":
+        lb = ln1p(b)
+        p = lb / (lb + ln1p(a))
+    elif prob == "log2":
+        p = ln1p(b) / ln1p(a + b)
+    else:
+        return None
+    return 0 if p < 0 else (1 if p > 1 else p)
 
 FINAL = frozenset((
     "filled", "cancelled", "expired", "cancelled_no_position",
@@ -98,10 +162,13 @@ class _Order:
 
 
 class MakerBook:
-    def __init__(self, market_id: str, portfolio, print_lag_ms: int = PRINT_LAG_MS) -> None:
+    def __init__(self, market_id: str, portfolio, print_lag_ms: int = PRINT_LAG_MS, queue_prob=None) -> None:
         self.market_id = market_id
         self.pf = portfolio
         self.lag = print_lag_ms
+        # job.engine.queue_prob or None -- see maker.mjs.
+        self.prob = queue_prob
+        self.unseen: dict[str, list[list]] = {"asks": [], "bids": []}  # [ts, q, amount]
         self.by_id: dict[str, _Order] = {}
         # Non-final orders in submission order -- see `open` in maker.mjs.
         self.open: list[_Order] = []
@@ -261,6 +328,18 @@ class MakerBook:
             led = self.ledger[kind]
             if led and led[0][0] + self.lag < T:
                 self.ledger[kind] = [e for e in led if e[0] + self.lag >= T]
+        if self.prob:
+            for kind in ("asks", "bids"):
+                un = self.unseen[kind]
+                if un and un[0][0] + self.lag < T:
+                    self.unseen[kind] = [e for e in un if e[0] + self.lag >= T]
+
+    def _unseen_at(self, kind, q):
+        total = 0
+        for e in self.unseen[kind]:
+            if e[1] == q:
+                total += e[2]
+        return total
 
     def tracking(self) -> bool:
         # A plain loop: this runs on every book event and trade.
@@ -281,6 +360,9 @@ class MakerBook:
             self.token_ts[side] = ev["ts_ms"]
             if ev.get("mirror") is True:
                 self.token_ts["DOWN" if side == "UP" else "UP"] = ev["ts_ms"]
+        if self.prob:
+            self._book_event_prob(ev, book, apply)
+            return
         if not self.tracking():
             apply()
             return
@@ -325,7 +407,184 @@ class MakerBook:
                 self.stats["crossed_observations"] += 1
             o.crossed = crossed
 
+    def _book_event_prob(self, ev: dict, book, apply) -> None:
+        """#bookEventProb in maker.mjs."""
+        if not self.stats["submitted"] > 0:
+            apply()
+            return
+        snapshot = ev.get("snapshot")
+        touches_up = (ev.get("levels") or {}).get("UP") is not None if snapshot else ev.get("side") == "UP"
+        if not touches_up:
+            apply()
+            return
+        T = ev["ts_ms"]
+        changes = []
+        if not snapshot and not ev.get("bbo"):
+            kind = ev.get("ladder")
+            px = ev.get("px")
+            if kind not in ("asks", "bids") or not _num(px):
+                apply()
+                return
+            ladder = book.ladders["UP"][kind]
+            q = to_ticks(px)
+            was = ladder.size_at_ticks(q)
+            apply()
+            changes.append((kind, q, was, ladder.size_at_ticks(q)))
+        else:
+            up = book.ladders["UP"]
+            before = {"asks": up["asks"].pairs(), "bids": up["bids"].pairs()}
+            apply()
+            for kind in ("asks", "bids"):
+                after = {q: s for q, s in book.ladders["UP"][kind].pairs()}
+                for q, size in before[kind]:
+                    changes.append((kind, q, size, after.get(q, 0)))
+        explained = {}
+        for kind, q, prev, now in changes:
+            drop = prev - now
+            if not drop > EPS:
+                continue
+            absorbed = 0
+            for e in self.unseen[kind]:
+                if e[1] != q or not e[2] > EPS:
+                    continue
+                take = min(drop - absorbed, e[2])
+                e[2] -= take
+                absorbed += take
+                if not drop - absorbed > EPS:
+                    break
+            if absorbed > 0:
+                self.unseen[kind] = [e for e in self.unseen[kind] if e[2] > EPS]
+            chg = drop - absorbed
+            if chg > EPS:
+                self.ledger[kind].append([T, q, chg])
+            explained[(kind, q)] = (prev, absorbed, chg)
+        bbo = ev.get("bbo")
+        for o in self._active():
+            v = book.ladders["UP"][o.kind].size_at_ticks(o.q)
+            was = o.ahead
+            nxt = v if v < was else was
+            c = None if bbo else explained.get((o.kind, o.q))
+            if c is not None and c[2] > EPS:
+                prev, absorbed, chg = c
+                prev_e = prev - absorbed
+                front = min(was, prev_e)
+                back = max(0, prev_e - front)
+                p = queue_prob(self.prob, front, back)
+                if p is not None:
+                    est = front - (1 - p) * chg + min(0, back - p * chg)
+                    e = est if est > 0 else 0
+                    if e < nxt:
+                        nxt = e
+            o.ahead = nxt
+            opp_levels = book.ladders["UP"]["asks" if o.kind == "bids" else "bids"].levels
+            opp_best = opp_levels[0] if opp_levels else None
+            crossed = opp_best is not None and (
+                opp_best[0] <= o.q if o.kind == "bids" else opp_best[0] >= o.q)
+            if crossed and not o.crossed:
+                self.stats["crossed_observations"] += 1
+            o.crossed = crossed
+
+    def _trade_prob(self, ev: dict, book) -> None:
+        """#tradeProb in maker.mjs."""
+        if not self.stats["submitted"] > 0:
+            return
+        size = ev.get("size")
+        px = ev.get("px")
+        if not (_num(size) and math.isfinite(size) and size > 0):
+            return
+        if not (_num(px) and 0 <= px <= 1):
+            return
+        if ev.get("side") not in ("UP", "DOWN") or ev.get("taker") not in ("BUY", "SELL"):
+            return
+        T = ev["ts_ms"]
+        kind, p = canonical_print(ev)
+        ladder = book.ladders["UP"][kind]
+        visible = {q: s for q, s in ladder.pairs()}
+        led = [e for e in self.ledger[kind] if _reached(kind, e[1], p) and e[2] > EPS]
+
+        def shadow(x):
+            return max(0, visible.get(x, 0) - self._unseen_at(kind, x))
+
+        def ordered(prices):
+            return sorted(prices) if kind == "asks" else sorted(prices, reverse=True)
+
+        own = [o for o in self._active() if o.kind == kind and _reached(kind, o.q, p)]
+        if own:
+            prices = set()
+            for lvl in ladder.levels:
+                if _reached(kind, lvl[0], p):
+                    prices.add(lvl[0])
+            for e in led:
+                prices.add(e[1])
+            for o in own:
+                prices.add(o.q)
+            left = [e[2] for e in led]
+            B = size
+            advance: list[list] = []
+            for x in ordered(prices):
+                if not B > EPS:
+                    break
+                for i, e in enumerate(led):
+                    if e[1] != x or not B > EPS:
+                        continue
+                    take = min(B, left[i])
+                    left[i] -= take
+                    B -= take
+                here = sorted((o for o in own if o.q == x), key=lambda o: (o.activated_ts, o.seq))
+                front = 0
+                ext_used = 0
+                for o in here:
+                    seg = max(0, o.ahead - front)
+                    ext_take = min(B, seg)
+                    B -= ext_take
+                    ext_used += ext_take
+                    if o.ahead > front:
+                        front = o.ahead
+                    exposed = T >= o.activated_ts + self.lag and (
+                        o.state == "live" or (o.state == "cancel_pending" and T <= o.cancel_eff + self.lag))
+                    if T >= o.activated_ts + self.lag:
+                        advance.append([o, ext_used])
+                    take = min(B, o.remaining)
+                    if not take > EPS:
+                        continue
+                    B -= take
+                    if exposed:
+                        self._fill(o, take, T)
+                    else:
+                        self.stats["lag_suppressed_size"] += take
+                rest = max(0, shadow(x) - front)
+                B -= min(B, rest)
+            for o, used in advance:
+                o.ahead = max(0, o.ahead - used)
+
+        prices = set()
+        for lvl in ladder.levels:
+            if _reached(kind, lvl[0], p):
+                prices.add(lvl[0])
+        for e in led:
+            prices.add(e[1])
+        before = {x: shadow(x) for x in prices}
+        R = size
+        for x in ordered(prices):
+            if not R > EPS:
+                break
+            for e in led:
+                if e[1] != x or not R > EPS:
+                    continue
+                take = min(R, e[2])
+                e[2] -= take
+                R -= take
+            t = min(R, before[x])
+            if t > EPS:
+                self.unseen[kind].append([T, x, t])
+            R -= t
+        if any(not e[2] > EPS for e in self.ledger[kind]):
+            self.ledger[kind] = [e for e in self.ledger[kind] if e[2] > EPS]
+
     def trade(self, ev: dict, book) -> None:
+        if self.prob:
+            self._trade_prob(ev, book)
+            return
         if not self.tracking():
             return
         size = ev.get("size")

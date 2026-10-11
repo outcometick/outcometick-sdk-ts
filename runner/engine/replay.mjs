@@ -559,7 +559,9 @@ export class MarketReplay {
 
     this.resting = resting;
     this.cancelLatencyMs = Number.isFinite(resting?.cancelLatencyMs) ? resting.cancelLatencyMs : fillDelayMs;
-    this.maker = resting?.allowed ? new MakerBook({ marketId: this.marketId, portfolio: this.pf }) : null;
+    this.maker = resting?.allowed
+      ? new MakerBook({ marketId: this.marketId, portfolio: this.pf, queueProb: engine?.queue_prob ?? null })
+      : null;
 
     // Orders decided at T but matched at T + fillDelayMs, and hold_s expiries.
     /** @type {Array<{at:number, kind:'order'|'flatten', payload:any}>} */

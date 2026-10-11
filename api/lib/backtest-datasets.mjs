@@ -573,6 +573,31 @@ export function normalizeFeedLatency(value) {
   return value;
 }
 
+/**
+ * `queue_model`: a probabilistic estimate of where in the queue unexplained
+ * book decreases came from (phase 2c), or null = the conservative default.
+ * {prob: "power"|"power2"|"power3", n: 1..10} or {prob: "log"|"log2"}. The
+ * names are QUEUE_PROBS in runner/engine/maker.mjs (a test pins the two).
+ */
+export const QUEUE_PROB_FUNCS = Object.freeze(['power', 'power2', 'power3', 'log', 'log2']);
+export function normalizeQueueModel(value) {
+  if (value == null) return null;
+  const bad = () => new BacktestRejection('E_MANIFEST',
+    'queue_model must be {"prob": "power"|"power2"|"power3", "n": 1..10} or {"prob": "log"|"log2"}, got '
+    + JSON.stringify(value));
+  if (typeof value !== 'object' || Array.isArray(value)) throw bad();
+  const keys = Object.keys(value);
+  const prob = value.prob;
+  if (!QUEUE_PROB_FUNCS.includes(prob)) throw bad();
+  if (prob.startsWith('power')) {
+    if (keys.some((k) => k !== 'prob' && k !== 'n')) throw bad();
+    if (!Number.isInteger(value.n) || value.n < 1 || value.n > 10) throw bad();
+    return { prob, n: value.n };
+  }
+  if (keys.some((k) => k !== 'prob')) throw bad();
+  return { prob, n: null };
+}
+
 /** `mirror_depth: "shared"` — single-book markets consume one depth for both tokens. */
 export function normalizeMirrorDepth(value) {
   if (value == null) return null;
@@ -598,9 +623,10 @@ export function enginePolicyFor({ manifest, venue, data = 'archive' }) {
   const guard = normalizeQuoteGuard(manifest?.quote_guard);
   const mirror = normalizeMirrorDepth(manifest?.mirror_depth);
   const feedLatency = normalizeFeedLatency(manifest?.feed_latency);
+  const queue = normalizeQueueModel(manifest?.queue_model);
   const timers = (manifest?.hooks ?? []).includes('on_timer');
   const global = timers || feedLatency != null;
-  if (!fok && rules == null && rebate == null && guard == null && mirror == null && !global) return null;
+  if (!fok && rules == null && rebate == null && guard == null && mirror == null && !global && queue == null) return null;
   const refuse = (why) => { throw new BacktestRejection('E_MANIFEST', why); };
   let orderRules = null;
   if (rules === 'venue') {
@@ -620,6 +646,9 @@ export function enginePolicyFor({ manifest, venue, data = 'archive' }) {
   if (mirror != null && data === 'archive' && venue === 'polymarket') {
     refuse('mirror_depth "shared" is for single-book markets (Predict.fun); Polymarket publishes two separate books');
   }
+  if (queue != null && data === 'archive' && venue !== 'polymarket') {
+    refuse(`queue_model is for resting (gtc) orders, which need a trade stream; the ${venue} archive has none`);
+  }
   return {
     fok,
     order_rules: orderRules,
@@ -631,6 +660,8 @@ export function enginePolicyFor({ manifest, venue, data = 'archive' }) {
     mirror_markets: mirror == null ? null : (data === 'archive' ? 'all' : 'single_mirrored'),
     // Phase 2b: one time line across markets (timers and/or a feed latency).
     ...(global ? { scheduler: 'global', timers, feed_latency: feedLatency ?? 0 } : {}),
+    // Phase 2c: absent unless declared, so 2a/2b jobs keep their exact shape.
+    ...(queue != null ? { queue_prob: queue } : {}),
   };
 }
 

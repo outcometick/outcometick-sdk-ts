@@ -439,7 +439,8 @@ class MarketReplay:
         cl = (resting or {}).get("cancelLatencyMs")
         self.cancel_latency_ms = cl if isinstance(cl, (int, float)) and not isinstance(cl, bool) \
             and cl == cl and cl not in (float("inf"), float("-inf")) else fill_delay_ms
-        self.maker = MakerBook(self.market_id, self.pf) if (resting or {}).get("allowed") else None
+        self.maker = MakerBook(self.market_id, self.pf, queue_prob=(engine or {}).get("queue_prob")) \
+            if (resting or {}).get("allowed") else None
         self.pending: list[dict] = []
         # A market with no declared close has no cutoff; the last event seen
         # becomes the close, tracked as we go rather than peeked.

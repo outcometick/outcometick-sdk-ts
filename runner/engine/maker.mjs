@@ -53,6 +53,87 @@ import { PRICE_SCALE, toTicks, fromTicks } from './book.mjs';
 export const QUEUE_MODEL = 'polymarket-queue-v1';
 
 /**
+ * Optional probabilistic queue models (manifest `queue_model`, job.engine
+ * .queue_prob = {prob, n}): where in the queue an UNEXPLAINED book decrease
+ * came from, after hftbacktest's ProbQueueModel. Absent, nothing below runs
+ * and the conservative model above is the whole story.
+ *
+ * Two separate records, so one unit of volume is explained once:
+ *  - the ARCHIVE level (no own orders exist there): `ledger` = volume the book
+ *    removed that no print explained yet, `unseen` = volume a print removed
+ *    that the book has not shown yet; shadow(q) = visible(q) - unseen(q). A
+ *    print walks it once (consuming ledger, adding unseen); a book decrease
+ *    first absorbs unseen, and only the rest is ledgered and treated as
+ *    cancellation.
+ *  - the ORDER level: `ahead`, advanced by the counterfactual waterfall as
+ *    today and, for the unexplained part of a decrease at its price, by
+ *    est = front - (1 - p) * chg + min(0, back - p * chg).
+ * Both lists live PRINT_LAG_MS: a heuristic window, stated in the report.
+ * MUST MATCH otmaker.py bit for bit (queueProb uses only + - * / in a fixed
+ * order for that reason).
+ */
+export const QUEUE_PROB_VERSION = 'prob-v1';
+export const QUEUE_PROBS = Object.freeze(['power', 'power2', 'power3', 'log', 'log2']);
+
+/** The report's model name for a run's queue_prob (null = the default). */
+export function queueModelName(queueProb) {
+  return queueProb ? `${QUEUE_MODEL}+${QUEUE_PROB_VERSION}` : QUEUE_MODEL;
+}
+
+const PROB_INPUT_MAX = 1e15;
+const LN2 = 0.6931471805599453;
+const SMALL_X = 2 ** -20;
+
+/** r^n, n a whole number >= 1, multiplied left to right. */
+function powN(r, n) {
+  let x = r;
+  for (let i = 1; i < n; i += 1) x = x * r;
+  return x;
+}
+
+/** ln(1 + x) for finite x >= 0, by + - * / alone (no library log). */
+export function ln1p(x) {
+  if (x === 0) return 0;
+  if (x < SMALL_X) return x - x * x / 2;
+  let y = 1 + x;
+  let k = 0;
+  while (y >= 2) { y = y / 2; k += 1; }
+  const s = (y - 1) / (y + 1);
+  const t = s * s;
+  let h = 1 / 39;
+  for (let j = 37; j >= 1; j -= 2) h = h * t + 1 / j;
+  return 2 * s * h + k * LN2;
+}
+
+/**
+ * The share of a cancellation that came from BEHIND an order with `a` in
+ * front and `b` behind, in [0, 1]; null outside the input contract (no
+ * probabilistic update then). MUST MATCH queue_prob in otmaker.py.
+ */
+export function queueProb(model, a, b) {
+  if (!(Number.isFinite(a) && Number.isFinite(b)) || !(a > 0) || !(b >= 0)
+      || a > PROB_INPUT_MAX || b > PROB_INPUT_MAX) return null;
+  const n = model.n;
+  let p;
+  if (model.prob === 'power') {
+    if (a <= b) p = 1 / (1 + powN(a / b, n));
+    else { const u = powN(b / a, n); p = u / (u + 1); }
+  } else if (model.prob === 'power2') {
+    p = powN(b / (a + b), n);
+  } else if (model.prob === 'power3') {
+    p = 1 - powN(a / (a + b), n);
+  } else if (model.prob === 'log') {
+    const lb = ln1p(b);
+    p = lb / (lb + ln1p(a));
+  } else if (model.prob === 'log2') {
+    p = ln1p(b) / ln1p(a + b);
+  } else {
+    return null;
+  }
+  return p < 0 ? 0 : (p > 1 ? 1 : p);
+}
+
+/**
  * How long a print may trail the book update that already showed its trade.
  *
  * One constant with three uses: the entry exclusion, the cancel exposure and
@@ -171,10 +252,14 @@ export class MakerBook {
    * @param {object} o.portfolio   the market's Portfolio (normalize / executeEffective / makerFill)
    * @param {number} [o.printLagMs]
    */
-  constructor({ marketId, portfolio, printLagMs = PRINT_LAG_MS }) {
+  constructor({ marketId, portfolio, printLagMs = PRINT_LAG_MS, queueProb = null }) {
     this.marketId = marketId;
     this.pf = portfolio;
     this.lag = printLagMs;
+    /** job.engine.queue_prob, or null: the conservative model, untouched. */
+    this.prob = queueProb;
+    /** Prob mode: print-removed volume the book has not shown yet, per side. */
+    this.unseen = { asks: [], bids: [] };
     /** Every order ever submitted in this market, by engine id. */
     this.byId = new Map();
     /**
@@ -385,6 +470,19 @@ export class MakerBook {
         this.ledger[kind] = led.filter((e) => e.ts + this.lag >= T);
       }
     }
+    if (this.prob) {
+      for (const kind of ['asks', 'bids']) {
+        const un = this.unseen[kind];
+        if (un.length && un[0].ts + this.lag < T) this.unseen[kind] = un.filter((e) => e.ts + this.lag >= T);
+      }
+    }
+  }
+
+  /** Prob mode: unexplained-print volume at `q`, summed in arrival order. */
+  #unseenAt(kind, q) {
+    let sum = 0;
+    for (const e of this.unseen[kind]) if (e.q === q) sum += e.amount;
+    return sum;
   }
 
   /** True when some activated order can still be affected by book or prints. */
@@ -402,6 +500,7 @@ export class MakerBook {
       // A mirrored delta (generic single-book data) updates both tokens.
       if (ev.mirror === true) this.tokenTs[ev.side === 'UP' ? 'DOWN' : 'UP'] = ev.ts_ms;
     }
+    if (this.prob) { this.#bookEventProb(ev, book, apply); return; }
     if (!this.tracking()) { apply(); return; }
     // Only the canonical (UP) ladders matter, and most events cannot touch
     // them: a DOWN delta or snapshot leaves UP as it was — and so every queue
@@ -444,8 +543,80 @@ export class MakerBook {
     }
   }
 
+  /**
+   * Prob mode's book event. From the first gtc submit on, every UP change is
+   * reconciled at the archive level (unseen absorbed once per price, the rest
+   * ledgered), then each active order is bounded by the visible size and, for
+   * the unexplained part at its own price, moved by the probability model. A
+   * bbo bound only bounds: a crossed-level prune says nothing about where in
+   * the queue volume left.
+   */
+  #bookEventProb(ev, book, apply) {
+    if (!(this.stats.submitted > 0)) { apply(); return; }
+    const touchesUp = ev.snapshot ? ev.levels?.UP != null : ev.side === 'UP';
+    if (!touchesUp) { apply(); return; }
+    const T = ev.ts_ms;
+    const changes = [];
+    if (!ev.snapshot && !ev.bbo) {
+      if ((ev.ladder !== 'asks' && ev.ladder !== 'bids') || typeof ev.px !== 'number') { apply(); return; }
+      const ladder = book.ladders.UP[ev.ladder];
+      const q = toTicks(ev.px);
+      const was = ladder.sizeAtTicks(q);
+      apply();
+      changes.push({ kind: ev.ladder, q, prev: was, now: ladder.sizeAtTicks(q) });
+    } else {
+      const before = { asks: book.ladders.UP.asks.pairs(), bids: book.ladders.UP.bids.pairs() };
+      apply();
+      for (const kind of ['asks', 'bids']) {
+        const after = new Map(book.ladders.UP[kind].pairs());
+        for (const [q, size] of before[kind]) changes.push({ kind, q, prev: size, now: after.get(q) ?? 0 });
+      }
+    }
+    const explained = new Map();
+    for (const c of changes) {
+      const drop = c.prev - c.now;
+      if (!(drop > EPS)) continue;
+      // Absorbed ONCE per price, oldest unseen first.
+      let absorbed = 0;
+      for (const e of this.unseen[c.kind]) {
+        if (e.q !== c.q || !(e.amount > EPS)) continue;
+        const take = Math.min(drop - absorbed, e.amount);
+        e.amount -= take;
+        absorbed += take;
+        if (!(drop - absorbed > EPS)) break;
+      }
+      if (absorbed > 0) this.unseen[c.kind] = this.unseen[c.kind].filter((e) => e.amount > EPS);
+      const chg = drop - absorbed;
+      if (chg > EPS) this.ledger[c.kind].push({ ts: T, q: c.q, amount: chg });
+      explained.set(`${c.kind}:${c.q}`, { prev: c.prev, absorbed, chg });
+    }
+    for (const o of this.#active()) {
+      const v = book.ladders.UP[o.kind].sizeAtTicks(o.q);
+      const was = o.ahead;
+      let next = v < was ? v : was;
+      const c = ev.bbo ? null : explained.get(`${o.kind}:${o.q}`);
+      if (c && c.chg > EPS) {
+        const prevE = c.prev - c.absorbed;
+        const front = Math.min(was, prevE);
+        const back = Math.max(0, prevE - front);
+        const p = queueProb(this.prob, front, back);
+        if (p != null) {
+          const est = front - (1 - p) * c.chg + Math.min(0, back - p * c.chg);
+          const e = est > 0 ? est : 0;
+          if (e < next) next = e;
+        }
+      }
+      o.ahead = next;
+      const oppBest = o.kind === 'bids' ? book.ladders.UP.asks.levels[0] : book.ladders.UP.bids.levels[0];
+      const crossed = oppBest != null && (o.kind === 'bids' ? oppBest.ticks <= o.q : oppBest.ticks >= o.q);
+      if (crossed && !o.crossed) this.stats.crossed_observations += 1;
+      o.crossed = crossed;
+    }
+  }
+
   /** One print, through the single waterfall. */
   trade(ev, book) {
+    if (this.prob) { this.#tradeProb(ev, book); return; }
     if (!this.tracking()) return;
     // The decoder already refuses these; this is the second door, so both
     // engines agree on the same rule rather than on whatever each tolerates.
@@ -505,6 +676,93 @@ export class MakerBook {
       if (this.ledger[k].some((e) => !(e.amount > EPS))) {
         this.ledger[k] = this.ledger[k].filter((e) => e.amount > EPS);
       }
+    }
+  }
+
+  /**
+   * Prob mode's print: the counterfactual waterfall (fills, `ahead`) reads the
+   * archive level as it stood before this print and never changes it; the
+   * REAL walk (no own orders) then consumes ledger and records unseen. Two
+   * budgets, each run out where it runs out.
+   */
+  #tradeProb(ev, book) {
+    if (!(this.stats.submitted > 0)) return;
+    if (!(typeof ev.size === 'number' && Number.isFinite(ev.size) && ev.size > 0)) return;
+    if (!(typeof ev.px === 'number' && ev.px >= 0 && ev.px <= 1)) return;
+    if ((ev.side !== 'UP' && ev.side !== 'DOWN') || (ev.taker !== 'BUY' && ev.taker !== 'SELL')) return;
+    const T = ev.ts_ms;
+    const { kind, p } = canonicalPrint(ev);
+    const ladder = book.ladders.UP[kind];
+    const visible = new Map(ladder.pairs());
+    const led = this.ledger[kind].filter((e) => reached(kind, e.q, p) && e.amount > EPS);
+    const shadow = (x) => Math.max(0, (visible.get(x) ?? 0) - this.#unseenAt(kind, x));
+    const order = (a, b) => (kind === 'asks' ? a - b : b - a);
+
+    // The counterfactual walk: today's waterfall on a copy of the ledger, the
+    // level's rest from shadow.
+    const own = this.#active().filter((o) => o.kind === kind && reached(kind, o.q, p));
+    if (own.length) {
+      const prices = new Set();
+      for (const l of ladder.levels) if (reached(kind, l.ticks, p)) prices.add(l.ticks);
+      for (const e of led) prices.add(e.q);
+      for (const o of own) prices.add(o.q);
+      const left = led.map((e) => e.amount);
+      let B = ev.size;
+      const advance = new Map();
+      for (const x of [...prices].sort(order)) {
+        if (!(B > EPS)) break;
+        for (let i = 0; i < led.length; i += 1) {
+          if (led[i].q !== x || !(B > EPS)) continue;
+          const take = Math.min(B, left[i]);
+          left[i] -= take;
+          B -= take;
+        }
+        const here = own.filter((o) => o.q === x)
+          .sort((a, b) => (a.activatedTs - b.activatedTs) || (a.seq - b.seq));
+        let front = 0;
+        let extUsed = 0;
+        for (const o of here) {
+          const seg = Math.max(0, o.ahead - front);
+          const extTake = Math.min(B, seg);
+          B -= extTake;
+          extUsed += extTake;
+          if (o.ahead > front) front = o.ahead;
+          const exposed = T >= o.activatedTs + this.lag
+            && (o.state === 'live' || (o.state === 'cancel_pending' && T <= o.cancelEff + this.lag));
+          if (T >= o.activatedTs + this.lag) advance.set(o, extUsed);
+          const take = Math.min(B, o.remaining);
+          if (!(take > EPS)) continue;
+          B -= take;
+          if (exposed) this.#fill(o, take, T, book);
+          else this.stats.lag_suppressed_size += take;
+        }
+        const rest = Math.max(0, shadow(x) - front);
+        B -= Math.min(B, rest);
+      }
+      for (const [o, used] of advance) o.ahead = Math.max(0, o.ahead - used);
+    }
+
+    // The REAL walk: what the archive says this print removed.
+    const prices = new Set();
+    for (const l of ladder.levels) if (reached(kind, l.ticks, p)) prices.add(l.ticks);
+    for (const e of led) prices.add(e.q);
+    const before = new Map();
+    for (const x of prices) before.set(x, shadow(x));
+    let R = ev.size;
+    for (const x of [...prices].sort(order)) {
+      if (!(R > EPS)) break;
+      for (const e of led) {
+        if (e.q !== x || !(R > EPS)) continue;
+        const take = Math.min(R, e.amount);
+        e.amount -= take;
+        R -= take;
+      }
+      const t = Math.min(R, before.get(x));
+      if (t > EPS) this.unseen[kind].push({ ts: T, q: x, amount: t });
+      R -= t;
+    }
+    if (this.ledger[kind].some((e) => !(e.amount > EPS))) {
+      this.ledger[kind] = this.ledger[kind].filter((e) => e.amount > EPS);
     }
   }
 
