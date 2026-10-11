@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.3.1';
+export const SDK_VERSION = '2.4.0';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -694,13 +694,19 @@ export const MAX_REPLAY_MS = 6_480_000;   // 108 minutes
  * ceiling drops 36 → 30 market-days; no customer run has ever asked for more
  * than 30. The 108-minute ceiling is unchanged on purpose (one worker slot).
  *
+ * polymarket/python RAISED to 260 s on 2026-10-11 (owner decision) for resting
+ * orders: the queue model costs the Python engine more per event, and the
+ * spread-quote template took 198 s of wall clock (fetch included) on one BTC
+ * day in production against a 210 s budget — no room for a slow host. The
+ * ceiling drops 30 → 24 market-days (= 4 assets × 6 days, 3 × 8, …).
+ *
  * MEASURE AGAIN AFTER ANY CADENCE OR DECODER CHANGE — the surprises above came
  * from a capture change that nobody thought to re-measure against. Emitting
  * predict book events as deltas is worth about 2× (measured: 4.2× the bytes,
  * 5.3× the parse, 5.7× the apply) and would bring predict's two back down.
  */
 export const REPLAY_MS_PER_MARKET_DAY = Object.freeze({
-  polymarket: Object.freeze({ nodejs: 84_000, python: 210_000 }),
+  polymarket: Object.freeze({ nodejs: 84_000, python: 260_000 }),
   predict: Object.freeze({ nodejs: 80_000, python: 180_000 }),
 });
 
