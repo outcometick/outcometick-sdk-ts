@@ -30,6 +30,7 @@ export const ARCHIVE_DATASETS = Object.freeze({
     twap60s: Object.freeze(['twap60s']),
     book: Object.freeze(['book', 'price_change']),
     bbo: Object.freeze(['best_bid_ask']),
+    spot: Object.freeze(['prices']),
     trades: Object.freeze(['last_trade_price']),
     markets: Object.freeze(['markets']),
   }),
@@ -835,7 +836,10 @@ export const PREWARM_DATASETS = Object.freeze(
  * Derived, so a dataset added to the product is warmed without anyone
  * remembering to come here.
  */
+// Not `spot`: a whole extra decoded copy of every warmed day for an option few
+// runs declare. A spot run pays a cold decode, like any shape nobody warms.
+export const NOT_WARMED = Object.freeze(['spot']);
 export const PREWARM_SHAPES = Object.freeze([
   PREWARM_DATASETS,
-  ...OPT_IN_DATASETS.map((d) => Object.freeze([...PREWARM_DATASETS, d])),
+  ...OPT_IN_DATASETS.filter((d) => !NOT_WARMED.includes(d)).map((d) => Object.freeze([...PREWARM_DATASETS, d])),
 ]);

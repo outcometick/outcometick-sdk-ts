@@ -963,7 +963,7 @@ export function buildReport({
   trades, fillStats: fillSummary, marketSummaries, marketMeta,
   feesPaid = 0, fillDelayMs = 0, feeModel = null, sweep = null, coverage = null,
   crosschecks = [], budget = null, seed = null, scanned = {}, maker = null, orders = null, timers = null,
-  fingerprint = null, record = null,
+  fingerprint = null, record = null, spot = null,
 }) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
   const equity = equityCurve(closed);
@@ -1045,6 +1045,8 @@ export function buildReport({
     ...(timers ? { timers } : {}),
     // The time-grid mark-to-market (record_ms) — only when the run asked for it.
     ...(record ? { record } : {}),
+    // The spot dataset: how many markets had any spot value -- only when declared.
+    ...(spot ? { spot } : {}),
     sweep,
     coverage,
     budget,

@@ -584,7 +584,8 @@ async function main() {
       m.rowsFor(ev.name).push(row);
       return false;
     }
-    m.seen += 1;
+    // A spot value is quiet (DATASETS.spot): not counted as an event seen.
+    if (ev.kind !== 'spot') m.seen += 1;
     // This book exists only to find the opening quotes, so it stops being kept
     // once they are known: the replay keeps its own, and applying every event
     // to both was a second book's worth of work per event.
@@ -632,6 +633,8 @@ async function main() {
     ), entry.lags ?? {});
     m.replay = new MarketReplay({
       market: entry.market,
+      stream: entry.stream ?? null,
+      spotDeclared: job.spot === true,
       strategy: instance,
       hooks: job.hooks,
       portfolio: pf,
@@ -704,6 +707,13 @@ async function main() {
     if (engine?.timers && out.timers) {
       const t = result.timers ?? (result.timers = { created: 0, fired: 0, dropped: 0 });
       for (const k of ['created', 'fired', 'dropped']) t[k] += out.timers[k] ?? 0;
+    }
+    // The spot dataset: how many markets actually got any (absent unless
+    // declared). MUST MATCH otharness.py.
+    if (job.spot === true) {
+      const s = result.spot ?? (result.spot = { markets: 0, markets_without: 0 });
+      if (out.spot_seen > 0) s.markets += 1;
+      else s.markets_without += 1;
     }
 
     // Tracked as the stream went past rather than scanned afterwards: there

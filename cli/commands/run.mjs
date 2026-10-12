@@ -433,6 +433,8 @@ export async function cmdRun({ dir, flags }) {
         // Same rule as the worker: Polymarket with book + trades declared.
         resting: restingPolicyFor({ manifest, venue }),
         ...(enginePolicy ? { engine: enginePolicy } : {}),
+        // Same rule as the worker: absent unless the spot dataset is declared.
+        ...((manifest.datasets ?? []).includes('spot') ? { spot: true } : {}),
         limits: LIMITS,
       };
       if (languageId === 'python') {
@@ -583,6 +585,7 @@ export async function cmdRun({ dir, flags }) {
         orders: ordersReport({ policy: enginePolicy, stats: base.result.orders }),
         timers: enginePolicy?.timers ? base.result.timers : null,
         record: rec.block,
+        spot: (manifest.datasets ?? []).includes('spot') ? base.result.spot : null,
         marketSummaries: [...marketMeta.values()],
         marketMeta,
         feesPaid: base.result.feesPaid,

@@ -166,7 +166,7 @@ export async function finishSpooledMarket({ day, marketId, market, events, event
   } };
 }
 
-export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDir, feed, pause = null }) {
+export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDir, feed, pause = null, spot = false }) {
   // SPOOLED TO DISK, not accumulated in memory.
   //
   // One day of one asset is about two million events once the book, its deltas
@@ -212,7 +212,7 @@ export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDi
       bytes += Number(f.bytes) || 0;
 
       for await (const row of f.rows()) {
-        for (const [marketId, ev] of eventsFromRow(f.path, row, markets, bySlug, throttle)) {
+        for (const [marketId, ev] of eventsFromRow(f.path, row, markets, bySlug, throttle, { spot })) {
           // COVERAGE IS A FACT ABOUT EVENTS, NOT ABOUT FILES. Recorded here,
           // where an event actually exists, rather than from the feed list.
           // An object that is present but empty, truncated, or whose every row

@@ -207,7 +207,14 @@ function bookView(book) {
   });
 }
 
-function createCtx({ params, portfolio, marketId, market, logBudget, references, series, rng, resting = null, timers = null }) {
+// The settlement window a TWAP-settled market's ctx.twap_locked() reads.
+const TWAP_LOOKBACK_MS = Object.freeze({ twap30s: 30_000, twap60s: 60_000 });
+// ctx.twap_locked().projected is null below this sample coverage, or when the
+// latest spot value is older than this. MUST MATCH otreplay.py.
+const SPOT_MIN_COVERAGE = 0.8;
+const SPOT_MAX_AGE_MS = 5000;
+
+function createCtx({ params, portfolio, marketId, market, logBudget, references, series, rng, resting = null, timers = null, stream = null, spotDeclared = false }) {
   const history = [];
   const logs = [];
   const crosschecks = [];
@@ -221,6 +228,72 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
   const tail = (window) => {
     const n = Math.max(1, Math.min(Number(window) || 1, history.length));
     return history.slice(history.length - n).map((t) => t.value);
+  };
+
+  // spot (DATASETS.spot): recorded as each spot event ARRIVES, so a feed
+  // latency delays it like everything else, and answered AS OF THIS CTX'S NOW:
+  // only values that had ARRIVED by ctx.now count (and so were stamped no later
+  // than it). A ctx kept from another market (session mode) thus answers for its
+  // own clock, never with values heard after it. Arrival order is feed order
+  // within a market (one latency for every event), so both arrays are sorted;
+  // the window and the one-sample-per-timestamp rule go by feed time.
+  const lookbackMs = TWAP_LOOKBACK_MS[stream] ?? null;
+  const closeTs = market?.close_ts_ms ?? null;
+  const windowStart = lookbackMs != null && closeTs != null ? closeTs - lookbackMs : null;
+  const spotTs = [];
+  const spotVal = [];
+  const spotArrived = [];
+  let spotSeen = 0;
+  // How many entries of a sorted array are at or before t.
+  const upTo = (xs, t) => {
+    let lo = 0;
+    let hi = xs.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (xs[mid] <= t) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+
+  // Undeclared, these would return null forever and a strategy would quietly
+  // never trade on them -- refused instead, like an undeclared ctx.ref().
+  const needSpot = (what) => {
+    if (!spotDeclared) throw new RunAbort('E_MANIFEST', `${what} needs the "spot" dataset declared in the manifest`);
+  };
+  const twapLocked = () => {
+    needSpot('ctx.twap_locked()');
+    if (windowStart == null || now < windowStart) return null;
+    const k = upTo(spotArrived, now);
+    // One sample per feed timestamp in [windowStart, close), the first to
+    // arrive, summed in arrival order.
+    let sum = 0;
+    let n = 0;
+    let prev = null;
+    for (let i = upTo(spotTs, windowStart - 1); i < k; i += 1) {
+      const ts = spotTs[i];
+      if (ts >= closeTs || ts === prev) continue;
+      sum += spotVal[i];
+      n += 1;
+      prev = ts;
+    }
+    if (n === 0) return null;
+    const elapsed = Math.min(Math.max(now - windowStart, 0), lookbackMs);
+    const value = sum / n;
+    const fraction = elapsed / lookbackMs;
+    const coverage = Math.min(1, n / Math.max(1, Math.floor(elapsed / 1000)));
+    const lastTs = spotTs[k - 1];
+    const lastVal = spotVal[k - 1];
+    const fresh = now - lastTs <= SPOT_MAX_AGE_MS;
+    return {
+      value,
+      samples: n,
+      elapsed_ms: elapsed,
+      elapsed_fraction: fraction,
+      coverage,
+      last_ts_ms: lastTs,
+      projected: coverage >= SPOT_MIN_COVERAGE && fresh ? fraction * value + (1 - fraction) * lastVal : null,
+    };
   };
 
   const ctx = {
@@ -318,6 +391,36 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
       return s.viewAt(now);
     },
 
+    /**
+     * The latest spot value that has reached the strategy, as
+     * { value, ts_ms } (a copy), or null. Needs the `spot` dataset.
+     */
+    spot() {
+      needSpot('ctx.spot()');
+      const k = upTo(spotArrived, now);
+      return k === 0 ? null : { value: spotVal[k - 1], ts_ms: spotTs[k - 1] };
+    },
+
+    /**
+     * The part of the settlement TWAP window [close - lookback, close) already
+     * elapsed, from the spot values seen in it -- an APPROXIMATION of what
+     * Chainlink's average holds so far (it uses finer observations than this
+     * per-second stream). null when the market does not settle on a TWAP, the
+     * window has not started, or no spot value in it has arrived.
+     *   value             mean of the window's spot samples seen so far
+     *   samples           how many (one per feed timestamp)
+     *   elapsed_ms        time since the window opened (capped at lookback)
+     *   elapsed_fraction  elapsed_ms / lookback -- time, not certainty
+     *   coverage          samples / elapsed seconds (capped at 1)
+     *   last_ts_ms        feed time of the latest spot value seen
+     *   projected         elapsed_fraction * value + (1 - elapsed_fraction) *
+     *                     latest spot: the final average IF the price stayed
+     *                     where it is; null when coverage < 0.8 or the latest
+     *                     spot is more than 5 s old
+     */
+    twap_locked() { return twapLocked(); },
+    twapLocked() { return twapLocked(); },
+
     /** Rolling helpers over the tick history. Identical across languages. */
     zscore(value, { window = 60 } = {}) {
       const xs = tail(window);
@@ -388,6 +491,13 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
     // writes to `tick.value` would otherwise be rewriting the series its own
     // zscore/sma/ema are computed from — and the report's prices with it.
     pushTick(ev) { history.push({ ...ev }); },
+    pushSpot(ev, arrivedAt) {
+      spotSeen += 1;
+      spotTs.push(ev.ts_ms);
+      spotVal.push(ev.value);
+      spotArrived.push(arrivedAt);
+    },
+    get spotSeen() { return spotSeen; },
     logs,
     crosschecks,
     get logTruncated() { return logTruncated; },
@@ -453,6 +563,10 @@ export function makeLogBudget({
 export class MarketReplay {
   constructor({
     market, strategy, hooks,
+    // The stream the market settles on (twap60s, ...): sets ctx.twap_locked()'s window.
+    stream = null,
+    // The run declared the spot dataset (job.spot): ctx.spot() / twap_locked() allowed.
+    spotDeclared = false,
     portfolio = null,
     fillDelayMs = 0,
     /**
@@ -534,6 +648,8 @@ export class MarketReplay {
     } : null;
     const { ctx, control } = createCtx({
       timers: timerApi,
+      stream,
+      spotDeclared,
       params: strategy.p ?? {},
       portfolio: this.pf,
       marketId: this.marketId,
@@ -722,6 +838,13 @@ export class MarketReplay {
     if (job.at < this.clock.t) {
       throw new RunAbort('E_RUNTIME', `engine invariant: a ${job.kind} at ${job.at} after the run reached ${this.clock.t}`);
     }
+    // A spot value arriving is QUIET here too: it is recorded, and nothing else
+    // moves -- not ctx.now (a ctx kept in session mode would jump), not the
+    // recorder.
+    if (job.kind === 'arrival' && job.payload.kind === 'spot') {
+      this.control.pushSpot(job.payload, job.at);
+      return;
+    }
     this.#recordBefore(job.at);
     this.control.setNow(job.at);
     if (job.kind === 'timer') {
@@ -779,6 +902,7 @@ export class MarketReplay {
 
   /** A lagged event reaches the strategy: the local book, the history, the hook. */
   #arrive(ev) {
+    if (ev.kind === 'spot') { this.control.pushSpot(ev, this.control.now); return; }
     if (ev.kind === 'book') applyEvent(this.localBook, ev, this.generic);
     if (ev.kind === 'tick') this.control.pushTick(ev);
     const hook = ev.bbo ? null : HOOK_FOR[ev.kind];
@@ -840,6 +964,10 @@ export class MarketReplay {
     try {
       out = fn.call(this.strategy, this.ctx, ...args);
     } catch (err) {
+      // The engine's own refusal (an undeclared ctx.ref(), ctx.spot(), ...)
+      // keeps its code; only what the strategy itself threw is E_RUNTIME.
+      // MUST MATCH _call in otreplay.py, which always did this.
+      if (err instanceof RunAbort) throw err;
       throw new RunAbort('E_RUNTIME', `${name} threw: ${err?.message ?? err}`);
     }
     this.monitor.record(Number(process.hrtime.bigint() - t0) / 1000);
@@ -924,6 +1052,16 @@ export class MarketReplay {
    */
   step(ev) {
     if (this.ended) return false;
+    // QUIET (DATASETS.spot): no hook, no book, recorder or maker work, not
+    // counted as an event seen or a budget sample -- declaring spot changes
+    // nothing but what ctx.spot() and ctx.twap_locked() return. A feed latency
+    // delays it like every event.
+    if (ev.kind === 'spot') {
+      if (ev.ts_ms > this.closeTs) return false;
+      if (this.global && this.feedLatency > 0) this.#schedule(ev.ts_ms + this.feedLatency, 'arrival', ev);
+      else this.control.pushSpot(ev, ev.ts_ms);
+      return true;
+    }
     this.seen += 1;
     this.lastTs = ev.ts_ms;
     if (ev.ts_ms > this.closeTs) { this.ended = true; return false; }
@@ -1034,6 +1172,7 @@ export class MarketReplay {
       marketId: this.marketId,
       asset: null,
       events: this.seen,
+      spot_seen: this.control.spotSeen,
       settled,
       logs: this.control.logs,
       logTruncated: this.control.logTruncated,
@@ -1085,6 +1224,7 @@ export class MarketReplay {
       // What the engine PULLED, not what the caller had. With a stream the
       // latter is unknowable without draining, and not draining is the point.
       events: this.seen,
+      spot_seen: this.control.spotSeen,
       settled,
       logs: this.control.logs,
       logTruncated: this.control.logTruncated,

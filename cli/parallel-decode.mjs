@@ -143,7 +143,7 @@ function takeHeader(buf) {
  * `chunkBytes` is there for the tests, which cut tiny chunks.
  */
 export async function spoolDayParallel({
-  day, markets, bySlug, throttle = null, eventsDir, feedPaths, root, workers, chunkBytes = CHUNK_BYTES,
+  day, markets, bySlug, throttle = null, eventsDir, feedPaths, root, workers, chunkBytes = CHUNK_BYTES, spot = false,
 }) {
   if (!canSpoolInParallel({ workers, markets, throttle })) return null;
   const n = workers;
@@ -170,7 +170,7 @@ export async function spoolDayParallel({
     const parse = [];
     for (let k = 0; k < n; k += 1) {
       parse.push(start({
-        phase: 'parse', k, markets, bySlug, dir: work, indexOf,
+        phase: 'parse', k, markets, bySlug, dir: work, indexOf, spot,
         dataset: throttle?.dataset ?? null, gate: throttle != null,
       }));
     }
@@ -241,7 +241,7 @@ export async function spoolDayParallel({
 
 // --- inside a thread --------------------------------------------------------
 
-function parseThread({ k, markets, bySlug, dir, indexOf, dataset, gate }) {
+function parseThread({ k, markets, bySlug, dir, indexOf, dataset, gate, spot }) {
   // One file per market, appended in budget-sized batches: the thread never
   // holds more than BUFFER_BYTES of records, however dense the day.
   const bufs = new Map();
@@ -280,7 +280,7 @@ function parseThread({ k, markets, bySlug, dir, indexOf, dataset, gate }) {
       asked = [];
       let evs;
       try {
-        evs = eventsFromRow(rel, row, markets, bySlug, probe);
+        evs = eventsFromRow(rel, row, markets, bySlug, probe, { spot });
       } catch (err) {
         finish({ fallback: `${rel}: ${err.message}` });
         return;

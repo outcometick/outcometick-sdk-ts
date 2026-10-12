@@ -304,7 +304,9 @@ class _Market:
             row = {k: v for k, v in ev.items() if k not in ("kind", "name")}
             self.rows_for(ev.get("name")).append(row)
             return False
-        self.seen += 1
+        # A spot value is quiet -- not counted as an event seen (harness.mjs).
+        if kind != "spot":
+            self.seen += 1
         # This book exists only to find the opening quotes, so it stops being
         # kept once they are known: the replay keeps its own, and applying
         # every event to both was a second book's worth of work per event.
@@ -438,6 +440,8 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
         series = entry.get("series") or []
         m.replay = MarketReplay(
             market=entry["market"],
+            stream=entry.get("stream"),
+            spot_declared=job.get("spot") is True,
             strategy=instance,
             hooks=hooks,
             portfolio=pf,
@@ -476,6 +480,13 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             t = result.setdefault("timers", {"created": 0, "fired": 0, "dropped": 0})
             for k in ("created", "fired", "dropped"):
                 t[k] += out["timers"].get(k, 0)
+        # The spot dataset -- see `finished` in harness.mjs.
+        if job.get("spot") is True:
+            s = result.setdefault("spot", {"markets": 0, "markets_without": 0})
+            if out.get("spot_seen", 0) > 0:
+                s["markets"] += 1
+            else:
+                s["markets_without"] += 1
         oq = m.open_quotes
         result["market_summaries"].append({
             "market_id": entry["market"]["market_id"],

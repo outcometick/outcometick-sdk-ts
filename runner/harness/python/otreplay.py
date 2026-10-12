@@ -14,6 +14,7 @@ the conformance vectors compare them row for row. In particular:
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import os
@@ -157,6 +158,28 @@ def make_log_budget(bytes_: int = LOG_BYTES_PER_RUN, line_chars: int = LOG_LINE_
     return {"bytes": bytes_, "line_chars": line_chars, "spent": 0}
 
 
+# The settlement window ctx.twap_locked() reads, and when its projection is
+# withheld. MUST MATCH replay.mjs.
+TWAP_LOOKBACK_MS = {"twap30s": 30_000, "twap60s": 60_000}
+SPOT_MIN_COVERAGE = 0.8
+SPOT_MAX_AGE_MS = 5000
+
+
+def _need_spot(ctx, what) -> None:
+    """Refused unless the spot dataset was declared -- needSpot in replay.mjs."""
+    if not _INTERNALS[id(ctx)]["spot"]["declared"]:
+        raise RunAbort("E_MANIFEST", f'{what} needs the "spot" dataset declared in the manifest')
+
+
+def _push_spot(state, ev, arrived_at) -> None:
+    """A spot event reaches the strategy at `arrived_at` -- control.pushSpot in replay.mjs."""
+    sp = state["spot"]
+    sp["seen"] += 1
+    sp["ts"].append(ev["ts_ms"])
+    sp["val"].append(ev["value"])
+    sp["arrived"].append(arrived_at)
+
+
 class Ctx:
     """The strategy's whole world.
 
@@ -193,6 +216,10 @@ class Ctx:
             "resting": None,
             # Set by MarketReplay in global mode with on_timer: {schedule, unschedule}.
             "timers": None,
+            # The spot dataset -- see createCtx in replay.mjs. MarketReplay sets
+            # the window; _push_spot updates the rest as spot events arrive.
+            "spot": {"ts": [], "val": [], "arrived": [], "seen": 0,
+                     "start": None, "close": None, "lookback": None, "declared": False},
         }
 
     @property
@@ -296,6 +323,56 @@ class Ctx:
 
     # ---- rolling helpers. Numerically identical to the JavaScript versions. ----
 
+    def spot(self):
+        """The latest spot value that has reached the strategy, as
+        {value, ts_ms}, or None. Needs the `spot` dataset. See replay.mjs."""
+        _need_spot(self, "ctx.spot()")
+        st = _INTERNALS[id(self)]
+        sp = st["spot"]
+        k = bisect.bisect_right(sp["arrived"], st["now"])
+        return None if k == 0 else Rec({"value": sp["val"][k - 1], "ts_ms": sp["ts"][k - 1]})
+
+    def twap_locked(self):
+        """The elapsed part of the settlement TWAP window, from the spot values
+        seen in it -- an APPROXIMATION; field by field in replay.mjs."""
+        _need_spot(self, "ctx.twap_locked()")
+        st = _INTERNALS[id(self)]
+        sp = st["spot"]
+        now = st["now"]
+        if sp["start"] is None or now < sp["start"]:
+            return None
+        ts_list, val_list = sp["ts"], sp["val"]
+        k = bisect.bisect_right(sp["arrived"], now)
+        total = 0.0
+        n = 0
+        prev = None
+        for i in range(bisect.bisect_right(ts_list, sp["start"] - 1), k):
+            ts = ts_list[i]
+            if ts >= sp["close"] or ts == prev:
+                continue
+            total += val_list[i]
+            n += 1
+            prev = ts
+        if n == 0:
+            return None
+        lookback = sp["lookback"]
+        elapsed = min(max(now - sp["start"], 0), lookback)
+        value = total / n
+        fraction = elapsed / lookback
+        coverage = min(1.0, n / max(1, elapsed // 1000))
+        last_ts, last_val = ts_list[k - 1], val_list[k - 1]
+        fresh = now - last_ts <= SPOT_MAX_AGE_MS
+        return Rec({
+            "value": value,
+            "samples": n,
+            "elapsed_ms": elapsed,
+            "elapsed_fraction": fraction,
+            "coverage": coverage,
+            "last_ts_ms": last_ts,
+            "projected": (fraction * value + (1 - fraction) * last_val
+                          if coverage >= SPOT_MIN_COVERAGE and fresh else None),
+        })
+
     def _tail(self, window: int) -> list[float]:
         hist = _INTERNALS[id(self)]["history"]
         n = max(1, min(int(window or 1), len(hist)))
@@ -374,7 +451,8 @@ class MarketReplay:
                  log_budget: dict | None = None, budget: BudgetMonitor | None = None,
                  references=None, series=None, seed: int = 1,
                  fee_bps: float = 0, resting: dict | None = None, terminal=None, engine=None,
-                 clock: dict | None = None, record_budget: dict | None = None) -> None:
+                 clock: dict | None = None, record_budget: dict | None = None, stream=None,
+                 spot_declared: bool = False) -> None:
         self.market_id = market["market_id"]
         self.market = market
         # generic-data.mjs; see the matching comment in replay.mjs.
@@ -417,6 +495,11 @@ class MarketReplay:
         self.state["book"] = self.book
         # The engine's own copy of the market, for assert_outcome.
         self.state["market"] = dict(market)
+        self.state["spot"]["declared"] = bool(spot_declared)
+        lookback = TWAP_LOOKBACK_MS.get(stream)
+        close = market.get("close_ts_ms")
+        if lookback is not None and close is not None:
+            self.state["spot"].update(start=close - lookback, close=close, lookback=lookback)
         # Phase 2b global scheduler -- see replay.mjs.
         self.global_ = isinstance(engine, dict) and engine.get("scheduler") == "global"
         self.job_seq = 0
@@ -504,6 +587,10 @@ class MarketReplay:
             return
         if job["at"] < self.clock["t"]:
             raise RunAbort("E_RUNTIME", f"engine invariant: a {job['kind']} at {job['at']} after the run reached {self.clock['t']}")
+        # A spot value arriving is quiet here too -- see runOne in replay.mjs.
+        if job["kind"] == "arrival" and job["payload"].get("kind") == "spot":
+            _push_spot(self.state, job["payload"], job["at"])
+            return
         self._record_before(job["at"])
         self.state["now"] = job["at"]
         if job["kind"] == "timer":
@@ -553,6 +640,9 @@ class MarketReplay:
     def _arrive(self, ev) -> None:
         """A lagged event reaches the strategy. MUST MATCH #arrive in replay.mjs."""
         kind = ev.get("kind")
+        if kind == "spot":
+            _push_spot(self.state, ev, self.state["now"])
+            return
         if kind == "book":
             apply_event(self.local_book, ev, self.generic)
         if kind == "tick":
@@ -726,6 +816,15 @@ class MarketReplay:
         past the close reaches a hook, the book, or the history."""
         if self.ended:
             return False
+        # QUIET (the spot dataset) -- see step in replay.mjs.
+        if ev.get("kind") == "spot":
+            if ev["ts_ms"] > self.close_ts:
+                return False
+            if self.global_ and self.feed_latency > 0:
+                self._schedule(ev["ts_ms"] + self.feed_latency, "arrival", ev)
+            else:
+                _push_spot(self.state, ev, ev["ts_ms"])
+            return True
         self.seen += 1
         ts = ev["ts_ms"]
         self.last_ts = ts
@@ -825,6 +924,7 @@ class MarketReplay:
             "market_id": self.market_id,
             "asset": None,
             "events": self.seen,
+            "spot_seen": self.state["spot"]["seen"],
             "settled": settled,
             "logs": state["logs"],
             "log_truncated": state["log_truncated"],
@@ -872,6 +972,7 @@ class MarketReplay:
             "asset": market.get("asset"),
             # What the engine PULLED, not what the caller had -- see replay.mjs.
             "events": self.seen,
+            "spot_seen": self.state["spot"]["seen"],
             "settled": settled,
             "logs": state["logs"],
             "log_truncated": state["log_truncated"],

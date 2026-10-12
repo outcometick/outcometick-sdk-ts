@@ -342,6 +342,10 @@ export function parseResult(raw) {
     timers: r.timers && typeof r.timers === 'object'
       ? { created: finite(r.timers.created) ? r.timers.created : 0, fired: finite(r.timers.fired) ? r.timers.fired : 0, dropped: finite(r.timers.dropped) ? r.timers.dropped : 0 }
       : null,
+    // The spot dataset: markets that got any (null unless declared).
+    spot: r.spot && typeof r.spot === 'object'
+      ? { markets: finite(r.spot.markets) ? r.spot.markets : 0, markets_without: finite(r.spot.markets_without) ? r.spot.markets_without : 0 }
+      : null,
     // The recorder's budgets as the harness spent them (null when off).
     record: r.record && typeof r.record === 'object'
       ? { rows: finite(r.record.rows) ? r.record.rows : 0, bytes: finite(r.record.bytes) ? r.record.bytes : 0, truncated: r.record.truncated === true }

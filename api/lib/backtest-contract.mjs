@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.11.3';
+export const SDK_VERSION = '2.12.0';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -27,6 +27,9 @@ export const SDK_VERSION = '2.11.3';
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
  *
+ * 1.26.0: the spot dataset (quiet 'spot' events, job.spot) and ctx.spot() /
+ * ctx.twap_locked(); the Node engine keeps the code of its own refusals thrown
+ * inside a hook (E_MANIFEST, E_STATE), as the Python engine always did.
  * 1.25.1: record.csv / record_markets.csv values rounded to 6 decimals (the
  * record block is computed before rounding); nothing else changes.
  * 1.25.0: the time-grid mark-to-market recorder (job.engine.record_ms, market
@@ -115,7 +118,7 @@ export const SDK_VERSION = '2.11.3';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.25.1';
+export const SANDBOX_IMAGE_TAG = '1.26.0';
 
 /**
  * The archive decoder's semantics, as part of a run's identity (the
@@ -224,6 +227,7 @@ export const DATASETS = Object.freeze({
   twap60s: 'TWAP over a 60-second lookback.',
   book: 'Order-book snapshots and deltas.',
   bbo: 'Unthrottled top of book. Prices only, no sizes — it removes ladder levels the venue has since moved past, and never adds any.',
+  spot: 'The 1 Hz Chainlink stream of each market\'s asset, fed to every market of that asset whatever it settles on. Quiet: it wakes no hook; ctx.spot() and ctx.twap_locked() read it.',
   trades: 'Every trade print on the venue.',
   markets: 'Per-market metadata, strike and settlement outcome.',
 });
@@ -249,7 +253,11 @@ export const KNOWN_DATASETS = Object.freeze(Object.keys(DATASETS));
  * hitting the prewarm, because the prewarm warms the default shape. That is the
  * honest trade: warming both shapes doubles a cache sized in tens of GB.
  */
-export const OPT_IN_DATASETS = Object.freeze(['bbo']);
+// `spot` is opt-in for the second reason only: ~86k rows per asset-day that only
+// a strategy calling ctx.spot() / ctx.twap_locked() reads. It is NOT degrading:
+// a strategy reads it, so outside its capture window is E_COVERAGE like any
+// stream a strategy reads.
+export const OPT_IN_DATASETS = Object.freeze(['bbo', 'spot']);
 
 /**
  * Datasets that DEGRADE instead of rejecting when the archive lacks them.
@@ -310,6 +318,8 @@ export const CAPTURE_WINDOWS = Object.freeze({
     // a day it can only half serve — silent degradation, which is the one thing
     // a stream added mid-archive must not do. 09-03 is the first complete day.
     bbo: Object.freeze({ from: '2026-09-03', to: null }),
+    // The same tree as `prices`, fed differently (see DATASETS.spot).
+    spot: Object.freeze({ from: FIRST_COMPLETE_DAY.polymarket, to: null }),
     trades: Object.freeze({ from: FIRST_COMPLETE_DAY.polymarket, to: null }),
     markets: Object.freeze({ from: FIRST_COMPLETE_DAY.polymarket, to: null }),
   }),

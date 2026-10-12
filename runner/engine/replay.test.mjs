@@ -241,7 +241,8 @@ test('reading another market cross-market is refused, not silently answered', ()
     strategy: { on_tick(ctx) { ctx.book('0xOTHER'); } },
     hooks: { on_tick: 'on_tick' },
   }), (err) => {
-    assert.equal(err.code, 'E_RUNTIME');
+    // The engine's own refusal, with its own code -- not a strategy error.
+    assert.equal(err.code, 'E_STATE');
     assert.match(err.detail, /session/);
     return true;
   });

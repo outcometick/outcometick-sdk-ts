@@ -429,7 +429,7 @@ export function makeBookThrottle({ venue, assets = [], from, to }) {
  * @param {Map} markets       from indexMarkets
  * @param {Map} bySlug        slug -> record, built once by the caller
  */
-export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = null) {
+export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = null, { spot = false } = {}) {
   const meta = classifyPath(filePath);
   const slugIndex = bySlug ?? buildSlugIndex(markets);
 
@@ -479,6 +479,20 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
         server_ts_ms: num(row.server_ts_ms) ?? (serverSec == null ? null : serverSec * 1000),
         recv_ts_ms: num(row.recv_ts_ms ?? row.recv_ms),
       }]);
+    }
+    // SPOT, when the run declared it: Polymarket's 1 Hz report stream to EVERY
+    // market of its asset, whatever that market settles on, inside the same
+    // window. A different kind, so nothing that reads ticks sees it (see
+    // DATASETS.spot); ordered before ticks within a millisecond (finaliseMarket).
+    if (spot && meta.dataset === 'prices' && meta.venue === 'polymarket' && meta.asset) {
+      const serverMs = num(row.server_ts_ms) ?? (serverSec == null ? null : serverSec * 1000);
+      const recvMs = num(row.recv_ts_ms ?? row.recv_ms);
+      for (const [id, m] of markets) {
+        if (!m.asset || String(m.asset) !== String(meta.asset)) continue;
+        if (m.open_ts_ms != null && ts < m.open_ts_ms) continue;
+        if (m.close_ts_ms != null && ts > m.close_ts_ms) continue;
+        out.push([id, { kind: 'spot', ts_ms: ts, market_id: id, value, server_ts_ms: serverMs, recv_ts_ms: recvMs }]);
+      }
     }
     return out;
   }
@@ -956,7 +970,9 @@ export function finaliseMarket(events, market) {
   // round throws the delta away. The remaining ties are between rows of the
   // same kind from the same file, where the archive's own order is the answer
   // and the caller reads files in a fixed order — see the feed selection.
-  const RANK = { book: 0, trade: 1, tick: 2, ref: 3, ext: 4 };
+  // `spot` first: a hook firing on this millisecond's book or tick reads the
+  // spot value of the same millisecond (a tie-break, not a recorded order).
+  const RANK = { spot: -1, book: 0, trade: 1, tick: 2, ref: 3, ext: 4 };
   const rank = (e) => RANK[e?.kind] ?? 9;
   const sub = (e) => (e?.kind === 'book' && e.snapshot !== true ? 1 : 0);
   events.sort((a, b) => (a.ts_ms - b.ts_ms) || (rank(a) - rank(b)) || (sub(a) - sub(b)));

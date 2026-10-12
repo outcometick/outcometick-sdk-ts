@@ -119,6 +119,8 @@ export function dayOfPath(rel) {
 export async function loadLocalDay({
   root, day, venue, assets, datasets, intervals, throttle = null, eventsDir, workers = 1, chunkBytes, stats = null,
 }) {
+  // `spot` is decoded from the `prices` tree into its own events (DATASETS.spot).
+  const spot = (datasets ?? []).includes('spot');
   // Day-scoped, and degrading datasets gated by their capture window — the
   // same call the queue makes, because `ot run` and the worker have drifted
   // apart nine times and every one of them was a rule computed twice.
@@ -176,11 +178,11 @@ export async function loadLocalDay({
   // and answer, or null -- and then this, the sequential spool, decides.
   // (`stats.parallel` says which one did, for the tests.)
   const threaded = await spoolDayParallel({
-    day, markets, bySlug, throttle, eventsDir, feedPaths: feed, root, workers, chunkBytes,
+    day, markets, bySlug, throttle, eventsDir, feedPaths: feed, root, workers, chunkBytes, spot,
   });
   if (stats) stats.parallel = threaded != null;
   const { out, unusable, bboSeen } = threaded ?? await spoolDay({
-    day, markets, bySlug, throttle, eventsDir,
+    day, markets, bySlug, throttle, eventsDir, spot,
     feed: feed.map((rel) => ({ path: rel, bytes: 0, rows: () => readRows(root, rel) })),
   });
 

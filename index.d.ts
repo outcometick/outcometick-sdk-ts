@@ -208,6 +208,24 @@ export interface Ctx<P = Record<string, unknown>> {
   /** An external series declared in the manifest. Throws if undeclared. */
   ext(name: string): FeedView;
 
+  /**
+   * The latest value of the market's asset on Chainlink's 1 Hz stream that has
+   * reached the strategy, or null. Needs the `spot` dataset (throws otherwise).
+   * Like ref(), it only sees values stamped at or before this ctx's now.
+   */
+  spot(): SpotValue | null;
+
+  /**
+   * The elapsed part of the settlement TWAP window [close - lookback, close),
+   * from the spot values seen in it -- an APPROXIMATION of Chainlink's average
+   * (it uses finer observations than this per-second stream). null when the
+   * market does not settle on a TWAP, the window has not started, or no spot
+   * value in it has arrived. Needs the `spot` dataset (throws otherwise).
+   */
+  twap_locked(): TwapLocked | null;
+  /** Same as twap_locked(). */
+  twapLocked(): TwapLocked | null;
+
   /** Rolling helpers over the tick history. Identical across languages. */
   zscore(value: number, opts?: { window?: number }): number;
   sma(window?: number): number | null;
@@ -332,6 +350,34 @@ export declare class Order {
   /** Present on gtc orders only. */
   readonly post_only?: boolean;
   readonly client_id?: string | null;
+}
+
+/** ctx.spot(): a value on the asset's 1 Hz Chainlink stream and its feed time. */
+export interface SpotValue {
+  value: number;
+  ts_ms: number;
+}
+
+/** ctx.twap_locked(): what the elapsed part of the settlement window holds so far. */
+export interface TwapLocked {
+  /** Mean of the window's spot samples seen so far. */
+  value: number;
+  /** How many: one per feed timestamp, no interpolation over gaps. */
+  samples: number;
+  /** Time since the window opened, capped at the lookback. */
+  elapsed_ms: number;
+  /** elapsed_ms / lookback: time elapsed, not certainty. */
+  elapsed_fraction: number;
+  /** samples / elapsed whole seconds, capped at 1. */
+  coverage: number;
+  /** Feed time of the latest spot value seen. */
+  last_ts_ms: number;
+  /**
+   * elapsed_fraction * value + (1 - elapsed_fraction) * latest spot: the final
+   * average if the price stayed where it is. null when coverage < 0.8 or the
+   * latest spot is more than 5 s old. Not a forecast.
+   */
+  projected: number | null;
 }
 
 /** A timer set with ctx.schedule(), as onTimer receives it. */

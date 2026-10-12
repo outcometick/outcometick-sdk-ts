@@ -9,7 +9,7 @@
 // can drift from index.mjs. This file plus the export-parity check in
 // sdk-types.test.mjs is what stops that drift being silent.
 
-import type { RestingOrder } from './index.js';
+import type { RestingOrder, TwapLocked } from './index.js';
 import { Strategy, Order, SIDES } from './index.js';
 import type {
   Ctx, Tick, Market, BookView, Side, Level, Position, Outcome, BookEvent, TradeEvent, Ladders,
@@ -36,6 +36,10 @@ export default class MeanReversion extends Strategy<Params> {
     const market: string = tick.market_id;
     ctx.log(market);
     const z: number = ctx.zscore(tick.value, { window: 180 });
+    const lock = ctx.twap_locked();
+    const projected: number | null = lock ? lock.projected : null;
+    const spotTs: number | undefined = ctx.spot()?.ts_ms;
+    const same: TwapLocked | null = ctx.twapLocked();
     if (this.entered || Math.abs(z) < ctx.p.entry_z) return null;
 
     const side: Side = z > 0 ? 'DOWN' : 'UP';
