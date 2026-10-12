@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.12.1';
+export const SDK_VERSION = '2.12.2';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -27,6 +27,8 @@ export const SDK_VERSION = '2.12.1';
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
  *
+ * 1.26.1: the orders block's order_rules note said the assumed tick erred the wrong
+ * way round (a 0.01-tick market refuses a 0.001 limit accepted here); text only.
  * 1.26.0: the spot dataset (quiet 'spot' events, job.spot) and ctx.spot() /
  * ctx.twap_locked(); the Node engine keeps the code of its own refusals thrown
  * inside a hook (E_MANIFEST, E_STATE), as the Python engine always did.
@@ -118,7 +120,7 @@ export const SDK_VERSION = '2.12.1';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.26.0';
+export const SANDBOX_IMAGE_TAG = '1.26.1';
 
 /**
  * The archive decoder's semantics, as part of a run's identity (the

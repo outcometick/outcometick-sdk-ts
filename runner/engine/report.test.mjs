@@ -605,3 +605,15 @@ test('3a: one row per market replayed, entered or not; results by settlement rul
     { settlement: 'twap60s', markets: 2, markets_entered: 1, trades: 1, net_pnl: -6, edge_per_contract: -0.6, edge_per_trade: -0.6 },
   ]);
 });
+
+test('the orders block says which way the assumed tick can be wrong', async () => {
+  const { ordersReport } = await import('./report.mjs');
+  const out = ordersReport({
+    policy: { order_rules: { mode: 'assumed', tick: 0.001, min_size: 5, size_step: 0.01 } },
+    stats: { refused: {}, rebate: 0 },
+  });
+  // Same words in client/backtest/report.py (tests/test_backtest.py holds them).
+  assert.equal(out.order_rules.note, 'archive markets do not carry their tick or minimum size: these are values measured '
+    + 'on the archive, not read per market — a market quoting in 0.01 would refuse a 0.001 limit accepted here, '
+    + 'one quoting finer would accept limits refused here');
+});

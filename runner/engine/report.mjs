@@ -615,7 +615,8 @@ export function ordersReport({ policy, stats }) {
       ? {
         mode: 'assumed', assumed_tick: rules.tick, assumed_min_size: rules.min_size, size_step: rules.size_step,
         note: 'archive markets do not carry their tick or minimum size: these are values measured on the archive, '
-          + 'not read per market — a market quoting in 0.01 would accept a 0.001 limit, one quoting finer would refuse it',
+          + 'not read per market — a market quoting in 0.01 would refuse a 0.001 limit accepted here, one quoting finer '
+          + 'would accept limits refused here',
       }
       : { mode: 'venue', size_step: 0.01, note: 'tick and minimum size read from each market' }),
     quote_guard: policy.quote_guard == null ? null : {
