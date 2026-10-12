@@ -21,7 +21,8 @@ import { BacktestRejection, parseReferenceFeed, HOOK_NAMES } from '../../api/lib
 
 /**
  * Every `ctx.ref(name)` / `ctx.ext(name)` the analyser could read must name a
- * feed or series the manifest declares.
+ * feed or series the manifest declares, and every `ctx.p` name it could read
+ * (Python) a declared param.
  *
  * At run time an undeclared name is E_MANIFEST on the first market that asks —
  * after the run was queued and the credits held. On 2026-10-08 a customer hit
@@ -33,8 +34,22 @@ import { BacktestRejection, parseReferenceFeed, HOOK_NAMES } from '../../api/lib
 export function assertFeedsDeclared(feeds, manifest) {
   const refs = new Set(manifest.reference ?? []);
   const series = new Set((manifest.series ?? []).map((x) => x.name));
+  const params = manifest.params ?? {};
   for (const f of feeds ?? []) {
     const at = f.line ? `${f.file}:${f.line}` : f.file;
+    // kind "param" (Python only): ctx.p is exactly the manifest's params, and a
+    // missing name raises on the first market that reads it. 2026-10-12: a
+    // customer's run failed on `ctx.p.slip`, never added to "params". JS is not
+    // checked: there a missing param reads as undefined, and `ctx.p.x ?? d` is
+    // a legitimate default this would refuse.
+    if (f.kind === 'param') {
+      if (Object.hasOwn(params, f.name)) continue;
+      const read = /^[A-Za-z_]\w*$/.test(f.name) ? `ctx.p.${f.name}` : `ctx.p[${JSON.stringify(f.name)}]`;
+      throw new BacktestRejection('E_MANIFEST',
+        `${at}: ${read} is not declared — add ${JSON.stringify(f.name)} to "params" in outcometick.json`
+          + ' (a run only gets the params declared there)',
+        { file: f.file, line: f.line ?? null });
+    }
     const call = `ctx.${f.kind}(${JSON.stringify(f.name)})`;
     if (f.kind === 'ref' && !refs.has(f.name)) {
       const canonical = parseReferenceFeed(f.name)?.canonical ?? null;

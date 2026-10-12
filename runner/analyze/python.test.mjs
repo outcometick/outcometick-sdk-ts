@@ -475,3 +475,135 @@ class S(Strategy):
         return ctx.ref("decorated")
 `);
 });
+
+// ---------------------------------------------------------------------------
+// ctx.p reads (kind "param"): checked against "params" by assertFeedsDeclared.
+
+const params = (feeds) => feeds.filter((f) => f.kind === 'param').map((f) => [f.name, f.line]);
+
+test('params: attribute and literal-subscript reads on the hook context are reported with their line', async () => {
+  const { feeds } = await analyzePythonSubmission(py(`from outcometick import Strategy, Order
+KEY = "size"
+
+
+class S(Strategy):
+    def on_market_open(self, ctx, market):
+        self.k = ctx.p.k
+
+    def on_tick(self, ctx, tick):
+        limit = min(0.99, ctx.p.slip + 0.5)
+        return Order(side="UP", size=ctx.p[KEY], limit=ctx.p["max px"])
+`), ENTRY);
+  assert.deepEqual(params(feeds), [['k', 7], ['slip', 10], ['size', 11], ['max px', 11]]);
+});
+
+test('params: dict methods, guarded names and try/suppress bodies are not reads of a param', async () => {
+  const { feeds } = await analyzePythonSubmission(py(`from outcometick import Strategy
+
+
+class S(Strategy):
+    def on_tick(self, ctx, tick):
+        a = ctx.p.get("a", 1)
+        b = ctx.p.b if "b" in ctx.p else 2
+        c = ctx.p.c if hasattr(ctx.p, "c") else 3
+        d = ctx.p["d"] if "d" in ctx.p.keys() else 4
+        try:
+            e = ctx.p.e
+        except AttributeError:
+            e = 5
+        with suppress(KeyError):
+            f = ctx.p["f"]
+        with self.optional():
+            h = ctx.p.h
+        read = lambda: ctx.p.i
+        def later():
+            return ctx.p.j
+        lazy = (ctx.p.k for _ in range(1))
+        g = ctx.p.g if ctx.p.get("g") is not None else 6
+        return None
+`), ENTRY);
+  assert.deepEqual(params(feeds), []);
+});
+
+test('params: anything that could put a name into a .p, or test one unseen, turns the check off for the file', async () => {
+  for (const line of [
+    'ctx.p.slip = 0.01',
+    'ctx.p["slip"] = 0.01',
+    'ctx.p.setdefault("slip", 0.01)',
+    'ctx.p.update(slip=0.01)',
+    'self.p = {"slip": 0.01}',
+    'self.p["slip"] = 0.01',
+    'ok = market.name in ctx.p',
+    'ok = hasattr(ctx.p, market.name)',
+    'p = ctx.p; p.setdefault("slip", 0.01)',
+    'self.fill_defaults(ctx.p)',
+    'dict.update(ctx.p, slip=0.01)',
+    'self.p.update(slip=0.01)',
+    'f = ctx.p.setdefault; f("slip", 0.01)',
+    'ok = ctx.p == {}',
+    'ok = ctx.p.get(market.name)',
+    'n = len(ctx.p.items())',
+    'ks = list(ctx.p.keys())',
+    'for k in ctx.p: pass',
+  ]) {
+    const { feeds } = await analyzePythonSubmission(py(`from outcometick import Strategy
+
+
+class S(Strategy):
+    def on_market_open(self, ctx, market):
+        ${line}
+
+    def on_tick(self, ctx, tick):
+        return ctx.p.slip
+`), ENTRY);
+    assert.deepEqual(params(feeds), [], line);
+  }
+});
+
+test('params: a receiver that is not the hook context, or outside the entry hooks, is never inspected', async () => {
+  const { feeds } = await analyzePythonSubmission(py(`from outcometick import Strategy
+
+
+def helper(ctx):
+    return ctx.p.a
+
+
+class S(Strategy):
+    def size(self, ctx):
+        return ctx.p.b
+
+    def on_tick(self, ctx, tick):
+        other = tick
+        return self.p.c, other.p.d
+`), ENTRY);
+  assert.deepEqual(params(feeds), []);
+});
+
+test('params: the check spans every submitted file — a helper module can fill a param in', async () => {
+  const strategy = `from outcometick import Strategy
+from .defaults import fill_defaults
+
+
+class S(Strategy):
+    def on_market_open(self, ctx, market):
+        fill_defaults(ctx)
+
+    def on_tick(self, ctx, tick):
+        return ctx.p.slip
+`;
+  const guarded = await analyzePythonSubmission([
+    { name: 'strategy.py', content: strategy },
+    { name: 'defaults.py', content: 'def fill_defaults(c):\n    c.p.setdefault("slip", 0.01)\n' },
+  ], ENTRY);
+  assert.deepEqual(params(guarded.feeds), []);
+  const tested = await analyzePythonSubmission([
+    { name: 'strategy.py', content: strategy },
+    { name: 'defaults.py', content: 'def has_slip(c):\n    return "slip" in c.p\n' },
+  ], ENTRY);
+  assert.deepEqual(params(tested.feeds), []);
+  const plain = await analyzePythonSubmission([
+    { name: 'strategy.py', content: strategy },
+    { name: 'defaults.py', content: 'def fill_defaults(c):\n    return c.p.k\n' },
+  ], ENTRY);
+  assert.deepEqual(params(plain.feeds), [['slip', 10]]);
+});

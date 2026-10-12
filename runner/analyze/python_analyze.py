@@ -205,7 +205,8 @@ def binding_counts(root):
 
 
 def feed_calls(tree, name, entry, hook_methods):
-    """Every `ctx.ref(...)` / `ctx.ext(...)` whose argument is known here.
+    """Every `ctx.ref(...)` / `ctx.ext(...)` whose argument is known here, and
+    every `ctx.p` read whose name is (kind "param", see param_reads_checkable).
 
     Only in the entry class's own declared hook methods -- the one place the
     runner is known to pass the context -- on the hook's context parameter,
@@ -226,13 +227,16 @@ def feed_calls(tree, name, entry, hook_methods):
             consts[target] = value.value
 
     found = []
+    # Over EVERY file, not just the entry: a helper module handed `ctx` can
+    # fill a param in too. main() combines them.
+    checkable = param_reads_checkable(tree, consts)
     if not entry or name != entry.get("file"):
-        return found
+        return found, checkable
     class_name = entry.get("className")
     # The runner takes the module's FINAL binding of the name: a second
     # `class S` (or any rebinding) and the one read here may not be the one run.
     if binds.get(class_name) != 1:
-        return found
+        return found, checkable
     # `self.on_tick = ...` anywhere replaces the method the runner would call.
     assigned_attrs = {n.attr for n in ast.walk(tree)
                       if isinstance(n, ast.Attribute) and isinstance(n.ctx, (ast.Store, ast.Del))}
@@ -273,9 +277,136 @@ def feed_calls(tree, name, entry, hook_methods):
                 else:
                     continue
                 found.append({"kind": node.func.attr, "name": value, "file": name, "line": node.lineno})
+            found.extend(param_reads(fn, ctx_name, consts, name))
     # Source order: the first undeclared call in the file is the one a
     # rejection should point at.
     found.sort(key=lambda f: f["line"])
+    return found, checkable
+
+
+# Reads that resolve on the dict itself, never on a param: `ctx.p.get(...)`.
+DICT_ATTRS = frozenset(dir(dict))
+
+
+def _is_p(node):
+    return isinstance(node, ast.Attribute) and node.attr == "p"
+
+
+def _const_str(node, consts):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in consts:
+        return consts[node.id]
+    return None
+
+
+def param_reads_checkable(tree, consts):
+    """Whether `ctx.p.<name>` reads can be checked against the manifest at all,
+    and the names the file itself guards.
+
+    ctx.p is exactly the manifest's params (a Rec: a missing name raises), so a
+    read of an undeclared name fails the run on the first market that reaches
+    it. Anything in the file that could put a name there, or that tests for
+    one first, makes that conclusion uncertain -- and what this reports can
+    reject a submission. So every `<anything>.p` must be used in one of the
+    shapes below; any other use (a write, any other dict method, an alias
+    `p = ctx.p`, passing it to a helper, iterating it, `**ctx.p`) and nothing
+    is checked. A name tested with a literal `in` / `.keys()` / `.get()` /
+    `hasattr` is skipped.
+    """
+    guarded = set()
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    for node in ast.walk(tree):
+        if not _is_p(node):
+            continue
+        if not isinstance(node.ctx, ast.Load):
+            return False, guarded
+        up = parents.get(id(node))
+        if isinstance(up, (ast.Attribute, ast.Subscript)) and up.value is node:
+            if not isinstance(up.ctx, ast.Load):
+                return False, guarded
+            if isinstance(up, ast.Attribute) and up.attr in DICT_ATTRS:
+                call = parents.get(id(up))
+                if not (isinstance(call, ast.Call) and call.func is up):
+                    return False, guarded
+                if up.attr == "get":
+                    # `ctx.p.get("x")` can guard a later `ctx.p.x`.
+                    key = _const_str(call.args[0], consts) if call.args else None
+                    if key is None:
+                        return False, guarded
+                    guarded.add(key)
+                    continue
+                # `x in ctx.p.keys()` tests a name like `x in ctx.p` does. Any
+                # other dict method -- iterating items() included -- could
+                # guard a name unseen, or put one there.
+                comp = parents.get(id(call))
+                if not (up.attr == "keys" and isinstance(comp, ast.Compare) and call in comp.comparators
+                        and _guard_compare(comp, call, consts, guarded)):
+                    return False, guarded
+            continue
+        if isinstance(up, ast.Compare) and node in up.comparators:
+            if not _guard_compare(up, node, consts, guarded):
+                return False, guarded
+            continue
+        if isinstance(up, ast.Call) and isinstance(up.func, ast.Name) and up.func.id in ("hasattr", "getattr") \
+                and up.args and up.args[0] is node:
+            key = _const_str(up.args[1], consts) if len(up.args) > 1 else None
+            if key is None or key in DICT_ATTRS:
+                return False, guarded
+            guarded.add(key)
+            continue
+        return False, guarded
+    return True, guarded
+
+
+def _guard_compare(comp, right, consts, guarded):
+    """`"x" in ctx.p`: record the name. False when it cannot be known."""
+    i = comp.comparators.index(right)
+    if not isinstance(comp.ops[i], (ast.In, ast.NotIn)):
+        return False
+    key = _const_str(comp.comparators[i - 1] if i else comp.left, consts)
+    if key is None:
+        return False
+    guarded.add(key)
+    return True
+
+
+def param_reads(fn, ctx_name, consts, name):
+    """`ctx.p.x` / `ctx.p["x"]` reads in one hook, outside try and with bodies
+    and anything that runs deferred (nested def / lambda / generator)."""
+    shielded = set()
+    for node in ast.walk(fn):
+        body = []
+        if isinstance(node, (ast.Try, getattr(ast, "TryStar", ast.Try))) and node.handlers:
+            body = node.body
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            # Any context manager's __exit__ can swallow the error (suppress is
+            # only the common one).
+            body = node.body
+        if node is not fn and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                                                ast.ClassDef, ast.GeneratorExp)):
+            # Runs later, or never, from wherever it is called: no telling
+            # whether that is inside a try.
+            body = [node]
+        for stmt in body:
+            shielded.update(id(n) for n in ast.walk(stmt))
+    found = []
+    for node in ast.walk(fn):
+        if id(node) in shielded or not isinstance(getattr(node, "ctx", None), ast.Load):
+            continue
+        if not (isinstance(node, (ast.Attribute, ast.Subscript)) and _is_p(node.value)
+                and isinstance(node.value.value, ast.Name) and node.value.value.id == ctx_name):
+            continue
+        if isinstance(node, ast.Attribute):
+            key = None if node.attr in DICT_ATTRS else node.attr
+        else:
+            key = _const_str(node.slice, consts)
+        if key is None:
+            continue
+        found.append({"kind": "param", "name": key, "file": name, "line": node.lineno})
     return found
 
 
@@ -396,7 +527,8 @@ def analyze_source(source, name, deps, entry=None, hook_methods=()):
                     node.lineno,
                 )
 
-    return imports, feed_calls(tree, name, entry, set(hook_methods))
+    feeds, checkable = feed_calls(tree, name, entry, set(hook_methods))
+    return imports, feeds, checkable
 
 
 def main():
@@ -413,14 +545,17 @@ def main():
     names = {f.get("name") for f in files}
     all_imports = []
     all_feeds = []
+    params_ok, guarded = True, set()
 
     try:
         for f in files:
             name = f.get("name") or ""
             if not name.endswith(".py"):
                 continue
-            imports, feeds = analyze_source(f.get("content") or "", name, deps, entry, hook_methods)
+            imports, feeds, (ok, file_guarded) = analyze_source(f.get("content") or "", name, deps, entry, hook_methods)
             all_feeds.extend(feeds)
+            params_ok = params_ok and ok
+            guarded |= file_guarded
             for spec in imports:
                 if not spec.startswith("."):
                     continue
@@ -438,6 +573,8 @@ def main():
         print(json.dumps(r.payload))
         return 1
 
+    all_feeds = [f for f in all_feeds
+                 if f["kind"] != "param" or (params_ok and f["name"] not in guarded)]
     print(json.dumps({"ok": True, "imports": sorted(set(all_imports)), "feeds": all_feeds}))
     return 0
 
