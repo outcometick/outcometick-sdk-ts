@@ -28,6 +28,7 @@ function stdev(xs) {
 /** Round for reporting only — never for arithmetic that feeds another number. */
 const r2 = (x) => (Number.isFinite(x) ? Number(x.toFixed(2)) : null);
 const r4 = (x) => (Number.isFinite(x) ? Number(x.toFixed(4)) : null);
+const r6 = (x) => (Number.isFinite(x) ? Number(x.toFixed(6)) : null);
 
 /**
  * Collateral a trade tied up: contracts times the price paid.
@@ -877,8 +878,12 @@ export function recordReport({ samples, recordMs, harness, maxRows }) {
       max_position_value: r2(maxPos),
       mean_position_value: pts.length ? r2(sumPos / pts.length) : null,
     },
-    points: pts,
-    samples,
+    // Rounded where they are written out (record.csv, record_markets.csv,
+    // Result.record): money here has at most 5 decimals, so 6 keeps every one
+    // and drops float noise like -7.399999999999999. The block above is
+    // computed from the unrounded series.
+    points: pts.map((p) => ({ ...p, value: r6(p.value), position_value: r6(p.position_value) })),
+    samples: samples.map((x) => ({ ...x, cash: r6(x.cash), marked: r6(x.marked), position_value: r6(x.position_value) })),
   };
 }
 

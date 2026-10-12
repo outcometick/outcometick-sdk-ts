@@ -15,7 +15,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.11.2';
+export const SDK_VERSION = '2.11.3';
 
 /**
  * The tag of the sandbox images, and the ONLY place it is written down.
@@ -27,6 +27,8 @@ export const SDK_VERSION = '2.11.2';
  * run completes, produces no result line, and every job is refunded while
  * looking like a strategy problem.
  *
+ * 1.25.1: record.csv / record_markets.csv values rounded to 6 decimals (the
+ * record block is computed before rounding); nothing else changes.
  * 1.25.0: the time-grid mark-to-market recorder (job.engine.record_ms, market
  * mode): per-market samples on result channel 'v'; absent = 1.24.0, byte for byte.
  * 1.24.0: probabilistic queue models for resting orders (job.engine.queue_prob:
@@ -113,7 +115,7 @@ export const SDK_VERSION = '2.11.2';
  * forwarded a fourth descriptor, so fd 3 was closed inside the container and no
  * containerised run had ever returned anything.
  */
-export const SANDBOX_IMAGE_TAG = '1.25.0';
+export const SANDBOX_IMAGE_TAG = '1.25.1';
 
 /**
  * The archive decoder's semantics, as part of a run's identity (the
