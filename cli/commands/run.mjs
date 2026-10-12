@@ -14,7 +14,7 @@
 import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
-import { availableParallelism, tmpdir } from 'node:os';
+import { availableParallelism, tmpdir, totalmem } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,6 +34,7 @@ import { buildArchive } from '../../runner/archive.mjs';
 import { createLineWriter } from '../../runner/stdin-writer.mjs';
 import { readEventLines } from '../../runner/spool-day.mjs';
 import { decoderDigest, defaultCacheRoot, loadLocalDayCached } from '../decode-cache.mjs';
+import { defaultDecodeWorkers } from '../parallel-decode.mjs';
 import {
   loadLocalDay, localDays, looksLikeArchive, archiveVenues, defaultVenue,
 } from '../local-data.mjs';
@@ -310,10 +311,12 @@ export async function cmdRun({ dir, flags }) {
       markets.push(...genericDecoded.markets);
     }
     const runInputs = [];
-    // Days are decoded on up to 8 threads (each holds its own heap: ~1.8 GB in
-    // all on the sample day) unless --workers says otherwise; the events are
-    // the same either way (cli/parallel-decode.mjs).
-    const decodeWorkers = flags.workers == null ? Math.min(availableParallelism(), 8) : Number(flags.workers);
+    // Days are decoded on every core, as many as half the memory allows (each
+    // thread holds its own heap), unless --workers says otherwise; the events
+    // are the same either way (cli/parallel-decode.mjs).
+    const decodeWorkers = flags.workers == null
+      ? defaultDecodeWorkers({ cores: availableParallelism(), totalBytes: totalmem() })
+      : Number(flags.workers);
     if (!Number.isInteger(decodeWorkers) || decodeWorkers < 1) {
       throw new Error(`--workers must be a whole number from 1, got ${flags.workers}`);
     }

@@ -38,9 +38,21 @@ import { finishSpooledMarket, marketDayKey } from '../runner/spool-day.mjs';
 const CHUNK_BYTES = 4 << 20;
 const IN_FLIGHT_PER_THREAD = 2;
 const BUFFER_BYTES = 16 << 20;
-const MAX_THREADS = 64;
 // readline's line ends: \r\n, \n, or a \r not followed by \n.
 const LINE_END = /\r?\n|\r(?!\n)/;
+
+// Measured on the sample day: ~0.45 GB on one thread, ~0.2 GB more per thread.
+const BASE_BYTES = 0.5 * 2 ** 30;
+const PER_THREAD_BYTES = 0.25 * 2 ** 30;
+
+/**
+ * How many threads `ot run` decodes on when not told: every core, unless that
+ * would want more than half the machine's memory.
+ */
+export function defaultDecodeWorkers({ cores, totalBytes }) {
+  const byMemory = Math.floor((totalBytes / 2 - BASE_BYTES) / PER_THREAD_BYTES);
+  return Math.max(1, Math.min(cores, byMemory));
+}
 
 /** Can this day be decoded on threads at all? */
 export function canSpoolInParallel({ workers, markets, throttle }) {
@@ -134,7 +146,7 @@ export async function spoolDayParallel({
   day, markets, bySlug, throttle = null, eventsDir, feedPaths, root, workers, chunkBytes = CHUNK_BYTES,
 }) {
   if (!canSpoolInParallel({ workers, markets, throttle })) return null;
-  const n = Math.min(workers, MAX_THREADS);
+  const n = workers;
   const ids = [...markets.keys()];
   const indexOf = Object.fromEntries(ids.map((id, i) => [id, i]));
   const threads = [];

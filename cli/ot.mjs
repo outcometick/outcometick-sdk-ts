@@ -48,7 +48,8 @@ const USAGE = `ot ${SDK_VERSION} — outcometick strategy tools
       --cache <dir|off>   decoded days are kept (default ~/.cache/outcometick/
                           decoded-js), so the next run over the same days skips
                           decoding; keyed on every file's sha256 and the decoder
-      --workers <n>       decode a day on n threads (default: up to 8);
+      --workers <n>       decode a day on n threads (default: every core, as
+                          many as half the memory allows);
                           the events, and so the result, are the same
 
   ot run <dir> --data <dataset> [--mark-max-age-ms <ms>] [--out <file>]
