@@ -32,7 +32,7 @@ const SPOOL_FLUSH_ROWS = 512;
  * already knows. Joined with the day it is the `asset|day|interval` the run is
  * billed on, so coverage and billing speak about the same unit.
  */
-function marketDayKey(m) {
+export function marketDayKey(m) {
   const mk = m?.market ?? m;
   if (!mk?.asset) return null;
   return `${String(mk.asset).toUpperCase()}|${mk.interval ?? 'none'}`;
@@ -105,6 +105,65 @@ export function* gzipChunks(events, max = GZIP_CHUNK_CHARS) {
     if (buf.length >= max) { yield buf; buf = ''; }
   }
   if (buf) yield buf;
+}
+
+/**
+ * One market's spooled events -> its finished events file, or the reason it
+ * cannot be replayed. The second half of spoolDay, also used by `ot run`'s
+ * parallel decode (cli/parallel-decode.mjs), so both finish a market the same way.
+ */
+export async function finishSpooledMarket({ day, marketId, market, events, eventsDir }) {
+  const { events: inWindow, up_px: upPx, down_px: downPx } = market
+    ? finaliseMarket(events, market)
+    : { events: [], up_px: null, down_px: null };
+  // ONE predicate, shared with `ot run` — see marketUnusable.
+  const why = marketUnusable(market, inWindow);
+  if (why) {
+    // asset and day travel with it: billing is per market-day, so the caller
+    // cannot decide anything about a gap it cannot locate.
+    return { unusable: { market_id: marketId, asset: market?.asset ?? null, day, why } };
+  }
+
+  // GZIPPED ON DISK, always — the reader gunzips as it feeds and never keeps
+  // a plain copy. Measured: a polymarket BTC market-day is 573 MB of decoded
+  // events that gzip to 57 MB, and `OT_KEEP_WORKDIR` holds every run's copy,
+  // so this is the difference between a sixteen-day run leaving 9 GB behind
+  // and leaving 0.9. It also makes a cache hit a hard link rather than a
+  // decompress-and-rewrite.
+  const file = `${day}-${marketId}.jsonl.gz`;
+  // WRITTEN TO A TEMP NAME AND RENAMED, never opened in place. A cache hit
+  // hard-links cache files into this same directory under these same names,
+  // so an in-place write here would truncate the CACHE's inode — corrupting
+  // a stored day while its manifest stayed valid, and serving the wreckage
+  // to every later run. Renaming replaces the name, never the bytes behind
+  // someone else's link.
+  const tmpFile = `${file}.${process.pid}.tmp`;
+  await pipeline(
+    Readable.from(gzipChunks(inWindow)),
+    createGzip(),
+    createWriteStream(path.join(eventsDir, tmpFile)),
+  );
+  await rename(path.join(eventsDir, tmpFile), path.join(eventsDir, file));
+  return { out: {
+    market: {
+      market_id: market.market_id,
+      asset: market.asset,
+      interval: market.interval,
+      strike: market.strike,
+      outcome: market.outcome,
+      open_ts_ms: market.open_ts_ms,
+      close_ts_ms: market.close_ts_ms,
+      // Polymarket only — a Predict record has no `fee` key, so its decoded
+      // days are unchanged and its cache stays warm. The engine reads it to
+      // charge the venue's taker fee (feeFor in engine/portfolio.mjs).
+      ...(market.fee !== undefined ? { fee: market.fee } : {}),
+    },
+    eventsFile: file,
+    stream: market.stream,
+    day,
+    up_px: upPx,
+    down_px: downPx,
+  } };
 }
 
 export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDir, feed, pause = null }) {
@@ -200,58 +259,9 @@ export async function spoolDay({ day, markets, bySlug, throttle = null, eventsDi
       await rm(part, { force: true });
     }
 
-    const { events: inWindow, up_px: upPx, down_px: downPx } = market
-      ? finaliseMarket(events, market)
-      : { events: [], up_px: null, down_px: null };
-    // ONE predicate, shared with `ot run` — see marketUnusable.
-    const why = marketUnusable(market, inWindow);
-    if (why) {
-      // asset and day travel with it: billing is per market-day, so the caller
-      // cannot decide anything about a gap it cannot locate.
-      unusable.push({ market_id: marketId, asset: market?.asset ?? null, day, why });
-      continue;
-    }
-
-    // GZIPPED ON DISK, always — the reader gunzips as it feeds and never keeps
-    // a plain copy. Measured: a polymarket BTC market-day is 573 MB of decoded
-    // events that gzip to 57 MB, and `OT_KEEP_WORKDIR` holds every run's copy,
-    // so this is the difference between a sixteen-day run leaving 9 GB behind
-    // and leaving 0.9. It also makes a cache hit a hard link rather than a
-    // decompress-and-rewrite.
-    const file = `${day}-${marketId}.jsonl.gz`;
-    // WRITTEN TO A TEMP NAME AND RENAMED, never opened in place. A cache hit
-    // hard-links cache files into this same directory under these same names,
-    // so an in-place write here would truncate the CACHE's inode — corrupting
-    // a stored day while its manifest stayed valid, and serving the wreckage
-    // to every later run. Renaming replaces the name, never the bytes behind
-    // someone else's link.
-    const tmpFile = `${file}.${process.pid}.tmp`;
-    await pipeline(
-      Readable.from(gzipChunks(inWindow)),
-      createGzip(),
-      createWriteStream(path.join(eventsDir, tmpFile)),
-    );
-    await rename(path.join(eventsDir, tmpFile), path.join(eventsDir, file));
-    out.push({
-      market: {
-        market_id: market.market_id,
-        asset: market.asset,
-        interval: market.interval,
-        strike: market.strike,
-        outcome: market.outcome,
-        open_ts_ms: market.open_ts_ms,
-        close_ts_ms: market.close_ts_ms,
-        // Polymarket only — a Predict record has no `fee` key, so its decoded
-        // days are unchanged and its cache stays warm. The engine reads it to
-        // charge the venue's taker fee (feeFor in engine/portfolio.mjs).
-        ...(market.fee !== undefined ? { fee: market.fee } : {}),
-      },
-      eventsFile: file,
-      stream: market.stream,
-      day,
-      up_px: upPx,
-      down_px: downPx,
-    });
+    const done = await finishSpooledMarket({ day, marketId, market, events, eventsDir });
+    if (done.unusable) unusable.push(done.unusable);
+    else out.push(done.out);
   }
   } catch (err) {
     await sweepParts();

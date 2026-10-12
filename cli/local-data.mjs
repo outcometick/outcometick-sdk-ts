@@ -28,6 +28,7 @@ import {
   makeBookThrottle,
 } from '../runner/events.mjs';
 import { spoolDay } from '../runner/spool-day.mjs';
+import { spoolDayParallel } from './parallel-decode.mjs';
 
 /**
  * Every file under a directory, as archive-relative paths.
@@ -115,7 +116,9 @@ export function dayOfPath(rel) {
  * Returns the same shape fetchMarketDays does, so `ot run` and the worker feed
  * the harness identically.
  */
-export async function loadLocalDay({ root, day, venue, assets, datasets, intervals, throttle = null, eventsDir }) {
+export async function loadLocalDay({
+  root, day, venue, assets, datasets, intervals, throttle = null, eventsDir, workers = 1, chunkBytes, stats = null,
+}) {
   // Day-scoped, and degrading datasets gated by their capture window — the
   // same call the queue makes, because `ot run` and the worker have drifted
   // apart nine times and every one of them was a rule computed twice.
@@ -168,7 +171,15 @@ export async function loadLocalDay({ root, day, venue, assets, datasets, interva
   // BTC is ~480k full-ladder snapshots, ~12KB each once parsed, and `ot run`
   // died of a 4GB heap on the public sample. Each market's events go to their
   // own file under `eventsDir`; `ot run` reads them back one market at a time.
-  const { out, unusable, bboSeen } = await spoolDay({
+  //
+  // On `workers` threads when asked (cli/parallel-decode.mjs): the same files
+  // and answer, or null -- and then this, the sequential spool, decides.
+  // (`stats.parallel` says which one did, for the tests.)
+  const threaded = await spoolDayParallel({
+    day, markets, bySlug, throttle, eventsDir, feedPaths: feed, root, workers, chunkBytes,
+  });
+  if (stats) stats.parallel = threaded != null;
+  const { out, unusable, bboSeen } = threaded ?? await spoolDay({
     day, markets, bySlug, throttle, eventsDir,
     feed: feed.map((rel) => ({ path: rel, bytes: 0, rows: () => readRows(root, rel) })),
   });

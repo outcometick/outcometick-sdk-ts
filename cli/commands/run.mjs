@@ -14,7 +14,7 @@
 import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -310,6 +310,13 @@ export async function cmdRun({ dir, flags }) {
       markets.push(...genericDecoded.markets);
     }
     const runInputs = [];
+    // Days are decoded on up to 8 threads (each holds its own heap: ~1.8 GB in
+    // all on the sample day) unless --workers says otherwise; the events are
+    // the same either way (cli/parallel-decode.mjs).
+    const decodeWorkers = flags.workers == null ? Math.min(availableParallelism(), 8) : Number(flags.workers);
+    if (!Number.isInteger(decodeWorkers) || decodeWorkers < 1) {
+      throw new Error(`--workers must be a whole number from 1, got ${flags.workers}`);
+    }
     // Decoded days are kept (cli/decode-cache.mjs) unless --cache off.
     const cacheFlag = flags.cache;
     const cacheRoot = cacheFlag === 'off' ? null : path.resolve(cacheFlag ?? defaultCacheRoot());
@@ -326,7 +333,7 @@ export async function cmdRun({ dir, flags }) {
         to: days[days.length - 1],
       });
       const request = {
-        root: dataRoot, day, venue, eventsDir,
+        root: dataRoot, day, venue, eventsDir, workers: decodeWorkers,
         assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
         datasets: manifest.datasets,
         intervals: manifest.intervals,

@@ -372,6 +372,12 @@ export function makeBookThrottle({ venue, assets = [], from, to }) {
   return {
     /** Nothing to do when nothing in range was throttled. */
     get active() { return dataset != null && fallback > 0; },
+    /** The dataset it thins (null: none on this venue). */
+    get dataset() { return dataset ?? null; },
+    /** What it was made from: makeBookThrottle(spec) is a fresh gate with the same windows. */
+    get spec() { return { venue, assets: [...assets], from, to }; },
+    /** True until it has kept or dropped a row. */
+    get untouched() { return last.size === 0; },
 
     /**
      * The window this gate will actually use for an asset.
