@@ -1,9 +1,5 @@
-// Resting orders, against hand-computed answers.
-//
-// Every expected number below was worked out on paper from the rules at the top
-// of maker.mjs, not read back from the engine. runner/conformance runs the same
-// shapes through both engines; this file is what says the shared answer is the
-// RIGHT one.
+// Resting-order tests with hand-computed expectations from maker.mjs.
+// runner/conformance checks the corresponding behavior in both engines.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -73,9 +69,8 @@ test('joins behind the visible size; prints on BOTH tokens advance it; the entry
       mirror(1000, [[0.40, 100]], [[0.45, 200]]),
       tick(1000, 1),
       tick(1100, 0),
-      // 1500 < 1800: ignored for the order — no fill, queue unchanged. The 30
-      // still goes through the waterfall against the 100 in front, so nothing
-      // is suppressed either.
+      // 1500 < 1800: no fill or queue update for this order. The 30 contracts
+      // still consume external depth through the waterfall.
       trade(1500, 'DOWN', 'BUY', 0.60, 30),
       // 2000: an UP seller hits 0.40 for 120 → 100 in front, then 20 to us.
       trade(2000, 'UP', 'SELL', 0.40, 120),
@@ -270,7 +265,7 @@ test('our own orders may not cross each other', () => {
 test('a just-cancelled order does not block a re-quote through its price', () => {
   // Bid UP @ 0.43 live; cancelled at 1500 (latency 0) → cancel_pending, still
   // exposed until 2300. A DOWN bid @ 0.59 (canonical ask 0.41) placed at 1600
-  // would cross the old bid — but that bid has left the venue. Accepted.
+  // crosses the old bid's price, but is accepted because that bid has left the venue.
   const { maker } = run({
     events: [mirror(1000, [[0.40, 100]], [[0.45, 100]]), tick(1000, 1), tick(1500, 2), tick(1600, 3), tick(1700, 0)],
     plan: {
@@ -284,7 +279,7 @@ test('a just-cancelled order does not block a re-quote through its price', () =>
 });
 
 test('own orders share the queue: the earlier one is in front, one print never fills more than it printed', () => {
-  // Two bids at 0.40 (UP 10, then DOWN reduce? no — keep both UP), 5 visible in front.
+  // Two UP bids at 0.40, with 5 visible contracts ahead.
   const { fills } = run({
     events: [
       mirror(1000, [[0.40, 5]], [[0.45, 100]]),
@@ -310,7 +305,7 @@ test('markouts: mid of the fill token at the horizon, null when stale or past th
       tick(1000, 1),
       tick(1100, 0),
       trade(2000, 'UP', 'SELL', 0.40, 10),
-      // 2900: book moves — UP mid (0.42 + 0.46) / 2 = 0.44 at the 1s horizon (3000).
+      // 2900: UP mid (0.42 + 0.46) / 2 = 0.44 at the 1s horizon (3000).
       mirror(2900, [[0.42, 50]], [[0.46, 50]]),
       // 11000: the 10s horizon (12000) sees this book, 1000ms old: fresh.
       mirror(11000, [[0.30, 50]], [[0.34, 50]]),

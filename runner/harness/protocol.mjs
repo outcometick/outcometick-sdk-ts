@@ -1,32 +1,14 @@
-// The contract between the worker (outside the sandbox) and a harness (inside).
-//
-// The worker never trusts anything a harness writes: it validates the shape,
-// bounds every array, and recomputes the report itself from the trade and fill
-// logs. A harness runs in the same process as untrusted code, so its output is
-// untrusted output — the container is the boundary, not the harness.
-//
+// Worker-to-harness protocol. Output is untrusted because the harness shares
+// a process with strategy code. The worker validates shapes, bounds arrays
+// and computes reports from trade and fill logs outside the sandbox.
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { OUTCOMES } from '../engine/portfolio.mjs';
 
-// This is also the reason the REPORT is not computed inside. Metrics,
-// calibration, latency and slippage are all derived outside, in one shared
-// implementation, from the two logs below. A Python run and a Node run
-// therefore cannot produce differently-shaped reports even though they run
-// different engines.
+// One worker-side implementation computes report metrics for both languages.
 
 /**
- * The job reaches the harness on STDIN, not as a file.
- *
- * It used to be written to /job/job.json and the events to a mounted /events.
- * The static analysers forbid `open`, `os` and `pathlib`, but the allowlisted
- * dependencies read files perfectly well — `pandas.read_json('/job/job.json')`
- * needs none of them. That handed a strategy every market's settled outcome and
- * the path to every event file, i.e. the whole future. Look-ahead being
- * impossible is the one claim this product cannot lose.
- *
- * stdin is reachable in neither language without `process` (JS) or `sys`
- * (Python), both of which the analysers refuse. Nothing with a future fact in it
- * touches a path the strategy can open.
+ * Jobs arrive on stdin, not on a strategy-readable filesystem path.
+ * The analyser rejects process (JS) and sys (Python), which expose stdin.
  *
  * The stream is newline-framed:
  *
@@ -36,37 +18,20 @@ import { OUTCOMES } from '../engine/portfolio.mjs';
  *   {"market": {...}, "n": <count>}
  *   ...
  *
- * Markets arrive one at a time so the harness's memory stays flat across a
- * seven-hundred-market-day run, exactly as it did when reading files.
+ * Markets arrive one at a time to bound memory across a run.
  */
 export const JOB_FILE = 'job.json';
 
 /**
- * Results come back over stdout, authenticated. There is no output directory.
+ * Results return over an authenticated stdout pipe, without an output directory.
+ * Sent rows cannot be replaced or deleted. Each line has a MAC using a per-run
+ * key read from stdin before strategy import. Direct writes to /proc/self/fd
+ * cannot forge valid lines.
  *
- * `/out` used to be a writable bind mount holding trades.jsonl and fills.jsonl.
- * A Python strategy declaring the allowlisted `pandas` could call
- * `DataFrame.to_json('/out/trades.jsonl')` from `on_settle` — that is, AFTER
- * being told the official outcome — and write profitable trades with valid
- * market ids and in-window timestamps. It needed no analyser bypass at all, and
- * reconcileRows cannot tell a forged row from an engine one: it checks that the
- * market existed, not that the fill happened.
+ * This does not protect against full code execution that extracts the key
+ * from harness state.
  *
- * Two changes, and both are needed:
- *
- *  1. Output is a PIPE, not a file. Rows already sent cannot be unsent, so a
- *     strategy cannot delete its losses either — which an HMAC alone would not
- *     have stopped.
- *  2. Every line is MACed with a per-run key that arrives on stdin and is
- *     consumed before user code is imported. It never touches a filesystem, so
- *     writing to `/proc/self/fd/3` — which IS addressable, a pipe is not by
- *     itself enough — produces lines the worker drops.
- *
- * This does not defeat a strategy that achieves full code execution and digs
- * the key out of a closure. It does defeat "declare pandas and write a file",
- * which was the actual, verified hole.
- *
- * Line format:  <mac> <channel> <payload>
+ * Line format: <mac> <channel> <payload>
  */
 export const CHANNEL = Object.freeze({
   trade: 't',
@@ -74,29 +39,17 @@ export const CHANNEL = Object.freeze({
   log: 'l',
   result: 'r',
   /**
-   * "I have finished replaying market-day N." Display only.
-   *
-   * The worker used to count how many market-days it had WRITTEN into stdin,
-   * which is not the same thing: a write only proves the bytes were accepted
-   * into a buffer. Small days fit several at a time, so the bar ran ahead of
-   * the replay and could show 100% while the sandbox still had work to do —
-   * the "looks stuck" experience this panel exists to prevent.
-   *
-   * It comes from the sandbox, so it is attacker-influenced like every other
-   * line, and it is authenticated like every other line. That is fine for a
-   * progress bar and NOT fine for money: billing still uses only what the
-   * worker itself fetched and fed.
+   * Completed-market acknowledgement for display, not an authoritative work count.
    */
   progress: 'p',
   /**
-   * The recorder (engine.record_ms): one market's value at one grid point, or
-   * its FINAL sample — `{key, ts, cash, marked, position_value, final}`. Engine
-   * output like markouts; only an input to the report's `record` block.
+   * Recorder sample or final value: {key, ts, cash, marked, position_value, final}.
+   * Used as input to the report's record block.
    */
   record: 'v',
 });
 
-/** Fields of a record line, in order. MUST MATCH RECORD_FIELDS in otharness.py. */
+/** Fields of a record line, in order. Keep in sync with RECORD_FIELDS in otharness.py. */
 export const RECORD_FIELDS = Object.freeze(['key', 'ts', 'cash', 'marked', 'position_value', 'final']);
 
 /**
@@ -104,14 +57,14 @@ export const RECORD_FIELDS = Object.freeze(['key', 'ts', 'cash', 'marked', 'posi
  * account grid the report builds from them (counted before it is built).
  * Bytes: the encoded record lines, MAC and channel included. Either reached ->
  * recording stops for the run and the report carries no series at all.
- * MUST MATCH otharness.py.
+ * Keep in sync with otharness.py.
  */
 export const MAX_RECORD_ROWS = 1_000_000;
 export const MAX_RECORD_BYTES = 256 * 1024 * 1024;
 
 /**
  * One record line, validated: a finite number for every value, a boolean
- * final, a string key. Anything else is not a sample. MUST MATCH parse_record.
+ * final, a string key. Anything else is not a sample. Keep in sync with parse_record.
  */
 export function parseRecord(raw) {
   if (!raw || typeof raw !== 'object' || typeof raw.key !== 'string') return null;
@@ -128,27 +81,24 @@ export function lineBytes(channel, payload) {
 }
 
 /**
- * The authenticated result channel: the container's stdout.
- *
- * It used to be fd 3. Docker hands a container stdin/stdout/stderr and nothing
- * else — the worker spawns `docker run` with a fourth pipe, but that fd belongs
- * to the docker CLIENT, so inside the container fd 3 was closed and every write
- * failed with EBADF. No containerised run had ever produced a result.
- *
- * Each harness makes fd 1 unreachable for the strategy before loading its code
- * (Python dups it away and points 1 at /dev/null; JavaScript takes over
- * `console`, which is the only route left once the analyser has refused
- * `process`). The MAC is what makes forgery impossible, and always was —
- * /proc/self/fd/1 was addressable either way.
+ * Authenticated results use container stdout. Docker exposes only stdin, stdout
+ * and stderr; an extra Docker-client pipe is not a container fd. Before strategy
+ * import, Python duplicates stdout and redirects fd 1 to /dev/null; JS replaces
+ * console with an object holding no streams. MACs authenticate lines even when
+ * /proc/self/fd is addressable.
  */
 export const RESULT_FD = 1;
 
 /** Exit codes a harness may use. Anything else is treated as a crash. */
 export const EXIT = Object.freeze({
   ok: 0,
-  /** The strategy or the manifest is wrong — a rejection, and free. */
+  /**
+   * Invalid strategy or manifest.
+   */
   rejected: 10,
-  /** The strategy exceeded a limit. Also free: no report was produced. */
+  /**
+   * Strategy exceeded a limit; no report was produced.
+   */
   budget: 11,
 });
 
@@ -177,12 +127,8 @@ export const MAKER_STAT_KEYS = Object.freeze([
 const finite = (x) => typeof x === 'number' && Number.isFinite(x);
 
 /**
- * Validate one trade row from a harness.
- *
- * Returns the row narrowed to known fields, or null. Dropping rather than
- * throwing: one malformed row out of a hundred thousand should cost that row,
- * not the customer's whole run — and the count of dropped rows is reported so
- * it cannot be silent.
+ * Validate a trade row and project known fields, or return null.
+ * Malformed rows are dropped and counted rather than aborting the run.
  */
 export function parseTrade(raw) {
   if (!raw || typeof raw !== 'object') return null;
@@ -193,9 +139,7 @@ export function parseTrade(raw) {
   const px = (v) => (v == null ? null : (finite(v) && v >= 0 && v <= 1 ? v : undefined));
   const entry = px(raw.entry_px);
   const exit = px(raw.exit_px);
-  // `undefined` means a value was present but impossible — a price outside
-  // 0..1 is not a price on a binary market, and accepting it would put a
-  // fabricated number into the calibration panel.
+  // undefined marks an invalid supplied price; null represents a missing one.
   if (entry === undefined || exit === undefined) return null;
   return {
     market_id: raw.market_id,
@@ -217,9 +161,8 @@ const label = (v) => (typeof v === 'string' ? v.slice(0, 200) : null);
 const numOrNull = (v) => (finite(v) ? v : null);
 
 /**
- * The extra fields of a GENERIC market's row (runner/generic-data.mjs),
- * present only when the row carries a label — archive rows never do, so their
- * parse is exactly what it always was. MUST MATCH the Python report parser.
+ * Additional generic-market fields, selected only when a row has a label.
+ * Keep in sync with the Python report parser.
  */
 function genericTradeFields(raw) {
   if (typeof raw.label !== 'string') return {};
@@ -274,7 +217,7 @@ export function parseFill(raw) {
   };
 }
 
-/** Why an order did not execute, as the engines write it. MUST MATCH the Python report parser. */
+/** Why an order did not execute, as the engines write it. Keep in sync with the Python report parser. */
 export const REJECT_REASONS = Object.freeze(['fok_unfilled', 'quote_guard', 'below_min_size', 'size_step', 'off_tick']);
 
 /** A harness's run-wide order counters (job.engine), or null. */
@@ -297,11 +240,8 @@ function parseMakerStats(raw) {
 }
 
 /**
- * Parse a JSONL log from a harness, bounded.
- *
- * `maxRows` is a hard stop, not a suggestion: a harness that emits rows in a
- * loop must not be able to exhaust the worker's memory from inside the
- * sandbox. What was dropped is returned, never swallowed.
+ * Parse a JSONL log with a hard row limit to bound worker memory.
+ * Return malformed-row counts and truncation status.
  */
 export function parseJsonl(text, parseRow, { maxRows = 2_000_000 } = {}) {
   const rows = [];
@@ -326,7 +266,9 @@ export function parseJsonl(text, parseRow, { maxRows = 2_000_000 } = {}) {
   return { rows, malformed, truncated };
 }
 
-/** Validate the result.json a harness writes. */
+/**
+ * Validate the harness result payload.
+ */
 export function parseResult(raw) {
   const r = raw && typeof raw === 'object' ? raw : {};
   const marketSummaries = Array.isArray(r.market_summaries) ? r.market_summaries.slice(0, 100_000) : [];
@@ -372,22 +314,16 @@ export function parseResult(raw) {
 }
 
 /**
- * Authenticate one output line.
- *
- * Truncated to 128 bits: this is a forgery check against a process that cannot
- * read the key, not a long-term signature, and a shorter tag keeps the per-row
- * overhead down across millions of rows.
+ * Authenticate an output line with a 128-bit truncated HMAC.
+ * The shorter tag reduces per-row overhead; this is not a long-term signature.
  */
 export function lineMac(key, channel, payload) {
   return createHmac('sha256', key).update(`${channel} ${payload}`).digest('hex').slice(0, 32);
 }
 
 /**
- * Split and verify one output line.
- *
- * Returns null for anything that does not authenticate — which is what a
- * strategy writing to /proc/self/fd/3 produces. Constant-time compare because
- * the tag is a secret-derived value and the loop runs per row.
+ * Split and authenticate an output line, or return null.
+ * Compare secret-derived tags in constant time.
  */
 export function parseOutputLine(key, line) {
   const first = line.indexOf(' ');

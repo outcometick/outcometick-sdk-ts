@@ -36,8 +36,7 @@ test('a normal strategy passes', () => {
 });
 
 test('Math is fine; Math.random is not', () => {
-  // The whole point of parsing rather than grepping: Math.abs, Math.min and
-  // Math.max are the arithmetic every strategy uses.
+  // AST checks must allow ordinary Math operations.
   assert.doesNotThrow(() => analyzeJavaScript(
     'export default class S { onTick(c, t) { return Math.max(0, Math.abs(t.value)); } }', 'x.mjs',
   ));
@@ -111,9 +110,7 @@ test('threads and shared memory are refused', () => {
 });
 
 test('the network is refused even though it is also absent', () => {
-  // Belt and braces: the image has no network stack, but a strategy that would
-  // have reached for one should be told why, not fail with a confusing DNS
-  // error at run time.
+  // Reject network calls during validation rather than at runtime.
   rejects('E_FORBIDDEN', 'await fetch("https://example.com");');
   rejects('E_FORBIDDEN', 'new WebSocket("wss://example.com");');
 });
@@ -144,12 +141,11 @@ test('unseeded randomness is refused wherever it is reached from', () => {
 });
 
 // ---------------------------------------------------------------------------
-// false positives — the expensive kind of bug
+// false positives
 // ---------------------------------------------------------------------------
 
 test('a forbidden name in a string or a comment is not a call', () => {
-  // A regex-based validator fails all three of these, and the docs promise a
-  // local pass is not rejected on submit.
+  // Comments and literals must not trigger identifier checks.
   assert.doesNotThrow(() => analyzeJavaScript('export const a = "Math.random() is banned";', 'x.mjs'));
   assert.doesNotThrow(() => analyzeJavaScript('// eval() would escape analysis\nexport const a = 1;', 'x.mjs'));
   assert.doesNotThrow(() => analyzeJavaScript('/* import fs from "node:fs" */ export const a = 1;', 'x.mjs'));
@@ -161,19 +157,13 @@ test('a property named like a banned global is not the global', () => {
 });
 
 test('a forbidden name is refused even when it is bound locally', () => {
-  // This test used to assert the OPPOSITE — that a local shadowing a banned
-  // name was fine. That exemption was the attack: `onTick(ctx, t, fetch = fetch)`
-  // binds the name while the DEFAULT VALUE captures the real global, and the
-  // shadowing rule waved the whole thing through.
-  //
-  // The cost is a false positive on `function f(Date) {…}`, which renames in one
-  // keystroke. The alternative was a documented way out of the allowlist.
+  // Banned names remain banned when shadowed: a default argument can capture
+  // the global. This also rejects harmless parameters with those names.
   rejects('E_NONDETERMINISM', 'export function f(Date) { return Date + 1; }');
   rejects('E_FORBIDDEN', 'export class S { onTick(ctx, t, fetch = fetch) { return fetch("http://x"); } }');
   rejects('E_NONDETERMINISM', 'export class S { onTick(ctx, t, Date = Date) { return Date.now(); } }');
 
-  // A name that is merely NOT on the allowlist is still fine when it is a
-  // local — that is what `bound` is still for.
+  // Local bindings may use names outside the global allowlist.
   assert.doesNotThrow(() => analyzeJavaScript('const helper = 1;\nexport const a = helper + 1;', 'x.mjs'));
 });
 
@@ -238,15 +228,12 @@ test('non-source files are left alone', () => {
 // ---------------------------------------------------------------------------
 
 test('the Function constructor is refused however it is spelled', () => {
-  // Blocking the bare `Function` identifier was not enough: nobody spells it
-  // that way when they are escaping. globalThis.constructor.constructor IS the
-  // Function constructor, and Function("return process")() reaches the whole
-  // runtime — filesystem, environment, everything the allowlist excludes.
+  // Constructor chains can expose Function and the unrestricted runtime.
   rejects('E_FORBIDDEN', 'const F = globalThis.constructor.constructor; F("return process")();');
   rejects('E_FORBIDDEN', 'const F = ({}).constructor.constructor;');
   rejects('E_FORBIDDEN', 'const F = [].constructor;');
   rejects('E_FORBIDDEN', 'const F = "".constructor;');
-  // And by computed access, which is the same door with a different handle.
+  // Computed property access must follow the same rule.
   rejects('E_FORBIDDEN', 'const F = ({})["constructor"];');
 });
 
@@ -260,9 +247,7 @@ test('globalThis itself is not reachable', () => {
 });
 
 test('a global nobody thought to name is refused, because the list is an allowlist', () => {
-  // The previous version enumerated what was FORBIDDEN, so every global that
-  // had not been thought of — and every one added by a future runtime — walked
-  // straight through.
+  // Unknown globals are rejected, including additions in newer runtimes.
   rejects('E_FORBIDDEN', 'Reflect.get({}, "x");');
   rejects('E_FORBIDDEN', 'const w = WebAssembly;');
   rejects('E_FORBIDDEN', 'new Intl.NumberFormat();');
@@ -271,8 +256,7 @@ test('a global nobody thought to name is refused, because the list is an allowli
 });
 
 test('the arithmetic a real strategy needs is still allowed', () => {
-  // The allowlist is only correct if it does not reject working code. Math in
-  // particular was missing when the list was first enforced.
+  // Keep ordinary Math operations available.
   const src = `export class S {
     onTick(ctx, t) {
       const a = Math.max(0, Math.abs(t.value));
@@ -289,17 +273,15 @@ test('the arithmetic a real strategy needs is still allowed', () => {
 });
 
 test('a computed constructor key is folded and refused', () => {
-  // ["con" + "structor"] is the same door as .constructor, and checking only
-  // literal keys let it through. Anything built from string literals is decided
-  // statically; a genuinely dynamic key cannot be, and the container is what
-  // stands behind that.
+  // Fold literal string keys such as ["con" + "structor"]. Dynamic keys
+  // remain subject to container isolation.
   rejects('E_FORBIDDEN', 'const F = []["con" + "structor"]["con" + "structor"];');
   rejects('E_FORBIDDEN', 'const F = ({})[`constructor`];');
   rejects('E_FORBIDDEN', 'const p = ({})["__" + "proto__"];');
 });
 
 test('ordinary indexing is untouched by that check', () => {
-  // The fix must not reject array access, which every strategy does.
+  // Ordinary array indexing remains allowed.
   assert.doesNotThrow(() => analyzeJavaScript(
     'export default class S { onTick(ctx, t) { const h = ctx.history(5); return h[h.length - 1]; } }', 'x.mjs',
   ));
@@ -309,11 +291,8 @@ test('ordinary indexing is untouched by that check', () => {
 });
 
 test('reflective Object methods are refused — the denylist lost here', () => {
-  // Blocking `.constructor` as a member access does nothing about
-  //   Object.getOwnPropertyDescriptor(Object.getPrototypeOf(function(){}), 'constructor').value
-  // which IS the Function constructor: the forbidden property arrives as a
-  // STRING ARGUMENT, so no member rule ever sees it. Verified — that payload
-  // passed analysis and returned `process`.
+  // Reflection can expose Function through a string property argument,
+  // without any constructor member access.
   rejects('E_FORBIDDEN',
     'export class S { onTick() { const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(function(){}), "constructor").value; return F("return process")(); } }');
   rejects('E_FORBIDDEN', 'const p = Object.getPrototypeOf({});');
@@ -324,7 +303,7 @@ test('reflective Object methods are refused — the denylist lost here', () => {
 });
 
 test('the Object methods a strategy actually uses still work', () => {
-  // The allowlist is only correct if it does not reject working code.
+  // Allow supported operations on ordinary objects.
   const src = `export class S {
     onTick(ctx, t) {
       const k = Object.keys(ctx.p);
@@ -340,8 +319,7 @@ test('the Object methods a strategy actually uses still work', () => {
 });
 
 test('a local named Object is the local, not the global', () => {
-  // `bound` still does its original job for names that are merely not on the
-  // allowlist — it is only the FORBIDDEN names it no longer excuses.
+  // Local bindings exempt unknown names, but not forbidden names.
   assert.doesNotThrow(() => analyzeJavaScript(
     'export function f(Object) { return Object.anything; }', 'x.mjs',
   ));
@@ -349,7 +327,7 @@ test('a local named Object is the local, not the global', () => {
 
 // ---------------------------------------------------------------------------
 // ctx.ref / ctx.ext names the analyser can read (checked against the manifest
-// by analyzeSource — see index.test.mjs)
+// by analyzeSource; see index.test.mjs)
 // ---------------------------------------------------------------------------
 
 const ENTRY = { entryClass: 'S', hookMethods: ['onMarketOpen', 'onTick', 'onBook', 'onTrade', 'onSettle'] };

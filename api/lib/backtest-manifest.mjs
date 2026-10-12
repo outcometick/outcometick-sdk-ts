@@ -1,13 +1,5 @@
-// Validating `outcometick.json` and the files that come with it.
-//
-// This is the validator the docs promise `ot check` runs: "if it passes locally
-// it will not be rejected on submit". That promise only survives if there is
-// exactly ONE implementation — so the CLI, the API and the runner all call
-// this, and none of them re-derive a rule of their own.
-//
-// Everything here is free and happens before a credit is held. A rejection
-// costs the submitter nothing, so the checks lean strict: a manifest that is
-// ambiguous is rejected rather than interpreted.
+// Shared outcometick.json and file validator for CLI, API and runner.
+// Reject ambiguous submissions before execution.
 
 import {
   LANGUAGES, KNOWN_LANGUAGES, HOOKS, KNOWN_HOOKS, HOOK_NAMES, LIMITS, MODES,
@@ -20,21 +12,15 @@ import {
   normalizeQueueModel,
   normalizeRecordMs,
 } from './backtest-datasets.mjs';
-// The series parser, so the FREE check rejects a malformed CSV instead of the
-// worker rejecting it after credits are held. One implementation, shared: the
-// docs promise a local pass is not rejected on submit.
+// Use the shared parser so malformed series fail the local check.
 import { parseSeries } from '../../runner/series-data.mjs';
 
 /** The one file name that is not the submitter's to choose. */
 export const MANIFEST_NAME = 'outcometick.json';
 
 /**
- * File names must be plain, relative and flat-ish. A submission is not unpacked
- * — the files arrive as text with names attached — but the runner does write
- * them to a scratch directory, and a name is the one field that reaches a
- * filesystem call. `..`, absolute paths, backslashes and control characters are
- * all rejected rather than sanitised: a name we had to repair is a name the
- * submitter did not mean.
+ * Names are relative paths written to a scratch directory. Reject traversal,
+ * absolute paths, backslashes and control characters rather than sanitising.
  */
 const SAFE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/;
 
@@ -51,11 +37,8 @@ function assertSafeName(name, what = 'file') {
 }
 
 /**
- * Parse the manifest text.
- *
- * A manifest that is not JSON, or is JSON but not an object, is E_MANIFEST and
- * not E_ENTRY — the distinction matters because the codes drive what the CLI
- * tells someone to go and look at.
+ * Parse a JSON object. Invalid JSON and non-objects raise E_MANIFEST,
+ * separate from entry-resolution errors (E_ENTRY).
  */
 export function parseManifest(text) {
   let doc;
@@ -71,11 +54,8 @@ export function parseManifest(text) {
 }
 
 /**
- * Validate the manifest on its own, without the files.
- *
- * Returns a normalised manifest: every optional field present with its default,
- * every list de-duplicated and in a stable order. Downstream code reads the
- * normalised form only, so no consumer has to repeat "or the default".
+ * Validate and normalise the manifest, supplying defaults and deduplicating
+ * lists so consumers need not apply defaults themselves.
  */
 export function validateManifest(doc) {
   if (doc.schema !== SCHEMA_VERSION) {
@@ -90,7 +70,7 @@ export function validateManifest(doc) {
   }
   const lang = LANGUAGES[language];
 
-  // entry is "file:ClassName" — resolved by exact name, no discovery.
+  // Resolve "file:ClassName" by name without discovery.
   const entryRaw = String(doc.entry ?? '');
   const sep = entryRaw.lastIndexOf(':');
   if (sep <= 0 || sep === entryRaw.length - 1) {
@@ -116,9 +96,7 @@ export function validateManifest(doc) {
     }
     if (!hooks.includes(h)) hooks.push(h);
   }
-  // At least one hook must be able to return an Order, or the run cannot
-  // produce a trade and the report would be an empty equity curve the
-  // submitter paid for.
+  // Require a hook that can emit orders.
   if (!hooks.some((h) => HOOKS[h].emitsOrders)) {
     throw new BacktestRejection('E_MANIFEST',
       `no hook that can return an Order was declared; one of ${KNOWN_HOOKS.filter((h) => HOOKS[h].emitsOrders).join(', ')} is required`);
@@ -126,13 +104,10 @@ export function validateManifest(doc) {
 
   const datasets = normalizeDatasets(doc.datasets);
 
-  // Which market lengths to replay. Absent means 5m — see MARKET_INTERVALS for
-  // why the set is closed and why the default is not "both".
+  // Market intervals default to 5m; see MARKET_INTERVALS.
   const intervals = normalizeIntervals(doc.intervals);
 
-  // Which fill delays to re-price at, for the latency panel. Empty by default:
-  // every delay is another replay of the range, and it used to be five of them
-  // whether or not anyone wanted the table.
+  // Optional latency comparison; each delay requires another replay.
   const latency = normalizeLatency(doc.latency);
   // How long a cancel takes to reach the venue; resting orders only. Absent
   // means the same as `latency`.
@@ -142,9 +117,7 @@ export function validateManifest(doc) {
   // it with a flat rate on notional; the report says which was used.
   const feeBps = normalizeFeeBps(doc.fee_bps);
 
-  // Execution options (all off by default; see enginePolicyFor). Only shapes are
-  // checked here — which venue or data they can apply to is decided where the
-  // run's venue is known.
+  // Check option shapes here; enginePolicyFor checks venue/data compatibility.
   const fok = normalizeFok(doc.fok);
   const orderRules = normalizeOrderRules(doc.order_rules);
   const makerRebate = normalizeMakerRebate(doc.maker_rebate);
@@ -154,9 +127,7 @@ export function validateManifest(doc) {
   const queueModel = normalizeQueueModel(doc.queue_model);
   const recordMs = normalizeRecordMs(doc.record_ms);
 
-  // A hook that needs a dataset it was not given would simply never fire, and
-  // a strategy that silently never trades looks like a bad strategy rather
-  // than a bad manifest. Say so instead.
+  // Reject missing datasets rather than accepting hooks that cannot fire.
   for (const h of hooks) {
     const need = HOOKS[h].requiresDataset;
     if (!need) continue;
@@ -176,7 +147,7 @@ export function validateManifest(doc) {
       `unknown mode ${JSON.stringify(doc.mode)}; known: ${KNOWN_MODES.join(', ')}`);
   }
 
-  // deps — names only, from the per-language allowlist. Versions are ours.
+  // Allowlisted dependency names only; images pin versions.
   const deps = [];
   if (doc.deps != null) {
     if (!Array.isArray(doc.deps)) throw new BacktestRejection('E_MANIFEST', 'deps must be an array');
@@ -208,7 +179,7 @@ export function validateManifest(doc) {
     }
   }
 
-  // series — the submitter's own CSV/Parquet, aligned to event time
+  // User series aligned to event time.
   const series = [];
   if (doc.series != null) {
     if (!Array.isArray(doc.series)) throw new BacktestRejection('E_MANIFEST', 'series must be an array');
@@ -237,7 +208,7 @@ export function validateManifest(doc) {
     }
   }
 
-  // params — defaults only, reachable as ctx.p
+  // Parameter defaults exposed as ctx.p.
   const params = {};
   if (doc.params != null) {
     if (typeof doc.params !== 'object' || Array.isArray(doc.params)) {
@@ -290,11 +261,9 @@ export function validateManifest(doc) {
 }
 
 /**
- * Validate the submitted files against the manifest and the hard limits.
- *
- * `files` is [{name, content}] as submitted — text only. The manifest itself
- * counts toward both the file count and the size budget, because it is one of
- * the things the submitter has to fit in.
+ * Validate text files against the manifest and limits. files is [{name, content}].
+ * The manifest counts toward file and source-byte limits; series have separate
+ * byte budgets.
  */
 export function validateFiles(files, manifest) {
   if (!Array.isArray(files) || files.length === 0) {
@@ -314,9 +283,7 @@ export function validateFiles(files, manifest) {
     if (typeof content !== 'string') {
       throw new BacktestRejection('E_MANIFEST', `file ${name} must be submitted as text`);
     }
-    // A NUL byte means this is not the text file it claims to be. We never
-    // unpack anything, so this is the whole of the "no archives" enforcement:
-    // a zip cannot survive the trip as a JSON string without one.
+    // Reject NUL bytes in text submissions.
     if (content.includes('\0')) {
       throw new BacktestRejection('E_MANIFEST',
         `file ${name} contains a NUL byte — submissions are text only, no archives`);
@@ -325,13 +292,7 @@ export function validateFiles(files, manifest) {
     seen.set(name, { name, bytes, content });
   }
 
-  // SOURCE and DATA have separate budgets.
-  //
-  // One shared 256KB cap meant a declared series ate the code's allowance, and
-  // the advertised 32MB series could never be sent at all — the two limits
-  // contradicted each other and the smaller one won silently. Code is small and
-  // is read by a human during an abuse review; a series is bulk and is read by
-  // nothing.
+  // Source and series have separate byte budgets.
   const seriesFiles = new Set(manifest.series.map((s) => s.file));
   for (const f of seen.values()) {
     if (seriesFiles.has(f.name)) continue;
@@ -348,13 +309,7 @@ export function validateFiles(files, manifest) {
       throw new BacktestRejection('E_LIMIT',
         `series ${s.name} is ${f.bytes} bytes, over the ${LIMITS.maxSeriesBytes} byte limit`);
     }
-    // PARSED HERE, in the free check — not later, in the worker.
-    //
-    // The docs promise that a local pass is not rejected on submit, and this is
-    // the same validator `ot check` runs. Leaving it to the worker meant a CSV
-    // with no readable timestamp got as far as holding credits and queueing,
-    // then failed and refunded: technically correct, and a terrible way to
-    // learn your header was wrong.
+    // Validate series timestamps before execution.
     if (f) {
       const out = parseSeries(f.content);
       if (out.rows.length === 0) {
@@ -391,12 +346,8 @@ export function validateFiles(files, manifest) {
 }
 
 /**
- * The full pre-billing check: manifest, files, and the scope it will run over.
- *
- * Scope is checked here rather than at submission time because coverage is a
- * property of the manifest's declared datasets crossed with the requested
- * range, and both come from the submitter. Getting E_COVERAGE from `ot check`
- * is the difference between fixing a manifest and buying a useless run.
+ * Validate manifest, files and requested coverage before execution.
+ * Coverage depends on declared datasets and requested range.
  *
  * @param {{manifestText?:string, manifest?:object, files:Array, scope:object}} input
  */
@@ -418,8 +369,7 @@ export function checkSubmission({ manifestText, manifest: manifestDoc, files, sc
     manifest,
     files: checked.files,
     totalBytes: checked.totalBytes,
-    // What the runner has to call, in this language's spelling. Resolved here
-    // so neither the runner nor the CLI re-implements the parity table.
+    // Resolve runtime hook names centrally for runner and CLI.
     hookNames: Object.fromEntries(manifest.hooks.map((h) => [h, HOOK_NAMES[manifest.languageId][h]])),
     shardable: MODES[manifest.mode].shardable,
   };

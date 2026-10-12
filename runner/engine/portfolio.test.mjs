@@ -233,8 +233,7 @@ test('flatten closes against the bid', () => {
 });
 
 test('a flatten with no bid leaves the position for settlement', () => {
-  // Better an open position resolved at the official outcome than a close at a
-  // price that did not exist.
+  // Without executable depth, leave the position open for settlement.
   const p = new Portfolio();
   const b = mkBook({ asks: [[0.50, 1000]], bids: [] });
   p.execute({ book: b, ts: 1, marketId: '0xm', order: { side: 'UP', size: 100, limit: 1 } });
@@ -257,16 +256,12 @@ test('fees are charged on notional at entry and exit', () => {
   // In and out at the same price: the only loss is the two fees.
   near(p.feesPaid, 0.5 + 0.5);
   near(p.cash, -1);
-  // BOTH fees are in the trade's PnL. Carrying only the exit fee made net_pnl
-  // — the first number on the report — understate costs by every entry fee in
-  // the run.
+  // Trade PnL includes both entry and exit fees.
   near(p.trades[0].pnl, -1);
 });
 
 test('a trade PnL always reconciles with the cash it moved', () => {
-  // The invariant behind the fee fix: for a round trip that opened and closed,
-  // realised PnL IS the cash flow. If those two ever disagree the report is
-  // describing a different run from the one that happened.
+  // Realised PnL must equal cash flow for a completed round trip.
   for (const feeBps of [0, 20, 100]) {
     const p = new Portfolio({ feeBps });
     const b = mkBook({ asks: [[0.40, 1000]], bids: [[0.55, 1000]] });
@@ -345,16 +340,9 @@ test('malformed orders are counted, not thrown', () => {
   assert.equal(p.fills.length, 0);
 });
 
-// Bad sizing is COUNTED, never thrown, and never allowed through.
-//
-// `Infinity > 0` is true, so a positivity test is not a finiteness test: an
-// infinite notional derived `size = Infinity`, walked the whole book and
-// produced `filled: NaN`, which poisons the position, the equity curve and
-// every number computed from them — with nothing anywhere reporting a problem.
-// The Python engine raised OverflowError on the same input, turning "reject
-// one order" into "fail the whole run". Same input, two different disasters.
-//
-// otengine.py is held to the identical table by runner/conformance.
+// Count invalid sizing as a rejection, without throwing or filling.
+// Positivity alone admits Infinity; require finite values.
+// runner/conformance applies the same cases to otengine.py.
 test('every shape of unusable sizing is rejected and counted', () => {
   const book = new Book();
   book.snapshot(1000, { UP: { asks: [[0.51, 1000]], bids: [[0.49, 1000]] } });

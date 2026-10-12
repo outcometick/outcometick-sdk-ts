@@ -1,8 +1,5 @@
-// The HTTP side of the CLI, in one place.
-//
-// Shared so that the key is read the same way everywhere: from the environment,
-// never from a flag. A flag lands in shell history and in the process list, and
-// this key spends money.
+// Shared HTTP helpers. Read the key from the environment to keep it out of
+// shell history and process arguments.
 
 export const DEFAULT_API = 'https://outcometick.com';
 

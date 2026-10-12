@@ -41,7 +41,7 @@ test('net pnl, win rate and trade count come straight off the trades', () => {
 
 test('profit factor is gross win over gross loss, and blank with no losses', () => {
   const winners = [settled({ px: 0.5, won: true, d: 1 }), settled({ px: 0.5, won: true, d: 2 })];
-  // Infinity would print as a number nobody can compare; a blank is honest.
+  // Render undefined ratios as blank rather than Infinity.
   assert.equal(metrics(winners).profit_factor, null);
 
   const mixed = [...winners, settled({ px: 0.5, won: false, d: 3 })];
@@ -94,8 +94,7 @@ test('edge per contract is realised outcome minus price paid', () => {
 });
 
 test('trades closed before settlement are excluded from edge and brier', () => {
-  // Exiting early is edge against the market, not against the truth. Scoring
-  // it as a forecast would be measuring something that never resolved.
+  // Early exits count toward PnL, but have no resolved forecast to score.
   const early = {
     market_id: '0xa', side: 'UP', size: 100, entry_px: 0.5, exit_px: 0.6,
     pnl: 10, fees: 0, opened_ms: day(1) - 1000, closed_ms: day(1), how: 'exit',
@@ -192,17 +191,13 @@ test('naive baselines price the same markets the strategy saw', () => {
   assert.equal(b.always_up, 0.05);
   // always DOWN: (0-0.62) + (1-0.47) = -0.09
   assert.equal(b.always_down, -0.09);
-  // The favourite is the DEARER side, because on a binary market the price is
-  // the implied probability. Market 1: DOWN at 0.62 (lost). Market 2: UP at
-  // 0.55 (lost). This test previously codified the inverted version, which is
-  // how the panel came to compare strategies against buying the underdog.
+  // The favourite is the higher-priced side. Market 1: DOWN at 0.62;
+  // market 2: UP at 0.55. Both lose.
   assert.equal(b.always_favourite, Number(((0 - 0.62) + (0 - 0.55)).toFixed(2)));
 });
 
 test('the favourite is the side the market thinks will win', () => {
-  // A market priced UP 0.70 / DOWN 0.30 that settles UP: buying the favourite
-  // made money. The inverted version reported a loss of 0.30 on a call the
-  // market got right.
+  // UP at 0.70 is the favourite and profits when the market settles UP.
   const b = baselines([{ outcome: 'UP', up_px: 0.70, down_px: 0.30 }], { size: 1 });
   assert.equal(b.always_favourite, 0.30);
 
@@ -210,8 +205,7 @@ test('the favourite is the side the market thinks will win', () => {
   assert.equal(lost.always_favourite, -0.70);
 });
 
-// A 50:50 settlement pays 0.5 on both sides, so it scores as 0.5 everywhere a
-// won/lost 1/0 used to go — never as a win or a loss.
+// A tie pays 0.5 on both sides and is scored as 0.5, not a win or loss.
 test('a TIE scores 0.5 in edge, brier, calibration and every baseline', () => {
   const tie = (px) => ({
     market_id: '0xa', side: 'UP', size: 100, entry_px: px, exit_px: 0.5,
@@ -346,15 +340,8 @@ test('a clean cross-check and a missing one look different', () => {
 
 
 
-// A run replays ONCE, at whatever fill delay the submitter asked for. There is
-// no comparison table any more: five extra replays took five sixths of the
-// wall clock, and the sampled version that replaced them was an extrapolation
-// dressed as a measurement.
-//
-// So the delay has to be IN the report. It changes every number in it — the
-// same strategy over the same days at 0ms and at 250ms produces two different
-// reports that are otherwise indistinguishable, and a reader with the archive
-// in front of them would have no way to tell which one they have.
+// Record the manifest's fill delay: it affects results even with identical
+// strategy source and data. Each run uses one replay pass.
 test('the report says which fill delay it was measured at', () => {
   const base = {
     runId: 'run_abc123',
@@ -366,8 +353,7 @@ test('the report says which fill delay it was measured at', () => {
     marketSummaries: [],
   };
   assert.equal(buildReport({ ...base, fillDelayMs: 250 }).fill_delay_ms, 250);
-  // Zero is a REPORTED value, not an absent one: "measured with no delay" and
-  // "we did not record the delay" must not look the same.
+  // Zero delay is a recorded value, distinct from missing delay.
   assert.equal(buildReport({ ...base, fillDelayMs: 0 }).fill_delay_ms, 0);
   assert.equal(buildReport(base).fill_delay_ms, 0);
   // And the comparison table is gone rather than empty.
@@ -375,19 +361,11 @@ test('the report says which fill delay it was measured at', () => {
     'the report still carries a latency panel that nothing produces');
 });
 
-// ---------------------------------------------------------------------------
-// "how much money do I need to run this"
-// ---------------------------------------------------------------------------
-//
-// The report could not answer it. It divided P&L by the SUM of every entry,
-// and a strategy that recycles one stake a thousand times has a sum a thousand
-// times larger than the stake — so a run that burned through its money
-// thirty-nine times over reported −4.35%.
+// Capital requirements use peak concurrent deployment, not summed entries.
 
 test('peak capital is what was at risk AT ONCE, not the sum of entries', async () => {
   const { metrics } = await import('./report.mjs');
-  // Three sequential positions, $80 each. The money is the same $80 three
-  // times over, and a strategy needing $240 is a different strategy.
+  // Three sequential $80 positions reuse the same capital.
   const seq = [0, 1, 2].map((i) => ({
     market_id: `m${i}`, pnl: -10, entry_px: 0.4, size: 200,
     opened_ms: 1000 + i * 1000, closed_ms: 1500 + i * 1000,
@@ -395,7 +373,7 @@ test('peak capital is what was at risk AT ONCE, not the sum of entries', async (
   const m = metrics(seq);
   assert.equal(m.collateral_deployed, 240, 'the sum of entries');
   assert.equal(m.peak_capital, 80, 'but only $80 was ever at risk');
-  // And the two returns differ by exactly that factor.
+  // The return denominators differ by a factor of three.
   assert.equal(m.return_on_collateral, -0.125);
   assert.equal(m.return_on_peak, -0.375);
 });
@@ -411,9 +389,7 @@ test('overlapping positions DO add up', async () => {
 
 test('a position that ends where the next begins needs one stake, not two', async () => {
   const { metrics } = await import('./report.mjs');
-  // Closes are processed before opens at the same instant. Getting this
-  // backwards doubles the answer for any strategy that trades back to back —
-  // which is most of them.
+  // Process closes before opens at the same instant so capital can be reused.
   const backToBack = [
     { market_id: 'a', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 0, closed_ms: 1000 },
     { market_id: 'b', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 1000, closed_ms: 2000 },
@@ -423,8 +399,7 @@ test('a position that ends where the next begins needs one stake, not two', asyn
 
 test('a trade with no timestamps is skipped, not assumed concurrent', async () => {
   const { metrics } = await import('./report.mjs');
-  // An unknown that inflated the peak would make a strategy look SAFER to
-  // fund than it is, which is the wrong direction to be wrong in.
+  // Unknown values must not inflate the capital denominator.
   const mixed = [
     { market_id: 'a', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 0, closed_ms: 1000 },
     { market_id: 'b', pnl: 0, entry_px: 0.5, size: 100 },
@@ -434,8 +409,7 @@ test('a trade with no timestamps is skipped, not assumed concurrent', async () =
 
 test('time in market is the UNION of the positions, never their sum', async () => {
   const { metrics } = await import('./report.mjs');
-  // Two overlapping hour-long positions are one hour of being in the market.
-  // Summing them can exceed the span and report over 100%.
+  // Overlapping positions contribute their union of occupied time.
   const overlap = [
     { market_id: 'a', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 0, closed_ms: 100 },
     { market_id: 'b', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 50, closed_ms: 100 },
@@ -464,8 +438,7 @@ test('no trades produces nulls, not zeros pretending to be answers', async () =>
 import { downsampleEquity, EQUITY_MAX_POINTS, TRADES_HEAD } from './report.mjs';
 
 test('downsampleEquity keeps both ends and every bucket extreme, and stays under the cap', () => {
-  // A deep, one-point trough in the middle: a stride would step over it and
-  // the drawn curve would show less drawdown than the metric above it.
+  // Preserve a one-point trough that stride sampling would miss.
   const pts = Array.from({ length: 100_000 }, (_, i) => ({ ts_ms: i, equity: i }));
   pts[54_321] = { ts_ms: 54_321, equity: -1e6 };
   pts[77_777] = { ts_ms: 77_777, equity: 1e7 };
@@ -501,7 +474,7 @@ test('the report carries counts and a head, not the full trade and fill lists', 
 });
 
 test('a report over 400k trades builds without blowing the argument limit', () => {
-  // Math.min(...rows) threw RangeError here long before memory ran out.
+  // Avoid spread arguments, which exceed the argument limit on large arrays.
   const trades = Array.from({ length: 400_000 }, (_, i) => settled({ px: 0.5, won: i % 2 === 0, d: 1 + (i % 28) }));
   const r = buildReport({ runId: 'r', submittedAt: 1, manifest: {}, scope: { archivedDayCount: 28 }, trades, fillStats: fillStats([]), marketSummaries: [] });
   assert.equal(r.rows.trades, 400_000);
@@ -509,8 +482,7 @@ test('a report over 400k trades builds without blowing the argument limit', () =
 });
 
 test('the streaming slippage panel equals the array version, bit for bit', () => {
-  // The worker now feeds fills one at a time from disk. The panel it builds
-  // must be the one the array version built — same sums in the same order.
+  // Streaming fills must preserve array-order accumulation and totals.
   const reference = (fills) => {
     const attempted = fills.filter((f) => f.action === 'open');
     if (!attempted.length) return null;

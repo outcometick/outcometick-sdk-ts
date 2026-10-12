@@ -9,16 +9,11 @@ def on_grid(x):
 
 
 class SpreadQuote(Strategy):
-    """Quote both sides with resting orders and let the queue decide what fills.
+    """Quote both sides with resting orders.
 
-    Buying UP at the best bid and buying DOWN at one minus the best ask is a
-    two-sided quote on one market: the venue's book is mirrored, so a DOWN bid
-    at 1 - a sits in the same queue as an UP offer at a. When both fill, the
-    pair pays exactly $1 at settlement whatever the outcome, so the pair earns
-    the spread, a - b. What decides the result is everything else: how often
-    you are filled at all behind the queue already there, and how often you
-    are filled just before the price moves through you — the markouts in the
-    report's maker panel.
+    An UP bid at b and a DOWN bid at 1-a share one mirrored book. If both fill,
+    the pair pays $1 at settlement, earning a-b before costs. Queue position
+    controls fills; maker markouts measure adverse selection.
     """
 
     def on_market_open(self, ctx, market):
@@ -35,7 +30,7 @@ class SpreadQuote(Strategy):
     def on_book(self, ctx, ev):
         if self.close_ts is None:
             return None
-        # The last stretch: pull the quotes. Whatever is held settles at $1 / $0.
+        # Cancel quotes near close; held tokens settle at $1 or $0.
         if (self.close_ts - ctx.now) / 1000 <= ctx.p.stop_quoting_s:
             if self.quoted is not None:
                 self.pull(ctx)
@@ -44,16 +39,15 @@ class SpreadQuote(Strategy):
         bid, ask = book.best_bid("UP"), book.best("UP")
         if bid is None or ask is None:
             return None
-        # Only quote a spread worth having, away from the extremes.
+        # Require a minimum spread and prices away from the extremes.
         if ask - bid < ctx.p.min_spread or bid < ctx.p.px_min or ask > ctx.p.px_max:
             if self.quoted is not None:
                 self.pull(ctx)
             return None
         if self.quoted == (bid, ask):
             return None
-        # Re-quote at most this often: every cancel stays exposed for a short
-        # window after it lands, and chasing every flicker of the touch mostly
-        # buys that exposure.
+        # Limit requoting: the queue model retains exposure for a late-print window
+        # after cancellation takes effect.
         if self.last_quote_ms is not None and ctx.now - self.last_quote_ms < ctx.p.requote_ms:
             return None
         self.pull(ctx)
@@ -62,12 +56,10 @@ class SpreadQuote(Strategy):
 
         pos = ctx.position()
         orders = []
-        # The cap is on the side you are LONG OF, not on gross size. ctx.position()
-        # reports the larger leg; once it reaches max_inventory, only the other
-        # side is quoted. Buying the other side pairs inventory off — an UP + DOWN
-        # pair pays exactly $1 at settlement whatever the outcome — so both legs
-        # can keep growing while what is actually at risk, their difference,
-        # stays within max_inventory + size.
+        # ctx.position() reports the larger open leg. At the cap, quote only
+        # the opposite side to reduce the imbalance. Matched UP/DOWN pairs pay $1
+        # at settlement; gross holdings can grow while the imbalance stays within
+        # max_inventory + size.
         if not (pos.side == "UP" and pos.size >= ctx.p.max_inventory):
             orders.append(Order(side="UP", size=ctx.p.size, limit=on_grid(bid), tif="gtc", post_only=True))
         if not (pos.side == "DOWN" and pos.size >= ctx.p.max_inventory):

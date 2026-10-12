@@ -1,8 +1,5 @@
-// `ot init` and the templates it copies.
-//
-// runner/conformance proves the templates TRADE identically in both engines;
-// this proves they are complete, valid, in step with each other, and that
-// `ot init` hands them over byte for byte without ever overwriting anything.
+// Check template validity, JS/Python parity and byte-for-byte copying.
+// runner/conformance checks that both implementations trade identically.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -37,16 +34,15 @@ test('every template is complete, described in both languages, and valid', async
     for (const lang of TEMPLATE_LANGS) {
       const dir = path.join(TEMPLATES_DIR, t.id, lang);
       assert.deepEqual((await readdir(dir)).sort(), ['outcometick.json', STRATEGY_FILE[lang]].sort(), `${t.id}/${lang}`);
-      // The queue's own validator: what `ot init` hands out passes `ot check`.
+      // Templates must pass the shared submission validator.
       const res = await validate(await readSubmission(dir));
       manifests[lang] = res.manifest;
     }
-    // One strategy written twice: the knobs and the data must be the same.
+    // Both languages expose the same parameters and data requirements.
     for (const field of ['hooks', 'datasets', 'intervals', 'reference', 'params', 'mode', 'latency']) {
       assert.deepEqual(manifests.nodejs[field], manifests.python[field], `${t.id}: ${field} differs between languages`);
     }
-    // A template that needs a reference feed cannot run locally; saying it can
-    // sends a new user straight into the refusal in `ot run`.
+    // Reference-feed templates cannot run locally.
     assert.equal(t.runsLocally, (manifests.python.reference ?? []).length === 0, `${t.id}: runsLocally is wrong`);
   }
 });
@@ -82,8 +78,7 @@ test('ot init copies the files byte for byte and points at the next step', async
 test('ot init never overwrites and leaves nothing half-written', async () => {
   const work = await mkdtemp(path.join(tmpdir(), 'ot-init-'));
   try {
-    // strategy.py exists, outcometick.json does not: copying the manifest
-    // first and then failing would leave a mixed directory.
+    // A conflicting strategy file must not leave a partially copied manifest.
     await writeFile(path.join(work, 'strategy.py'), 'mine');
     const r = await ot(['init', work, '--template', 'favourite-near-close']);
     assert.equal(r.code, 1);

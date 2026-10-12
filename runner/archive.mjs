@@ -1,15 +1,6 @@
-// The report archive: one zip, built by hand.
-//
-// One zip and not a folder of links was an explicit product decision — a
-// customer should be able to drop the whole thing into a notebook and have
-// every number reproducible from what is inside it.
-//
-// Written without a zip dependency because the format's stored (uncompressed)
-// variant is about eighty lines, and this runs on the machine that executes
-// untrusted code: every package on that host is attack surface, and a zip
-// library is one that parses attacker-adjacent data. Deflate is skipped
-// deliberately — CSVs compress well, but "the archive is 3x bigger" is a much
-// cheaper problem than "the archive is subtly corrupt".
+// Report ZIP writer with fixed timestamps for reproducible output.
+// Entries use Deflate when it reduces size, otherwise stored bytes.
+// Implemented here to avoid an additional ZIP dependency on the runner.
 
 import { createHash, randomUUID } from 'node:crypto';
 import { deflateRawSync, createDeflateRaw } from 'node:zlib';
@@ -43,14 +34,9 @@ function crc32(buf) {
 }
 
 /**
- * A file writer that cannot take the process down.
- *
- * A WriteStream's `error` with no listener kills Node, and the obvious
- * backpressure idiom — `once('drain')` — never settles when the error comes
- * instead of the drain. A full disk (ENOSPC) while the worker writes a
- * customer's fills would then kill the worker with the run still leased.
- * Here the listener is attached at open, and every wait races the event it
- * wants against `error`, so a disk failure rejects the current step only.
+ * File writer with backpressure and error handling.
+ * An error rejects a pending drain or finish wait, preventing unhandled stream
+ * errors and waits that would otherwise never settle.
  */
 export function openWriter(file) {
   const out = createWriteStream(file);
@@ -83,8 +69,8 @@ const DOS_TIME = 0;
 const DOS_DATE = 0x0021;
 
 /**
- * STORE unless DEFLATE actually helped. One rule for both writers below, so
- * the in-memory and the streaming archive are the same bytes.
+ * Use Deflate only for entries over 256 bytes that compress smaller.
+ * Both writers use this rule to produce identical archives.
  */
 const useDeflateFor = (rawLen, deflatedLen) => rawLen > 256 && deflatedLen < rawLen;
 
@@ -121,9 +107,8 @@ function centralHeader({ nameBuf, method, crc, csize, usize, offset }) {
   dir.writeUInt16LE(0, 32);            // comment
   dir.writeUInt16LE(0, 34);            // disk
   dir.writeUInt16LE(0, 36);            // internal attrs
-  // Multiplication, not `<< 16`: JavaScript's bitwise operators are signed
-  // 32-bit, and 0o100644 << 16 overflows to a negative that writeUInt32LE
-  // rejects outright.
+  // Use multiplication: a signed 32-bit shift of 0o100644 overflows,
+  // and writeUInt32LE rejects the negative result.
   dir.writeUInt32LE(0o100644 * 0x10000, 38); // external attrs (0644, regular file)
   dir.writeUInt32LE(offset, 42);
   return Buffer.concat([dir, nameBuf]);
@@ -143,15 +128,8 @@ function endRecord(count, centralLen, centralOffset) {
 }
 
 /**
- * Build a zip from a list of {name, data}.
- *
- * Uses DEFLATE where it helps and STORE where it does not, decided per entry by
- * measuring rather than guessing — a compressed entry that came out larger is
- * stored instead.
- *
- * Timestamps are fixed rather than taken from the clock. Two runs of the same
- * strategy over the same range must produce byte-identical output, and a zip
- * carrying "now" in every local header would break that for no benefit.
+ * Build a ZIP from {name, data} entries.
+ * Use Deflate when it reduces size. Fixed timestamps make output deterministic.
  */
 export function zip(entries) {
   const chunks = [];
@@ -174,17 +152,11 @@ export function zip(entries) {
 }
 
 /**
- * The same zip as `zip()`, written to `outPath` without holding any entry in
- * memory. An entry is `{ name, data }` (string/Buffer) or `{ name, file }`.
- *
- * The fill log of a busy strategy is hundreds of MB; building it as a string,
- * then a Buffer, then a deflated Buffer is what made the worker's memory the
- * limit on how much a strategy may trade. Each file entry is read twice — once
- * to CRC, hash and deflate it into a scratch file, once to copy the chosen
- * body — so the local header can carry real sizes exactly as `zip()` writes
- * them (no data descriptors: the format stays byte-identical).
- *
- * Returns the sha256 of every entry's raw bytes, by name.
+ * Write a ZIP to `outPath`. Entries are {name, data} (string/Buffer) or
+ * {name, file}; data may also be a function of the hashes written so far.
+ * File entries are streamed: first CRC, hash and compress to scratch, then copy
+ * the chosen body. Known sizes avoid data descriptors and match `zip()` output.
+ * Returns SHA-256 hashes of each entry's raw bytes, keyed by name.
  */
 export async function writeZip(outPath, entries, { scratchDir = path.dirname(outPath) } = {}) {
   const out = openWriter(outPath);
@@ -248,20 +220,10 @@ function csvField(v) {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-/** Rows to CSV with a fixed column order, so a diff between runs is meaningful. */
+/** CSV rows use a fixed column order for reproducible diffs. */
 /**
- * A UTF-8 byte-order mark.
- *
- * Excel opens a .csv as the system ANSI code page unless the file says
- * otherwise, and the only thing it accepts as saying otherwise is this. The
- * symptom was a calibration bucket reading `0.30 釴?0.40` — an en dash, three
- * UTF-8 bytes, read as GBK. That is not a Chinese-locale problem: it is every
- * non-ASCII byte in every one of these files, including the `tag` a strategy
- * puts on its own fills, which we do not control at all.
- *
- * Parsers that do not expect it see one stray character on the first header;
- * `encoding='utf-8-sig'` is the standard remedy. A spreadsheet that mangles
- * the whole file is the worse failure, and it is the one that was happening.
+ * UTF-8 BOM for spreadsheet encoding detection, including non-ASCII tags.
+ * Python readers can use encoding="utf-8-sig" to strip it from the first header.
  */
 const BOM = '\uFEFF';
 
@@ -282,8 +244,7 @@ const FILL_COLUMNS = [
   'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle',
 ];
 
-// A generic-data run (report.data_kind === 'generic') appends these; an
-// archive run's files keep exactly the columns above.
+// Generic-data runs append valuation columns; archive runs use the base columns.
 const GENERIC_TRADE_COLUMNS = [
   ...TRADE_COLUMNS, 'label', 'mark_px', 'marked_size', 'marked_pnl', 'mark_source',
   'mark_ts_ms', 'mark_age_ms', 'mark_missing',
@@ -291,9 +252,9 @@ const GENERIC_TRADE_COLUMNS = [
 const isGeneric = (report) => report?.data_kind === 'generic';
 
 /**
- * The fills.csv columns of a run, fixed before its first row: the base set,
- * `label` for generic data, and the execution options' fields (engine policy,
- * see enginePolicyFor). MUST MATCH engineFillFields in the harnesses.
+ * Fix fills.csv columns before writing: base fields, `label` for generic data,
+ * and fields enabled by enginePolicyFor.
+ * Keep in sync with engineFillFields in the harnesses.
  */
 export function fillColumnsFor({ generic = false, engine = null } = {}) {
   const cols = [...FILL_COLUMNS];
@@ -339,9 +300,8 @@ export const fillCsvLine = (fill, columns = FILL_COLUMNS) => csvLine(fill, colum
 export const fillsCsvHeader = (columns) => `${BOM}${columns.join(',')}`;
 
 /**
- * The whole equity curve, rounded as report.equity is; that one is thinned.
- * A generator over a sorted list of references: the curve for millions of
- * trades is never materialised as objects.
+ * Generate the full equity curve with report.equity rounding.
+ * Sort trade references and yield points without materialising the curve.
  */
 function* fullEquity(trades) {
   const closed = (trades ?? []).filter((t) => Number.isFinite(t.pnl));
@@ -354,21 +314,11 @@ function* fullEquity(trades) {
 }
 
 /**
- * Assemble the archive a customer downloads, into `outPath`.
- *
- * THE SOURCE IS NOT IN IT. It used to be, so that a report could be tied back
- * to the exact code that produced it — "which version of my strategy was
- * this?" is the first question anyone asks a week later. That question is now
- * answered by `source_sha256` in report.json instead: the same identification,
- * without handing back a copy of the code. Shipping the strategy inside the
- * deliverable made a report something you cannot forward to anyone.
- *
- * sha256sums.txt covers every other entry, so the whole thing is verifiable
- * without trusting the transport.
- *
- * `fillsCsv` is a file already in fills.csv format (FILLS_CSV_HEADER, then one
- * fillCsvLine per row): the worker writes it while it streams the fill log off
- * disk, so the fills are never all in memory at once.
+ * Write the report archive to `outPath`. Strategy source is identified by
+ * source_sha256 in report.json and is not included.
+ * sha256sums.txt covers all other entries.
+ * `fillsCsv` is an existing file with FILLS_CSV_HEADER and fillCsvLine rows,
+ * allowing fills to be streamed from disk.
  */
 export async function writeArchive({ outPath, report, trades, fillsCsv, logs, markets = null, record = null }) {
   const scratch = await mkdtemp(path.join(path.dirname(outPath), '.archive-'));
@@ -376,19 +326,16 @@ export async function writeArchive({ outPath, report, trades, fillsCsv, logs, ma
     const tradesCsv = path.join(scratch, 'trades.csv');
     const equityCsv = path.join(scratch, 'equity.csv');
     await writeCsvFile(tradesCsv, trades, isGeneric(report) ? GENERIC_TRADE_COLUMNS : TRADE_COLUMNS);
-    // FROM THE FULL TRADE LIST, not report.equity — that one is thinned for
-    // the page. Same rows and rounding the report used to carry in full.
+    // Use the full trade list; report.equity is thinned for display.
     await writeCsvFile(equityCsv, fullEquity(trades), ['ts_ms', 'equity']);
     const entries = [
       { name: 'report.json', data: `${JSON.stringify(report, null, 2)}\n` },
       { name: 'trades.csv', file: tradesCsv },
       { name: 'fills.csv', file: fillsCsv },
       { name: 'equity.csv', file: equityCsv },
-      // One row per market replayed, entered or not (marketRows); absent only
-      // for a caller that has no market list.
+      // Include all replayed markets, including those with no trades, when supplied.
       ...(markets ? [{ name: 'markets.csv', data: toCsv(markets, MARKET_COLUMNS) }] : []),
-      // The time-grid mark-to-market (recordReport): the account, and every
-      // instance's samples. Absent when the run did not record or was cut short.
+      // Include account and per-instance time-grid valuations when recording produced points.
       ...(record?.points?.length ? [
         { name: 'record.csv', data: toCsv(record.points, ['ts', 'value', 'position_value', 'open_positions']) },
         { name: 'record_markets.csv', data: toCsv(record.samples, ['key', 'ts', 'cash', 'marked', 'position_value', 'final']) },
@@ -400,8 +347,7 @@ export async function writeArchive({ outPath, report, trades, fillsCsv, logs, ma
       { name: 'coverage.json', data: `${JSON.stringify(report.coverage ?? {}, null, 2)}\n` },
       { name: 'logs.txt', data: logs ?? '' },
     ];
-    // Checksums last, over everything above — computed by writeZip as it
-    // writes each entry, so no entry is read a third time.
+    // Append checksums after writeZip has hashed the other entries, avoiding another read.
     const names = entries.map((e) => e.name);
     entries.push({
       name: 'sha256sums.txt',
@@ -410,9 +356,7 @@ export async function writeArchive({ outPath, report, trades, fillsCsv, logs, ma
     await writeZip(outPath, entries, { scratchDir: scratch });
     return { path: outPath, bytes: (await stat(outPath)).size };
   } catch (err) {
-    // A half-written archive is garbage that can be most of a gigabyte, and
-    // the stale sweep only runs at worker start: left here, one full disk
-    // becomes every following run failing on the same full disk.
+    // Remove incomplete archives immediately so failed writes do not fill the disk.
     await rm(outPath, { force: true });
     throw err;
   } finally {
@@ -421,9 +365,8 @@ export async function writeArchive({ outPath, report, trades, fillsCsv, logs, ma
 }
 
 /**
- * The archive as a Buffer, from in-memory trades and fills. For `ot run` and
- * tests; the worker uses writeArchive directly. Same bytes either way — this
- * is writeArchive with the fills spelled out to a file first.
+ * Return the archive as a Buffer from in-memory trades and fills.
+ * Uses writeArchive after writing fills to a temporary file, producing the same bytes.
  */
 export async function buildArchive({ report, trades, fills, logs, markets = null, record = null }) {
   const dir = await mkdtemp(path.join(tmpdir(), 'ot-archive-'));

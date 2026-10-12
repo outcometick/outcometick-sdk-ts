@@ -77,8 +77,7 @@ test('threads are refused — parallelism is across markets', async () => {
 });
 
 test('the wall clock and unseeded randomness are non-determinism, not merely forbidden', async () => {
-  // The distinct code matters: it tells the submitter to reach for ctx.now and
-  // ctx.random rather than to go looking for a permission to request.
+  // Use a distinct code to direct strategies to ctx.now and ctx.random.
   await rejects('E_NONDETERMINISM', py('import time\n'));
   await rejects('E_NONDETERMINISM', py('from datetime import datetime\n'));
   await rejects('E_NONDETERMINISM', py('import random\n'));
@@ -109,8 +108,7 @@ test('dynamic attribute access and dunder reflection are refused', async () => {
 });
 
 test('ordinary dunders a strategy legitimately writes are allowed', async () => {
-  // __init__ on the class is normal; rejecting it would fail every strategy
-  // that has one.
+  // Strategy constructors remain allowed.
   await assert.doesNotReject(() => analyzePythonSubmission(py(
     'class S:\n    def __init__(self):\n        self.x = 1\n',
   )));
@@ -127,10 +125,8 @@ test('a forbidden name in a comment or a docstring is not a call', async () => {
 });
 
 test('a forbidden builtin is refused even as a parameter or a local', async () => {
-  // This asserted the opposite until the default-argument capture was found:
-  // `def on_tick(self, ctx, tick, getattr=getattr)` binds the name while the
-  // DEFAULT captures the real builtin, and the shadowing exemption let it
-  // through — straight to `getattr(ctx, "_s")` and the live engine state.
+  // A default argument can capture a forbidden builtin despite shadowing
+  // its name, then expose engine state through getattr.
   await rejects('E_FORBIDDEN', py('def f(open):\n    return open + 1\n'));
   await rejects('E_FORBIDDEN', py(
     'class S:\n    def on_tick(self, ctx, tick, getattr=getattr):\n        return getattr(ctx, "_s")\n',
@@ -183,8 +179,7 @@ test('non-python files are left alone', async () => {
 // ---------------------------------------------------------------------------
 
 test('both languages refuse the same categories', async () => {
-  // The two runtimes are advertised as having identical semantics. A construct
-  // rejected in one and accepted in the other is a broken promise.
+  // Keep rejection behavior consistent with the JavaScript analyser.
   const { analyzeJavaScript } = await import('./javascript.mjs');
   const jsRejects = (src) => {
     try { analyzeJavaScript(src, 'x.mjs'); return null; } catch (e) { return e.code; }
@@ -204,9 +199,7 @@ test('both languages refuse the same categories', async () => {
 });
 
 test('__builtins__ is refused — it is a door around every builtin check', async () => {
-  // The analyser rejected bare open()/eval(), but __builtins__.open(...) is
-  // neither a bare call nor a dunder ATTRIBUTE, so it walked straight past both
-  // checks and reached the filesystem.
+  // Access through __builtins__ must not bypass bare-call checks.
   await rejects('E_FORBIDDEN', py('__builtins__.open("/etc/passwd")\n'));
   await rejects('E_FORBIDDEN', py('__builtins__.eval("1+1")\n'));
   await rejects('E_FORBIDDEN', py('__builtins__.__import__("os")\n'));
@@ -215,24 +208,20 @@ test('__builtins__ is refused — it is a door around every builtin check', asyn
 });
 
 test('a forbidden builtin reached as an attribute of anything is refused', async () => {
-  // The receiver does not matter: if we cannot see what it is, we cannot allow
-  // the call.
+  // Reject calls whose receiver cannot be checked.
   await rejects('E_FORBIDDEN', py('obj.open("/etc/passwd")\n'));
   await rejects('E_FORBIDDEN', py('mod.eval("1")\n'));
 });
 
 test('reaching into an engine object private attribute is refused', async () => {
-  // ctx.book()._b was the live Book, and Python has no privacy — a strategy
-  // inserted a level that never existed and filled 1000 contracts at $0.01 in a
-  // market whose real book held 10 at $0.90.
+  // Private book internals would allow a strategy to fabricate liquidity.
   await rejects('E_FORBIDDEN', py('b = ctx.book()._b\n'));
   await rejects('E_FORBIDDEN', py('x = ctx._pf.trades\n'));
   await rejects('E_FORBIDDEN', py('y = obj._anything\n'));
 });
 
 test('a strategy own private attributes are still fine', async () => {
-  // The rule cannot be a blanket one: self._entered is ordinary Python and
-  // refusing it would reject working strategies.
+  // Private attributes on the strategy itself remain allowed.
   await assert.doesNotReject(() => analyzePythonSubmission(py(
     'class S:\n'
     + '    def on_market_open(self, ctx, market):\n'
@@ -245,14 +234,8 @@ test('a strategy own private attributes are still fine', async () => {
 });
 
 test('outcometick is importable as the SDK, never as a package prefix', async () => {
-  // In the sandbox `outcometick` is one flat module — Strategy and Order. pip
-  // additionally ships `outcometick.data`, the HTTP client for the data
-  // subscription, which resolves to nothing inside a container that has no
-  // network. Allowing it because the ROOT segment matched would mean `ot check`
-  // passing a strategy that dies on import after being queued.
-  //
-  // The JavaScript analyser compares the whole specifier and always refused
-  // `outcometick/data`; this is the Python half of the same rule.
+  // The sandbox exposes the flat SDK module, not the network data client.
+  // Reject submodule imports, matching the JavaScript analyser.
   const strategy = (imp) => [{
     name: 'strategy.py',
     content: `${imp}\n\n\nclass S:\n    def on_tick(self, ctx, t):\n        return None\n`,
@@ -272,16 +255,7 @@ test('outcometick is importable as the SDK, never as a package prefix', async ()
   }
 });
 
-// The docs tell people to split a strategy across files. That instruction is
-// only true in one spelling.
-//
-// `/docs/sdk` used to say nothing at all about multi-file submissions; when the
-// section was written the first draft said "relative imports between them
-// work" and showed `from helpers import cheaper`, which this analyser rejects
-// with E_IMPORT — a bare module name is not on the allowlist and there is no
-// way for the reader to guess that the dot is the difference. These two cases
-// are what that paragraph now promises, so they are pinned here: a doc sentence
-// nothing enforces is a doc sentence that drifts.
+// Multi-file Python submissions require relative imports, including the dot.
 test('a sibling file is importable relatively, and only relatively', async () => {
   const files = [
     {
@@ -321,7 +295,7 @@ class Demo(Strategy):
 
 // ---------------------------------------------------------------------------
 // ctx.ref / ctx.ext names the analyser can read (checked against the manifest
-// by analyzeSource — see index.test.mjs)
+// by analyzeSource; see index.test.mjs)
 // ---------------------------------------------------------------------------
 
 const ENTRY = { entry: { file: 'strategy.py', className: 'S' },

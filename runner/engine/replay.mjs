@@ -1,35 +1,20 @@
-// The event loop: what actually drives a strategy.
-//
-// Control is inverted. The strategy has no main(), no loop, no clock and no
-// file handles — this module owns all of it and hands over events one at a
-// time, in event-time order. Look-ahead is impossible here not because we
-// filter it out but because future rows are not in the process yet: the caller
-// feeds an iterator and we never read ahead of the cursor.
-//
-// Decode once, replay many. A market-day's events are decoded by the caller and
-// handed here as an array; running the same array again with different params
-// is what makes a 36-cell parameter sweep cost one market-day, and what lets
-// the latency panel re-price every fill at six different delays. Both are our
-// CPU, not the customer's data.
+// Event loop. Owns the clock, iteration and I/O; strategies receive events
+// one at a time in event-time order. Rows are pulled from the caller's
+// iterator as they are replayed. Decoded market-days can be replayed with
+// different parameters.
 
 import { Book } from './book.mjs';
 import { Portfolio, contractValue } from './portfolio.mjs';
 import { MakerBook, MAX_RESTING } from './maker.mjs';
 
 
-// Mirrors LIMITS.logLineChars / LIMITS.logBytesPerRun, and does NOT import
-// them. This file is baked into the sandbox image, which contains runner/ and
-// nothing else — an import of api/ resolves fine on a developer's machine and
-// on the worker, and then fails inside every container with
-// ERR_MODULE_NOT_FOUND. otreplay.py mirrors the same two numbers for the same
-// reason. replay-limits.test.mjs asserts both copies still equal the contract.
+// Keep in sync with LIMITS.logLineChars / logBytesPerRun and otreplay.py.
+// Do not import api/: the sandbox image only contains runner/.
+// replay-limits.test.mjs checks both copies against the contract.
 const LOG_LINE_CHARS = 512;
 const LOG_BYTES_PER_RUN = 2 * 1024 * 1024;
 
-// A settlement recompute is a once-per-market claim, so these are generous.
-// They exist because `crosschecks` rides the same result line as everything
-// else: unbounded, it is an output channel with no budget. Mirrored in
-// otreplay.py.
+// Bound crosscheck output on the result line. Keep in sync with otreplay.py.
 const MAX_CROSSCHECKS_PER_MARKET = 16;
 const CROSSCHECK_CLAIMED_CHARS = 32;
 
@@ -37,13 +22,7 @@ const CROSSCHECK_CLAIMED_CHARS = 32;
 /** Event kinds the loop understands, in the order they dispatch. */
 export const EVENT_KINDS = Object.freeze(['tick', 'book', 'trade']);
 
-/**
- * Per-event budget.
- *
- * Measured over the strategy's own hook, not the loop around it. Sustained cost
- * over budget kills the shard rather than the run: one pathological market must
- * not cost the customer the other 719.
- */
+/** Measure strategy-hook cost; sustained over-budget cost stops the shard. */
 export class BudgetMonitor {
   constructor({ limitMicros = 400, sampleFloor = 2000 } = {}) {
     this.limitMicros = limitMicros;
@@ -52,11 +31,7 @@ export class BudgetMonitor {
     this.breaches = 0;
     this.maxMicros = 0;
     this.totalMicros = 0;
-    // The most recent `sampleFloor` events, as a ring. One monitor covers the
-    // WHOLE run, so a lifetime mean is diluted by however much came before: a
-    // strategy that runs 18,000 events at 8us and then 2,000 at 2,000us has a
-    // lifetime mean of 207us and passes, while its last 2,000 events are
-    // continuously 5x over budget. The window is what makes "sustained" local.
+    // Recent-event ring: a cheap prefix must not hide a sustained slow phase.
     this.window = new Float64Array(sampleFloor);
     this.windowSum = 0;
     this.windowAt = 0;
@@ -78,50 +53,11 @@ export class BudgetMonitor {
   }
 
   /**
-   * SUSTAINED cost, which is what the limit is for and what customers are told
-   * it means ("sustained breach kills the shard"): the mean of the most recent
-   * `sampleFloor` events, not the tail and not the lifetime.
-   *
-   * This judged the breach RATE against a 1% tolerance, and it was measuring
-   * the wrong machine. The budget brackets each hook with two wall-clock reads,
-   * on a 2-core box where the worker is decompressing and feeding stdin the
-   * whole time and the sandbox holds one vCPU — so an event that gets
-   * descheduled is recorded as an event the strategy spent 4ms in. Measured
-   * inside the real image: the same strategy on an idle host averages 7.8us
-   * with a 766us worst case, and under contention averages 20.9us with a 4090us
-   * worst case. Nothing about the strategy changed.
-   *
-   * The page's own sample was rejected in production at avg 72us — a fifth of
-   * its 400us budget — because 1.1% of its events had been interrupted. The
-   * breaches were not even front-loaded, so a longer warm-up floor could never
-   * have fixed it: measured in-image they land at events 171, 2368, 3201 and so
-   * on, which is the shape of GC and scheduling, not of a slow strategy.
-   *
-   * The mean is what actually predicts the thing this protects — the 20-minute
-   * wall clock is mean times event count — and it is not fooled by a machine
-   * that takes the CPU away. A strategy that really is slow raises the mean; an
-   * interrupted one does not. A single hook that never returns is still caught,
-   * by the run deadline, which is where that belongs.
-   *
-   * WINDOWED, NOT LIFETIME. One monitor covers the whole run, so a lifetime
-   * mean lets a cheap prefix pay for an expensive phase: 18,000 events at 8us
-   * followed by 2,000 at 2,000us averages 207us and passes, while the strategy
-   * has been 5x over budget for its last two thousand events. The window is
-   * what makes "sustained" mean sustained rather than "on average, eventually".
-   *
-   * `breaches` and `max_micros` stay in the summary. They are good diagnostics.
-   * They are not a verdict.
-   *
-   * KNOWN AND DELIBERATE GAP: a low-frequency, very heavy event slips through.
-   * One 500ms hook among 2,000 events at 8us is a window mean of 258us, inside
-   * budget; it would take 800ms to trip on its own. A per-hook hard cap would
-   * close it, and it is not being added, because this limit has now been wrong
-   * twice and BOTH times the same way — a one-off cost judged as a sustained
-   * one, killing a strategy that was fine. Building an index on the first tick
-   * is a legitimate 300ms hook. The wall clock already bounds total resource
-   * use, so the cap would buy protection against a failure nobody has seen at
-   * the cost of the exact mistake already made twice. Add it when a real run
-   * demonstrates the need, not before.
+   * Judge sustained cost by the mean of the latest sampleFloor events.
+   * Hook wall time includes scheduling and GC pauses; breach counts and
+   * max_micros are diagnostics, not the verdict.
+   * No per-hook cap: one 500ms hook among 2,000 at 8us averages 258us and
+   * passes. The run deadline bounds total time and catches stalled hooks.
    */
   get breached() {
     return this.count >= this.sampleFloor && this.windowMicros > this.limitMicros;
@@ -135,8 +71,7 @@ export class BudgetMonitor {
       breaches: this.breaches,
       breach_rate: this.count ? this.breaches / this.count : 0,
       avg_micros: this.avgMicros,
-      // The number the verdict is actually made on. Without it a rejection
-      // shows a lifetime average comfortably inside budget and reads as a lie.
+      // Window mean used for the verdict.
       window_micros: this.windowMicros,
       window_events: this.sampleFloor,
       max_micros: this.maxMicros,
@@ -155,35 +90,8 @@ export class RunAbort extends Error {
   }
 }
 
-/**
- * Build the object a strategy sees, plus a private handle for the loop.
- *
- * A CLOSURE, not a class with underscore-prefixed fields. The earlier version
- * held `_pf`, `_book`, `_history` and `_logs` as ordinary properties, which
- * meant a strategy could reach `ctx._pf.trades` and push a fabricated settled
- * trade straight into the report — verified: a submitted strategy could invent
- * a $990,000 profit, or delete its real losses, and the worker would archive it
- * as fact. That defeats the entire claim that the report is computed outside
- * the strategy from engine-owned facts.
- *
- * Nothing below is reachable from the returned `ctx`: the internals exist only
- * as locals captured by the methods, and `control` is kept by the loop.
- *
- * `now` is a getter for the same reason. It looks like a harmless field, but
- * `ctx.ref()` and `ctx.ext()` use it as the point-in-time cursor — a strategy
- * that could assign it would read reference rows from the future.
- */
-/**
- * A read-only view of a book.
- *
- * `ctx.book()` used to hand back the LIVE Book, whose ladders are plain arrays.
- * A strategy could `unshift` a level that never existed and then fill against
- * it — verified: an order filled at $0.01 in a market whose real best ask was
- * $0.90, and the fabricated fill went into the report as fact.
- *
- * Rebuilt per call rather than cached: the underlying book changes on every
- * book event, and a stale view would be a different bug in the same place.
- */
+/** Context state stays in closures; control and clock remain owned by the loop. */
+/** Read-only book view, rebuilt per call to reflect current state. */
 function bookView(book) {
   if (!book) return null;
   return Object.freeze({
@@ -195,8 +103,7 @@ function bookView(book) {
     depth: (side, bound = null) => book.depth(side, bound),
     bidDepth: (side, bound = null) => book.bidDepth(side, bound),
     bid_depth: (side, bound = null) => book.bidDepth(side, bound),
-    // .levels() already returns freshly-built pairs, so mutating the result
-    // reaches nothing.
+    // Fresh pairs isolate the book from returned-array mutations.
     levels: (side, n = 10) => book.levels(side, n),
     bidLevels: (side, n = 10) => book.bidLevels(side, n),
     bid_levels: (side, n = 10) => book.bidLevels(side, n),
@@ -210,7 +117,7 @@ function bookView(book) {
 // The settlement window a TWAP-settled market's ctx.twap_locked() reads.
 const TWAP_LOOKBACK_MS = Object.freeze({ twap30s: 30_000, twap60s: 60_000 });
 // ctx.twap_locked().projected is null below this sample coverage, or when the
-// latest spot value is older than this. MUST MATCH otreplay.py.
+// latest spot value is older than this. Keep in sync with otreplay.py.
 const SPOT_MIN_COVERAGE = 0.8;
 const SPOT_MAX_AGE_MS = 5000;
 
@@ -230,13 +137,9 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
     return history.slice(history.length - n).map((t) => t.value);
   };
 
-  // spot (DATASETS.spot): recorded as each spot event ARRIVES, so a feed
-  // latency delays it like everything else, and answered AS OF THIS CTX'S NOW:
-  // only values that had ARRIVED by ctx.now count (and so were stamped no later
-  // than it). A ctx kept from another market (session mode) thus answers for its
-  // own clock, never with values heard after it. Arrival order is feed order
-  // within a market (one latency for every event), so both arrays are sorted;
-  // the window and the one-sample-per-timestamp rule go by feed time.
+  // Record spot values at arrival and answer as of this context's clock.
+  // Saved contexts cannot see later arrivals. Windows and deduplication use
+  // feed timestamps; arrays follow arrival order.
   const lookbackMs = TWAP_LOOKBACK_MS[stream] ?? null;
   const closeTs = market?.close_ts_ms ?? null;
   const windowStart = lookbackMs != null && closeTs != null ? closeTs - lookbackMs : null;
@@ -256,8 +159,7 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
     return lo;
   };
 
-  // Undeclared, these would return null forever and a strategy would quietly
-  // never trade on them -- refused instead, like an undeclared ctx.ref().
+  // Refuse undeclared feeds rather than silently returning null.
   const needSpot = (what) => {
     if (!spotDeclared) throw new RunAbort('E_MANIFEST', `${what} needs the "spot" dataset declared in the manifest`);
   };
@@ -301,7 +203,7 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
 
     get now() { return now; },
 
-    /** The book as of this millisecond. Never a future state. */
+    /** Book view at the current replay time. */
     book(id = null) {
       if (id && id !== marketId) {
         // Cross-market reads are what session mode is for. Returning another
@@ -312,44 +214,31 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
       return bookView(book);
     },
 
-    /** The last n ticks already seen. Never more, by construction. */
+    /** The last n ticks already seen. */
     history(n = 1) {
       const k = Math.max(0, Math.min(Number(n) || 0, history.length));
-      // A COPY: handing back the live array would let a strategy rewrite the
-      // series its own indicators are computed from.
+      // Copy history so strategies cannot rewrite indicator inputs.
       return history.slice(history.length - k).map((t) => ({ ...t }));
     },
 
     position() {
-      // The REAL book here: this is the engine marking the position, not the
-      // strategy reading it.
+      // Engine valuation uses the live book.
       return portfolio.position(marketId, book);
     },
 
     log(msg) {
-      // BYTES FOR THE WHOLE RUN, not lines per market. The old shape — 10,000
-      // lines per market, no length cap — let a run emit the archive it had
-      // just paid a market-day for into a file the customer downloads. See
-      // LIMITS.logBytesPerRun for the arithmetic that picks these numbers.
+      // Share the byte allowance across the run; cap each line's characters.
       if (logBudget.spent >= logBudget.bytes) { logTruncated = true; return; }
       const line = `${now} ${String(msg)}`.slice(0, logBudget.lineChars);
-      // BYTES, not string length. logs.txt is UTF-8, and `.length` counts
-      // UTF-16 units — so a run logging Chinese spent a third of what it
-      // wrote, and the archive could reach three times the 2 MB this budget
-      // advertises. The line cap stays in characters because it is about
-      // being readable; the run cap is about how much data leaves with the
-      // customer, and that is measured in bytes.
+      // Count UTF-8 output bytes, not UTF-16 string length, for the run cap.
       logBudget.spent += Buffer.byteLength(line, 'utf8') + 1;
       logs.push(line);
     },
 
-    /** Seeded generator — the only randomness available, and it is recorded. */
+    /** Seeded generator, recorded in the report. */
     random(seed = null) { return rng(seed); },
 
-    /**
-     * This market's resting orders that are not final yet: copies, and no
-     * queue position — a venue does not tell you that, so neither do we.
-     */
+    /** Copies of this market's non-final resting orders, without queue position. */
     orders() { return resting ? resting.orders() : []; },
 
     /**
@@ -360,7 +249,7 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
     cancel(id) { return resting ? resting.cancel(id) : false; },
 
     /**
-     * Wake on_timer at `at_ms` (phase 2b). Returns the timer's id ("t1", ...).
+     * Wake on_timer at `at_ms`. Returns the timer's id ("t1", ...).
      * Needs the on_timer hook declared; at_ms later than now and not past the
      * market's declared close.
      */
@@ -372,13 +261,7 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
     /** Cancel a pending timer by its id; false when there is none. */
     unschedule(id) { return timers ? timers.unschedule(id) : false; },
 
-    /**
-     * A declared reference feed as of now.
-     *
-     * `.last`, `.window(n)` and `.at(ts)` can never see a row stamped after
-     * ctx.now, so a carelessly built signal cannot leak the future into a
-     * backtest.
-     */
+    /** Declared reference feed as of now, without future rows. */
     ref(name) {
       const feed = refs.get(name);
       if (!feed) throw new RunAbort('E_MANIFEST', `reference feed ${name} was not declared in the manifest`);
@@ -403,18 +286,18 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
 
     /**
      * The part of the settlement TWAP window [close - lookback, close) already
-     * elapsed, from the spot values seen in it -- an APPROXIMATION of what
+     * elapsed, from the spot values seen in it, an approximation of what
      * Chainlink's average holds so far (it uses finer observations than this
      * per-second stream). null when the market does not settle on a TWAP, the
      * window has not started, or no spot value in it has arrived.
      *   value             mean of the window's spot samples seen so far
      *   samples           how many (one per feed timestamp)
      *   elapsed_ms        time since the window opened (capped at lookback)
-     *   elapsed_fraction  elapsed_ms / lookback -- time, not certainty
+     *   elapsed_fraction  elapsed_ms / lookback (time, not certainty)
      *   coverage          samples / elapsed seconds (capped at 1)
      *   last_ts_ms        feed time of the latest spot value seen
      *   projected         elapsed_fraction * value + (1 - elapsed_fraction) *
-     *                     latest spot: the final average IF the price stayed
+     *                     latest spot: the final average if the price stayed
      *                     where it is; null when coverage < 0.8 or the latest
      *                     spot is more than 5 s old
      */
@@ -450,27 +333,11 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
       return xs.reduce((acc, x, i) => (i === 0 ? x : x * k + acc * (1 - k)), 0);
     },
 
-    /**
-     * Compare the strategy's own recompute against the official settlement.
-     *
-     * Recorded rather than enforced: a mismatch is information for the
-     * cross-check panel, not grounds to fail someone's run.
-     */
+    /** Record settlement comparisons; mismatches do not fail the run. */
     assert_outcome(_market, outcome) {
-      // The first argument is IGNORED for everything that matters. It used to
-      // supply both `official` and `market_id`, so a strategy could call
-      // ctx.assert_outcome({ market_id: realId, outcome: 'UP' }, 'UP') — or
-      // simply mutate the market object it was handed — and book itself a
-      // recompute match that never happened. The cross-check panel's whole
-      // value is that it is the ARCHIVE's answer, not the strategy's.
+      // Official outcome and market id come from engine state, not the argument.
       const official = market?.outcome ?? null;
-      // BOUNDED, for the same reason ctx.log is. `outcome` is whatever the
-      // strategy passed and this can be called on every event, so an unbounded
-      // push here is an unmetered output channel wearing a different name: the
-      // whole array is serialised onto the authenticated result line, sent,
-      // and parsed by the worker before anything downstream gets to ignore it.
-      // The panel only ever shows an aggregate, so nothing of value is lost by
-      // capping — a settlement recompute is a once-per-market claim.
+      // Bound strategy-supplied output before serialising the result line.
       if (crosschecks.length >= MAX_CROSSCHECKS_PER_MARKET) return;
       crosschecks.push({
         market_id: marketId,
@@ -487,9 +354,7 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
     setNow(v) { now = v; },
     get now() { return now; },
     setBook(b) { book = b; },
-    // A COPY. The same object is handed to the hook, and a strategy that
-    // writes to `tick.value` would otherwise be rewriting the series its own
-    // zscore/sma/ema are computed from — and the report's prices with it.
+    // Copy ticks to protect indicator inputs and report prices.
     pushTick(ev) { history.push({ ...ev }); },
     pushSpot(ev, arrivedAt) {
       spotSeen += 1;
@@ -509,7 +374,7 @@ function createCtx({ params, portfolio, marketId, market, logBudget, references,
 /** Deterministic PRNG. The seed is recorded in the report. */
 export function makeRng(runSeed) {
   return (seed = null) => {
-    // splitmix32 — small, fast, and identical to the Python harness's copy.
+    // splitmix32; keep in sync with the Python harness.
     let s = ((seed == null ? runSeed : Number(seed)) >>> 0);
     return () => {
       s = (s + 0x9e3779b9) >>> 0;
@@ -524,23 +389,7 @@ export function makeRng(runSeed) {
 /** Which hook an event dispatches to. */
 const HOOK_FOR = { tick: 'on_tick', book: 'on_book', trade: 'on_trade' };
 
-/**
- * Replay one market.
- *
- * @param {object} market      metadata: market_id, asset, strike, outcome, close_ts_ms
- * @param {Array}  events      already merged into event-time order by the caller
- * @param {object} strategy    the instance, with hooks under their canonical names
- * @param {object} opts
- * @param {number} opts.fillDelayMs  match every order this much later than the
- *   decision. Zero is "as captured"; the latency panel is this same replay at
- *   100ms, 250ms, 500ms, 1s and 2s.
- */
-/**
- * A log allowance for one run.
- *
- * Bytes, not lines, and shared by every market in the run — see
- * LIMITS.logBytesPerRun for why those two choices are the whole fix.
- */
+/** Run log allowance in UTF-8 bytes, shared across markets. */
 export function makeLogBudget({
   bytes = LOG_BYTES_PER_RUN,
   lineChars = LOG_LINE_CHARS,
@@ -549,16 +398,9 @@ export function makeLogBudget({
 }
 
 /**
- * One market's replay, as a state machine: open, step per event, close.
- *
- * Market mode drives one of these at a time. Session mode drives every market
- * that is open at once from ONE time-ordered stream, so a strategy sharing an
- * instance across markets never sees a later moment of market A before an
- * earlier moment of market B — feeding whole markets one after another let the
- * 00:00–00:15 market hand 00:15 to a market that opened at 00:05.
- *
- * The rules and their order are exactly what replayMarket has always applied.
- * MUST MATCH MarketReplay in otreplay.py.
+ * Market state machine: open, step, close. Market mode drives one at a time;
+ * session mode merges open markets into one timeline.
+ * Keep in sync with MarketReplay in otreplay.py.
  */
 export class MarketReplay {
   constructor({
@@ -569,14 +411,7 @@ export class MarketReplay {
     spotDeclared = false,
     portfolio = null,
     fillDelayMs = 0,
-    /**
-     * The run's remaining log allowance, SHARED ACROSS MARKETS.
-     *
-     * Passed in rather than created here, because a per-market allowance is
-     * what the old limit was and what made the log channel an export route: 386
-     * markets a day each got their own budget. One object for the whole run is
-     * the fix — the harness makes it once and hands the same one to every market.
-     */
+    /** Run log allowance shared across markets, created once by the harness. */
     logBudget = null,
     budget = null,
     references = null,
@@ -590,36 +425,26 @@ export class MarketReplay {
      */
     resting = null,
     /**
-     * Generic markets only: the decoder's terminal mark for an UNRESOLVED
+     * Generic markets only: the decoder's terminal mark for an unresolved
      * market (`{UP, DOWN, source, ts_ms, age_ms}` or `{none}`). Kept here and
-     * never on the market record a hook is handed — it is a future fact.
+     * never on the market record a hook is handed; it is a future fact.
      */
     terminal = null,
-    /**
-     * Execution options (job.engine, phase 2a), or null — every option off and
-     * every path the one it always was. See enginePolicyFor.
-     */
+    /** Run execution options (job.engine); null disables them. */
     engine = null,
     /**
-     * Global scheduler only: the run's clock, `{ t }`, ONE object for every
-     * market of a session and advanced only by the harness (the time of the
-     * line or job it is about to process). A ctx saved from another market
-     * still reads that market's own now; this is what keeps it from acting
-     * in the past of the run.
+     * Shared session clock {t}, advanced by the harness. Saved contexts retain
+     * their own now but cannot schedule into the run's past.
      */
     clock = null,
     /**
-     * Recorder only: the run's row budget, `{ rows, limit, truncated }`, ONE
-     * object for every market (the harness makes it). Samples are counted as
-     * they are made, so a long market cannot build an unbounded array before
-     * anything checks it; once spent, no market samples again.
+     * Shared recorder budget {rows, limit, truncated}. Count samples as made;
+     * exhaustion stops recording in all markets.
      */
     recordBudget = null,
   }) {
     this.marketId = market.market_id;
-    // generic-data.mjs. Every branch that differs from the archive path is
-    // keyed on this; archive records carry no `kind` and take exactly the
-    // code they always took.
+    // Generic-data branches; archive records have no kind.
     this.generic = market.kind === 'generic';
     this.terminal = this.generic ? terminal : null;
     this.pf = portfolio ?? new Portfolio({ feeBps, engine });
@@ -636,11 +461,7 @@ export class MarketReplay {
     this.strategy = strategy;
     this.hooks = hooks;
     this.fillDelayMs = fillDelayMs;
-    // The engine keeps its OWN copy and hands the strategy a different one.
-    // Both halves matter: settlement reads `outcome` from here, so a strategy
-    // that mutated the object it was handed would have forged not just the
-    // cross-check panel but its own PnL — every position settling the way it
-    // said rather than the way the venue did.
+    // Keep settlement metadata separate from the copy passed to hooks.
     this.market = { ...market };
     const timerApi = engine?.scheduler === 'global' && engine.timers === true ? {
       schedule: (at, tag) => this.#scheduleTimer(at, tag),
@@ -666,9 +487,7 @@ export class MarketReplay {
     this.ctx = ctx;
     this.control = control;
     control.setBook(this.book);
-    // Phase 2b, global scheduler (engine.scheduler === 'global'): one time line
-    // across markets, timers, and a feed latency with a second (local) book.
-    // Off = none of this exists and every path is the old one.
+    // Global scheduler: shared timeline, timers and a lagged local book.
     this.global = engine?.scheduler === 'global';
     this.jobSeq = 0;
     if (this.global) {
@@ -690,24 +509,13 @@ export class MarketReplay {
     /** @type {Array<{at:number, kind:'order'|'flatten', payload:any}>} */
     this.pending = [];
 
-    // The market's close, resolved BEFORE any event because replay has to stop
-    // there.
-    //
-    // The settlement feed is a per-DAY stream, and fetch-data hands every row
-    // of it to every market that settles on that stream — so a market closing
-    // at 10:00 was still being shown ticks from 14:00. A strategy could watch
-    // the price that decides its own settlement, hours after its market had
-    // closed, and log it. That is look-ahead in its purest form, and it
-    // survived the pending-order cutoff because that fixed the ORDERS and not
-    // the EVENTS. A market with no close time in the archive has no cutoff to
-    // apply; the last event seen becomes the close, tracked as we go rather
-    // than peeked.
+    // Resolve close before replay to cut off per-day feeds. Without a
+    // declared close, use the last event seen, without reading ahead.
     this.declaredClose = this.market.close_ts_ms ?? null;
     this.closeTs = this.declaredClose ?? Number.POSITIVE_INFINITY;
     if (this.generic) {
-      // Two instants, not one: trading ends at trade_until (the decoder already
-      // dropped every event after it), and a resolved market pays at its
-      // resolution time — declaredClose — which can be later.
+      // Trading ends at trade_until; resolved markets pay at declaredClose,
+      // which can be later. The decoder excludes events after trading ends.
       this.tradeUntil = this.market.trade_until_ts_ms;
       this.closeTs = this.tradeUntil;
       this.tradingEnded = false;
@@ -717,12 +525,9 @@ export class MarketReplay {
     this.lastTs = 0;
     this.ended = false;
 
-    // Phase 3b recorder (engine.record_ms, market mode): the market's value on
-    // a fixed time grid. ONE rule: before any change at time t — a job, an
-    // event, a terminal mark, the settlement — every grid point g < t not yet
-    // written is written, so each point is the state after everything at times
-    // <= g and nothing later; after the last change, one FINAL sample. Reads
-    // the ledger and the exchange book only; changes nothing.
+    // record_ms: before a change at t, write unwritten grid points g < t.
+    // Each reflects state through g. Write a final sample after the last
+    // change; read only the ledger and exchange book.
     this.recordMs = Number.isInteger(engine?.record_ms) && engine.record_ms > 0 ? engine.record_ms : null;
     this.recordRows = this.recordMs ? [] : null;
     this.recordBudget = this.recordMs ? (recordBudget ?? { rows: 0, limit: Infinity, truncated: false }) : null;
@@ -765,7 +570,7 @@ export class MarketReplay {
     }
   }
 
-  /** After the last change, at `ts`: the FINAL sample (a grid point when one falls there). */
+  /** After the last change, at `ts`: the final sample (a grid point when one falls there). */
   #recordFinal(ts) {
     if (!this.recordMs) return;
     this.#recordStart(ts);
@@ -775,20 +580,7 @@ export class MarketReplay {
     if (this.recNext === ts) this.recNext += this.recordMs;
   }
 
-  /**
-   * What a hook is allowed to see about the market, BEFORE it settles.
-   *
-   * `outcome` is a future fact and it is stripped. It arrived here because the
-   * worker's market metadata carries the settled result — so a strategy could
-   * read `market.outcome` in on_market_open, buy the winning side at whatever
-   * it was quoted at, and every number in the report became meaningless.
-   * Verified: a 900% return on a market the strategy was simply told the answer
-   * to. This is not an output-forgery hole; it is the documented SDK input
-   * handing over the answer.
-   *
-   * Only on_settle sees it, which is exactly what the docs say: "on_settle …
-   * carrying the official outcome and strike".
-   */
+  /** Pre-settlement views exclude outcome; on_settle receives it. */
   #preSettleMarket() {
     if (this.generic) return genericView(this.market);
     const { outcome, ...rest } = this.market;
@@ -799,9 +591,7 @@ export class MarketReplay {
     const pending = this.pending;
     let i = pending.length;
     if (this.global) {
-      // Nothing lands before what the run has already processed: a cancel
-      // asked for through another market's saved ctx (whose now lags behind)
-      // happens now, not in the past. Timers are refused instead (#scheduleTimer).
+      // Saved contexts cannot schedule cancels before the run clock.
       if (at < this.clock.t) at = this.clock.t;
       // (at, rank, seq): exchange jobs before arrivals before timers at one ms;
       // insertion order within a rank.
@@ -838,9 +628,7 @@ export class MarketReplay {
     if (job.at < this.clock.t) {
       throw new RunAbort('E_RUNTIME', `engine invariant: a ${job.kind} at ${job.at} after the run reached ${this.clock.t}`);
     }
-    // A spot value arriving is QUIET here too: it is recorded, and nothing else
-    // moves -- not ctx.now (a ctx kept in session mode would jump), not the
-    // recorder.
+    // Spot arrivals only update spot history, without moving ctx.now or recording.
     if (job.kind === 'arrival' && job.payload.kind === 'spot') {
       this.control.pushSpot(job.payload, job.at);
       return;
@@ -929,7 +717,7 @@ export class MarketReplay {
   #runExchangeJob(job) {
     if (job.kind === 'order') {
         const res = this.pf.execute({ book: this.book, order: job.payload, ts: job.at, marketId: this.marketId, how: 'exit' });
-        // hold_s is measured from the FILL, not the decision: a fill that
+        // hold_s is measured from the fill, not the decision: a fill that
         // landed late has not been held as long.
         if (res?.filled > 0 && job.payload.hold_s > 0 && !job.payload.reduce_only) {
           this.#schedule(job.at + job.payload.hold_s * 1000, 'flatten', { side: job.payload.side });
@@ -945,11 +733,9 @@ export class MarketReplay {
 
   #requestCancel(id) {
     if (!this.maker) return false;
-    // Resolved NOW, to the record: a client_id reused after this call cannot
-    // redirect a cancel already on its way.
+    // Bind cancellation to its order before client_id can be reused.
     const rec = this.maker.find(id);
-    // Asked NOW in the run's time: through a ctx kept from another market this
-    // market's own now lags, and the latency must still be paid in full.
+    // Apply full cancel latency from the run clock, including saved contexts.
     const asked = this.global ? Math.max(this.control.now, this.clock.t) : this.control.now;
     if (!rec) { this.maker.cancel(null, asked); return false; }
     this.#schedule(asked + this.cancelLatencyMs, 'cancel', rec);
@@ -964,9 +750,8 @@ export class MarketReplay {
     try {
       out = fn.call(this.strategy, this.ctx, ...args);
     } catch (err) {
-      // The engine's own refusal (an undeclared ctx.ref(), ctx.spot(), ...)
-      // keeps its code; only what the strategy itself threw is E_RUNTIME.
-      // MUST MATCH _call in otreplay.py, which always did this.
+      // Preserve engine refusal codes; strategy exceptions become E_RUNTIME.
+      // Keep in sync with _call in otreplay.py.
       if (err instanceof RunAbort) throw err;
       throw new RunAbort('E_RUNTIME', `${name} threw: ${err?.message ?? err}`);
     }
@@ -979,14 +764,9 @@ export class MarketReplay {
     const list = Array.isArray(out) ? out : [out];
     for (const raw of list) {
       if (raw == null) continue;
-      // A COPY, taken at decision time. The hook's own object used to be
-      // scheduled by reference, so a strategy could rewrite `limit` or `size`
-      // while the order was still "in flight" and have the engine act on what
-      // it decided later — latency that only applied to the decision, not to
-      // its content.
+      // Copy orders at decision time so in-flight contents cannot change.
       const order = typeof raw === 'object' ? { ...raw } : raw;
-      // A side NAMED but not this market's: stop, loudly. Counting it as one
-      // rejected order hid a misspelt side in a run that simply never traded.
+      // Abort for a named side outside this market.
       if (typeof order?.side === 'string' && this.pf.sideOf(order.side, this.marketId) == null) {
         const labels = this.pf.marketLabels.get(this.marketId);
         throw new RunAbort('E_RUNTIME', `order side ${JSON.stringify(order.side)} is not "UP" or "DOWN"${
@@ -1019,8 +799,7 @@ export class MarketReplay {
       throw new RunAbort('E_MANIFEST', this.resting?.refusal
         ?? 'resting (gtc) orders are not available for this run');
     }
-    // hold_s is a timer from a fill, and a resting order fills in pieces over
-    // time — there is no single fill to time from. Refused, not guessed at.
+    // hold_s needs a single fill time; resting orders can fill in pieces.
     if (order.hold_s != null) {
       throw new RunAbort('E_MANIFEST', 'hold_s is not supported on gtc orders; exit with a reduce_only order');
     }
@@ -1038,8 +817,7 @@ export class MarketReplay {
   }
 
   open(openTs = null) {
-    // Global mode: the market opens AT a time, and nothing it schedules may be
-    // earlier than that — ctx.now is the open, not 0.
+    // Start at market open so global jobs cannot precede it.
     if (this.global && typeof openTs === 'number' && Number.isFinite(openTs)) this.control.setNow(openTs);
     // A fresh copy per call: whatever the strategy does to it reaches nothing.
     this.#call('on_market_open', this.#preSettleMarket());
@@ -1052,10 +830,8 @@ export class MarketReplay {
    */
   step(ev) {
     if (this.ended) return false;
-    // QUIET (DATASETS.spot): no hook, no book, recorder or maker work, not
-    // counted as an event seen or a budget sample -- declaring spot changes
-    // nothing but what ctx.spot() and ctx.twap_locked() return. A feed latency
-    // delays it like every event.
+    // Spot events update only spot/TWAP helpers: no hooks, book changes,
+    // recorder, maker work or budget samples. Feed latency still applies.
     if (ev.kind === 'spot') {
       if (ev.ts_ms > this.closeTs) return false;
       if (this.global && this.feedLatency > 0) this.#schedule(ev.ts_ms + this.feedLatency, 'arrival', ev);
@@ -1066,10 +842,8 @@ export class MarketReplay {
     this.lastTs = ev.ts_ms;
     if (ev.ts_ms > this.closeTs) { this.ended = true; return false; }
     if (this.recordMs) this.#recordStart(ev.ts_ms);
-    // Everything scheduled strictly BEFORE this event resolves against the book
-    // as it stood then — draining after applying the event would fill a delayed
-    // order against depth that arrived after it. (Global mode: the harness's
-    // scheduler already ran every job before this instant, in every market.)
+    // Drain earlier jobs against the earlier book before applying this event.
+    // In global mode, the harness already drained jobs across all markets.
     if (!this.global) this.drainUntil(ev.ts_ms - 1);
     this.#recordBefore(ev.ts_ms);
     this.control.setNow(ev.ts_ms);
@@ -1080,22 +854,19 @@ export class MarketReplay {
     }
 
     if (ev.kind === 'book') {
-      // BEFORE the snapshot test, because a bound carries snapshot:false and
-      // would otherwise be applied as a delta with no ladder, no price and no
-      // size — which Book.delta rejects by throwing, taking the whole run with
-      // it.
+      // Test bounds first: they carry snapshot:false but are not deltas.
       const apply = () => applyEvent(this.book, ev, this.generic);
       if (maker) maker.bookEvent(ev, this.book, apply);
       else apply();
     } else if (ev.kind === 'trade' && maker) {
-      // Resting orders see the print BEFORE any hook does, and an order a hook
+      // Resting orders see the print before any hook does, and an order a hook
       // returns now cannot consume it (see PRINT_LAG_MS).
       maker.trade(ev, this.book);
     }
     if (!this.global) this.drainUntil(ev.ts_ms);
 
     // A feed latency: the strategy hears of this event later, from its own
-    // (local) book — the exchange book above has already moved.
+    // (local) book; the exchange book above has already moved.
     if (this.global && this.feedLatency > 0) {
       this.#schedule(ev.ts_ms + this.feedLatency, 'arrival', ev);
       return true;
@@ -1103,22 +874,10 @@ export class MarketReplay {
 
     if (ev.kind === 'tick') this.control.pushTick(ev);
 
-    // A BOUND REFINES THE BOOK SILENTLY. Three reasons it must not reach a hook,
-    // and the first one alone is enough:
-    //
-    //  - The event has no `levels`, `ladder`, `px` or `size`. Handing it to
-    //    on_book gives a documented SDK input a shape no documentation
-    //    describes, and a strategy reading ev.levels gets undefined.
-    //  - This stream is UNTHROTTLED — 1.3M rows in a day of BTC-5m against a
-    //    price_change stream thinned to 20-500ms. Firing a hook on each would
-    //    multiply hook invocations several-fold inside a 20-minute wall clock,
-    //    and a run that times out is refunded in full at our cost.
-    //  - Nothing is lost by staying quiet: ctx.book() is live, so the next real
-    //    event already sees the refined ladder. Pruning only ever REMOVES
-    //    liquidity, so not waking a strategy cannot cost it an opportunity that
-    //    existed — which is the direction this engine resolves ambiguity in.
-    //
-    // MUST MATCH otreplay.py. Both engines or neither.
+    // BBO bounds refine the book without on_book: they lack depth fields and
+    // the unthrottled stream would multiply hook calls. The next regular event
+    // sees the pruned book. Bounds only remove liquidity.
+    // Keep in sync with otreplay.py.
     const hook = ev.bbo ? null : HOOK_FOR[ev.kind];
     if (hook && this.hooks[hook]) this.#emit(this.#call(hook, ev), ev.ts_ms);
     this.#checkBudget();
@@ -1128,10 +887,10 @@ export class MarketReplay {
   /**
    * Generic markets: trading ends. Everything scheduled up to trade_until
    * executes, resting orders expire and their short markouts resolve against
-   * the book as it stood, the rest is dropped — and an unresolved market's
+   * the book as it stood, the rest is dropped; and an unresolved market's
    * open legs are valued at the decoder's mark. Idempotent: session mode calls
    * it at trade_until and close() calls it again.
-   * MUST MATCH end_trading in otreplay.py.
+   * Keep in sync with end_trading in otreplay.py.
    */
   endTrading() {
     if (!this.generic || this.tradingEnded) return;
@@ -1187,19 +946,14 @@ export class MarketReplay {
 
   /**
    * `nowTs` (global mode, session): the time line's own position when the close
-   * is processed — on_settle never sees the clock go back, while the payout is
+   * is processed; on_settle never sees the clock go back, while the payout is
    * still booked at the declared close.
    */
   close(nowTs = null) {
     this.closeNow = this.global && typeof nowTs === 'number' && Number.isFinite(nowTs) ? nowTs : null;
     if (this.generic) return this.#closeGeneric();
-    // Anything still queued lands AT THE CLOSE — not at its own future
-    // timestamp. Draining to Infinity executed a delayed order stamped after the
-    // market had already closed, producing trade rows with opened_ms later than
-    // closed_ms and letting late fills trade against a book that no longer
-    // existed. An order that had not landed by the close did not land.
-    // With no declared close, the last event seen IS the close — tracked as the
-    // stream went past, because there is no array to look back into.
+    // Drain through close, then drop future jobs. Without a declared close,
+    // use the last event seen while consuming the stream.
     const settleTs = this.declaredClose ?? this.lastTs;
     this.control.setNow(settleTs);
     this.drainUntil(settleTs);
@@ -1221,8 +975,7 @@ export class MarketReplay {
     return {
       marketId: this.marketId,
       asset: this.market.asset ?? null,
-      // What the engine PULLED, not what the caller had. With a stream the
-      // latter is unknowable without draining, and not draining is the point.
+      // Count consumed events without draining the remaining stream.
       events: this.seen,
       spot_seen: this.control.spotSeen,
       settled,
@@ -1237,7 +990,7 @@ export class MarketReplay {
   }
 }
 
-/** Same-millisecond order of a market's jobs in global mode. MUST MATCH otreplay.py. */
+/** Same-millisecond order of a market's jobs in global mode. Keep in sync with otreplay.py. */
 const JOB_RANK = Object.freeze({ order: 0, activate: 0, cancel: 0, flatten: 0, arrival: 1, timer: 2 });
 export const MAX_PENDING_TIMERS = 64;
 export const MAX_TIMERS_CREATED = 10_000;
@@ -1252,11 +1005,8 @@ function applyEvent(book, ev, generic) {
 }
 
 /**
- * The order rules a market trades under: `{tickTicks, minSize}`.
- * "assumed" carries the venue constants; "venue" reads the market's own
- * metadata, which the generic decoder already refused when it was missing or
- * not representable — this is the second door. MUST MATCH market_rules in
- * otreplay.py.
+ * Market rules {tickTicks, minSize}: assumed constants or venue metadata.
+ * Validate metadata here too. Keep in sync with market_rules in otreplay.py.
  */
 function marketRules(rules, market) {
   const tick = rules.mode === 'venue' ? market.tick_size : rules.tick;
@@ -1270,11 +1020,9 @@ function marketRules(rules, market) {
 }
 
 /**
- * What a hook sees of a GENERIC market before it settles: a fresh deep copy of
- * a whitelist. Not "the record minus outcome" — the record carries more than
- * one future fact (resolution time and source, a trading end derived from the
- * resolution), and a nested object handed over by reference could be written
- * to. MUST MATCH generic_view in otreplay.py.
+ * Deep-copy a whitelist for generic pre-settlement views. Exclude outcome,
+ * resolution time/source and trading ends derived from resolution.
+ * Keep in sync with generic_view in otreplay.py.
  */
 const GENERIC_VIEW = [
   'market_id', 'kind', 'venue', 'question', 'slug', 'token_ids', 'labels', 'fee',
@@ -1287,20 +1035,15 @@ export function genericView(market) {
     const v = market[k];
     out[k] = v == null ? null : (typeof v === 'object' ? JSON.parse(JSON.stringify(v)) : v);
   }
-  // The name archive strategies read. Only a DECLARED trading end — never one
+  // The name archive strategies read. Only a declared trading end; never one
   // derived from the resolution, which would date the outcome.
   out.close_ts_ms = market.trading_end_ts_ms ?? null;
   return out;
 }
 
 /**
- * Replay one market start to finish.
- *
- * `events` is any ITERABLE, not necessarily an array. The harness passes a
- * generator that pulls one line off stdin per step, so the future is not in the
- * process at all — which is what the docs claim and what was previously only
- * approximately true. Nothing below may index it, take its length, or look
- * ahead in it.
+ * Replay from any iterable. The harness pulls stdin one line at a time;
+ * do not index, measure length or read ahead in events.
  */
 export function replayMarket(args) {
   const r = new MarketReplay(args);

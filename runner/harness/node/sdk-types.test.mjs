@@ -1,19 +1,6 @@
-// Guards the TypeScript declarations against drifting from the runtime.
-//
-// The SDK ships as plain ESM with a hand-written index.d.ts. That is not
-// laziness: index.mjs is loaded directly by the API, by the worker and by the
-// harness INSIDE the sandbox, none of which have a build step, and adding one
-// would put a compiled artefact on the path that runs untrusted code.
-//
-// The cost of hand-writing is that the declarations can drift. This file is the
-// price paid for that choice:
-//
-//   1. a real TypeScript strategy must compile under `strict`
-//   2. code that should NOT type-check must fail to
-//   3. every runtime export must be declared, and vice versa
-//
-// Without (2) in particular the first test would pass against declarations that
-// typed everything as `any`.
+// Check hand-written SDK declarations against the plain ESM runtime.
+// Compile a strict strategy, reject invalid examples and compare exports.
+// Negative cases prevent overly broad types such as any from passing unnoticed.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -71,9 +58,7 @@ test('a real TypeScript strategy compiles against the declarations', async () =>
   assert.ok(ok, `types.test-d.ts no longer compiles:\n${out}`);
 });
 
-// Each of these MUST fail to compile. If any starts passing, the declarations
-// have gone loose — most likely something became `any` — and the test above
-// would keep passing while telling us nothing.
+// Each invalid example must fail strict compilation.
 const MUST_NOT_COMPILE = [
   ['a side that is not an outcome token', `
     import { Order } from './sdk/index.js';
@@ -111,8 +96,7 @@ const MUST_NOT_COMPILE = [
     import type { Market } from './sdk/index.js';
     export function f(m: Market): string { return m.outcome; }
   `],
-  // on_book gets the CHANGE, not the book. Declaring it as a BookView made
-  // `event.best()` type-check, and it throws on the first book event.
+  // on_book receives the change event, not a BookView.
   ['reading the book off a book event, which carries only the change', `
     import type { BookEvent } from './sdk/index.js';
     export function f(e: BookEvent) { return e.best('UP'); }
@@ -126,10 +110,8 @@ const MUST_NOT_COMPILE = [
     import { Order } from './sdk/index.js';
     export function onTick(ctx: Ctx, t: Tick): Order | null { return 'buy'; }
   `],
-  // Sizing in money: the two ways of stating a size are mutually exclusive,
-  // and the money one has no meaning without a price ceiling. Both are
-  // rejected at run time too — this is the version you find out about while
-  // typing rather than after paying for a run.
+  // Size and notional are mutually exclusive; notional requires a price ceiling.
+  // Match runtime validation.
   ['a size and a notional at once', `
     import { Order } from './sdk/index.js';
     export const o = new Order({ side: 'UP', size: 1, notional: 80, limit: 0.5 });
@@ -164,14 +146,8 @@ test('every runtime export is declared, and every declared value exists', async 
   assert.match(dts, /export default/, 'index.d.ts declares no default export');
 });
 
-// The declarations against what the decoder REALLY hands a hook.
-//
-// on_book was declared as receiving a BookView while every engine passed the
-// raw event, so `event.best()` type-checked and threw on the first book row.
-// Hand-written fixtures would only prove the declarations agree with
-// themselves; these events come out of runner/events.mjs, and each one is
-// assigned as an object literal under `strict`, so a field the runtime sends
-// that the type lacks, or a required field it does not send, is a compile error.
+// Assign decoder-produced events as object literals under strict checking
+// to catch missing, extra or incorrectly required fields.
 test('real decoded events type-check against Tick, BookEvent and TradeEvent', async () => {
   const { eventsFromRow, buildSlugIndex, indexMarkets } = await import('../../events.mjs');
   const UP = '38293413631092421766722553077150584523582731647519935429040512234425496259883';

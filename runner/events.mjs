@@ -1,14 +1,5 @@
-// Turning archived rows into replayable events.
-//
-// Extracted so the two things that read the archive share ONE implementation:
-// the worker (which streams it out of R2) and the `ot` CLI (which reads a
-// cloned sample repo off disk). They differ only in where the bytes come from.
-//
-// The lesson this is applying is the one runner/conformance already enforces
-// for the two engines: two implementations of the same rules drift, and the
-// drift is silent. "The identical files, byte for byte, with the same checksums"
-// is a published promise about `ot run` versus a queued run — it cannot be true
-// if local and remote decode the archive differently.
+// Decode archived rows into replay events. Shared by the hosted worker and
+// `ot run` so local and remote reads use the same rules.
 
 import { classifyPath } from '../api/lib/data-taxonomy.mjs';
 import { resolveSettlementStream, degradingCoverage, inputKeys } from '../api/lib/backtest-datasets.mjs';
@@ -18,11 +9,7 @@ import { OUTCOME_TIE, OUTCOMES, FEE_MODEL_PM } from './engine/portfolio.mjs';
 
 /**
  * Coerce a field to a number, or null.
- *
- * The empty check is load-bearing: `Number('')` is 0, not NaN, and an empty CSV
- * cell is the normal case. Without it a missing `close_ts_ms` becomes 0 — a
- * market that closed at the Unix epoch — and settlement and hold expiry both
- * behave nonsensically off it.
+ * Check empty CSV cells before conversion: Number('') would turn missing times into 0.
  */
 export const num = (v) => {
   if (v == null) return null;
@@ -45,25 +32,18 @@ export function parseLevels(v) {
 }
 
 /**
- * A market's own record, normalised across venues.
- *
- * WRITTEN AGAINST THE ARCHIVE, not against a guess at it. The previous version
- * read `open_ts_ms`, `close_ts_ms`, `interval` and `outcome` — none of which
- * the archive publishes. Every market therefore came out with a null window,
- * every event was cut by the window filter, and every run in the product's life
- * reported "no market data could be read". The shapes below were taken from
- * real objects; do not adjust one without looking at one.
+ * Normalise market metadata across venues. Match these fields to archive rows.
  *
  * Polymarket:
  *   {slug, asset:"btc", interval_sec:900, condition_id, token_ids:[UP, DOWN],
  *    start_sec, end_sec, resolved, outcome_prices:["0","1"], strike_value, raw}
- *   `strike_value` is scaled by 1e18; `outcome_prices[0]` is the UP token.
+ *   strike_value is scaled by 1e18; outcome_prices[0] is the UP token.
  *
  * Predict:
  *   {category_slug, asset:"btc", interval_label:"15m", market_id:1506956,
  *    price_feed_id, price_feed_symbol, price_feed_provider, condition_id,
  *    start_sec, end_sec, start_price:"627.505", end_price:"628.265", status}
- *   Prices are plain decimals and settlement is end_price vs start_price.
+ *   Prices are decimal values; settlement compares end_price to start_price.
  */
 
 /** `900` -> `"15m"`, `86400` -> `"1d"`. Null when the venue states it directly. */
@@ -77,13 +57,8 @@ function intervalLabel(seconds) {
 }
 
 /**
- * Which side of a Polymarket market a token id belongs to.
- *
- * VERIFIED AGAINST SETTLED MARKETS, not assumed: for 64 of 64 resolved
- * 15-minute markets on 2026-08-20, `outcome_prices[0] === '1'` coincided
- * exactly with the settlement price closing above the strike. So `token_ids[0]`
- * is UP. Getting this backwards would mirror every strategy's P&L while the
- * report still looked entirely reasonable.
+ * Map a Polymarket token id to its outcome side.
+ * The archive orders token_ids as [UP, DOWN], confirmed on 64 resolved 15m markets.
  */
 function sideOfToken(market, assetId) {
   const ids = market?.token_ids;
@@ -95,10 +70,8 @@ function sideOfToken(market, assetId) {
 }
 
 /**
- * UP, DOWN, or null — never a guess.
- *
- * Polymarket writes the settled pair as `["1","0"]` (the UP token paid) or
- * `["0","1"]`. Anything else is a row we cannot read.
+ * Read UP or DOWN from a settled binary pair, otherwise null.
+ * Polymarket uses ["1","0"] for UP and ["0","1"] for DOWN.
  */
 function polymarketOutcome(row) {
   if (row?.resolved !== true) return null;
@@ -111,22 +84,12 @@ function polymarketOutcome(row) {
 }
 
 /**
- * A Polymarket market's taker fee schedule, normalised — or null.
- *
- * Three answers, kept apart because a report has to say which it was:
- *   `{model:'polymarket-taker-v1', rate}` — the venue charges takers
- *       C × rate × p × (1 − p) on this market (see feeFor in portfolio.mjs);
- *   `{model:'none'}` — the market says fees are off: a KNOWN zero;
- *   null — we could not read a schedule we understand: UNKNOWN, charged
- *       nothing and counted, never guessed at.
- *
- * Read against the archive (2026-09-08 sample: every market carries
- * `feesEnabled:true, feeSchedule:{rate:0.07, exponent:1, takerOnly:true,
- * rebateRate:0.2}`). Only `exponent: 1` is the formula the venue documents;
- * anything else is a curve we have not seen and is unknown. `rebateRate` is
- * the maker rebate, and this engine never makes.
- *
- * MUST MATCH `_fee_of` in client/backtest/decode.py.
+ * Normalised taker fee schedule of a Polymarket market:
+ *   {model: 'polymarket-taker-v1', rate}  fees on: C × rate × p × (1 − p)
+ *   {model: 'none'}                       fees off (known zero)
+ *   null                                  missing or unknown, charged 0
+ * Only exponent 1 is accepted. rebateRate is separate from this taker schedule.
+ * Keep in sync with _fee_of in client/backtest/decode.py.
  */
 export function feeOf(row) {
   const raw = row?.raw;
@@ -145,17 +108,10 @@ export function feeOf(row) {
 function polymarketRecord(row) {
   const openMs = num(row.start_sec) == null ? null : num(row.start_sec) * 1000;
   const closeMs = num(row.end_sec) == null ? null : num(row.end_sec) * 1000;
-  // The strike is published at full accuracy, scaled by 1e18 — the same value
-  // that appears in the settlement stream's `full_accuracy_value` column.
+  // strike_value uses 1e18 scaling, as does settlement full_accuracy_value.
   const strikeRaw = num(row.strike_value);
-  // The outcome is read from a COMPLETE binary pair, or not at all.
-  //
-  // `prices[0] === '1' ? UP : DOWN` made every other value a DOWN — `[]`, `['']`,
-  // `['0.5']`, a drifted schema, a truncated row. A settled position is priced
-  // at $1/$0 off this field, so one unreadable metadata row would have inverted
-  // a market's P&L, its baseline and its crosschecks while still looking like a
-  // perfectly ordinary resolved market. Fail-closed, like every other
-  // settlement fact here: null, and the fetcher drops the market-day.
+  // Require a complete settled pair. Unreadable outcomes remain null so
+  // marketUnusable rejects them rather than treating them as DOWN.
   const outcome = polymarketOutcome(row);
   return {
     market_id: String(row.condition_id ?? row.slug ?? ''),
@@ -167,9 +123,8 @@ function polymarketRecord(row) {
     open_ts_ms: openMs,
     close_ts_ms: closeMs,
     stream: resolveSettlementStream(row),
-    // null (not []) marks a Polymarket market whose [Up, Down] pair is
-    // unusable — marketUnusable drops it. Predict records keep [] (their book
-    // rows are not attributed through token ids).
+    // null marks an unusable Polymarket [Up, Down] pair. Predict uses []
+    // because its book rows are not routed by token id.
     token_ids: upDownPair(row.token_ids),
     fee: feeOf(row),
     raw: row,
@@ -189,29 +144,8 @@ function predictRecord(row) {
   const closeMs = num(row.end_sec) == null ? null : num(row.end_sec) * 1000;
   const start = num(row.start_price);
   const end = num(row.end_price);
-  // `end_price` is the settlement marker, NOT `status`.
-  //
-  // This used to require status === 'RESOLVED', on the theory that an OPEN
-  // market's prices are live quotes rather than a settlement. Both halves were
-  // wrong. `end_price` is written only by the settlement backfill, which is
-  // driven by `end_price IS NULL` and drops a market from its re-read queue the
-  // moment it lands — so `status` is whatever the venue last said while we were
-  // still polling, and it freezes there. There is no row in the whole table
-  // with status RESOLVED and no end_price, so the implication runs one way
-  // only: end_price present ⇒ settled.
-  //
-  // MEASURED 2026-09-08, all assets: 1245 markets, every one of them with an
-  // end_price, but only 1104 said RESOLVED. The check discarded 39/873 of the
-  // 5-minute markets (4.5%) and 21/291 of the 15-minute ones (7.2%) — reported
-  // to the customer as "outcome could not be read" while the outcome was right
-  // there, and billed for, because a market-day charges whole.
-  //
-  // A TIE IS ITS OWN OUTCOME. Predict.fun settles end_price == start_price
-  // 50:50 — every UP and every DOWN contract pays $0.50 (`contractValue`).
-  // It used to be dropped because the engines only knew UP/DOWN, which cost the
-  // customer 0.53–1.20% of the 5-minute markets they paid for, reported as
-  // "outcome could not be read". Never "fix" a tie by picking a side: half of
-  // them would be scored backwards.
+  // end_price marks settlement; status may retain its last polled value.
+  // Equal start and end prices produce TIE, paying $0.50 per outcome contract.
   let outcome = null;
   if (start != null && end != null) {
     outcome = end > start ? 'UP' : end < start ? 'DOWN' : OUTCOME_TIE;
@@ -225,16 +159,8 @@ function predictRecord(row) {
     outcome,
     open_ts_ms: openMs,
     close_ts_ms: closeMs,
-    // Predict settles on its own price feed, named by the market. There is no
-    // TWAP variant in this tree, so the stream is `prices` — but WHICH file
-    // that is depends on `price_feed_id`.
-    //
-    // FAIL-CLOSED, like every other settlement question here: a market whose
-    // feed id cannot be read has no stream, so the fetcher drops the market-day
-    // rather than run it against whichever price file happened to match the
-    // asset. A dropped day is visible in coverage and costs the customer
-    // nothing; a market settled off another feed's price is invisible and makes
-    // the whole report a lie.
+    // Predict settles on the price_feed_id named by the market. An unreadable
+    // id leaves stream null so marketUnusable rejects it.
     stream: num(row.price_feed_id) == null ? null : 'prices',
     price_feed_id: num(row.price_feed_id),
     token_ids: [],
@@ -243,11 +169,8 @@ function predictRecord(row) {
 }
 
 /**
- * Index the markets of one day, keyed by the id its event rows carry.
- *
- * Both venues get the SAME record shape, because everything downstream — the
- * engine, the SDK, the report — is venue-agnostic. The differences are absorbed
- * here and nowhere else.
+ * Index a day's markets by the id carried in event rows.
+ * Normalise both venues to the same downstream record shape.
  */
 export function indexMarkets(rows, { venue = 'polymarket' } = {}) {
   const byId = new Map();
@@ -261,11 +184,8 @@ export function indexMarkets(rows, { venue = 'polymarket' } = {}) {
 }
 
 /**
- * Look up a market from the identifiers an event row actually carries.
- *
- * Polymarket event rows name the market by `slug` — NOT by the `condition_id`
- * the markets tree is keyed on — so a straight id lookup finds nothing. Predict
- * rows carry the numeric `market_id` directly.
+ * Resolve event identifiers: Polymarket rows use slug rather than condition_id;
+ * Predict rows use numeric market_id.
  */
 function marketForRow(row, markets, bySlug) {
   const direct = row.market_id ?? row.marketId ?? null;
@@ -276,13 +196,8 @@ function marketForRow(row, markets, bySlug) {
 }
 
 /**
- * `[{price, size}]` or `[[px, size]]` -> `[[px, size]]`, unusable entries dropped.
- *
- * An outcome token pays 0 or 1, so a price outside that range is not a cheap
- * quote — it is a row we cannot read. Dropped rather than passed on: the engine
- * matches against the best price it is given, so a negative one becomes the
- * best bid in the book and quietly poisons every fill after it. Mirroring makes
- * it worse, turning one bad row into a bad row on the other side too.
+ * Normalise [{price,size}] or [[px,size]] to [[px,size]], dropping bad levels.
+ * Prices must be in [0,1] before matching or mirroring.
  */
 function ladder(levels) {
   if (!Array.isArray(levels)) return [];
@@ -299,12 +214,8 @@ function ladder(levels) {
 }
 
 /**
- * The mirror of a UP-side ladder: a bid at 0.4 for UP is an ask at 0.6 for DOWN.
- *
- * Only reachable with prices already inside [0, 1], so the result is too — but
- * asserted rather than assumed, because this is the step that would turn one
- * unnoticed bad row into a negative price the engine treats as the best in the
- * book.
+ * Mirror a UP ladder: a UP bid at 0.4 becomes a DOWN ask at 0.6.
+ * Validate the mirrored price remains in [0,1].
  */
 function mirror(levels) {
   const out = [];
@@ -317,56 +228,24 @@ function mirror(levels) {
 }
 
 /**
- * Thin a venue's book stream to one cadence for the whole run.
- *
- * The archive was captured at different densities at different times, and a run
- * spanning a change would otherwise fill differently in its first month than in
- * its last — with nothing in the report saying why, because the backtest
- * deliberately does not make a reader think about capture rates at all. So the
- * finer days are thinned to match the coarsest one in range, and there is no
- * boundary left to notice.
- *
- * THE SAME RULE THE COLLECTOR APPLIES: at most one row per market per window,
- * keeping the first. A thinned day is therefore byte-for-byte the shape a
- * coarser day already has, rather than an approximation of one.
- *
- * ONE CADENCE PER ASSET PER RUN — NOT ONE PER RUN. The window is the coarsest
- * THAT ASSET had anywhere in the range, so a single asset's series never
- * changes density partway through, which is the artefact a reader could
- * actually notice. Levelling every asset to the run-wide coarsest was the other
- * candidate and is worse on both counts that matter:
- *
- *   - It makes a result depend on the basket. The same BTC strategy over the
- *     same days would return different numbers because SOL was also ticked,
- *     and "why did adding an asset change my BTC P&L" has no honest answer.
- *   - It throws away the finer data almost always. Every 500ms asset in a
- *     basket would drag BTC back to 500ms, so the 20ms capture would go unused
- *     in any multi-asset run — while accuracy is the whole reason it exists.
- *
- * Different assets legitimately differ in density anyway: BTC's book really
- * does move more than DOGE's. What is not legitimate is the SAME book changing
- * density on a date, and that is what this removes.
- *
- * Only the delta/snapshot stream is thinned — Polymarket's `price_change` and
- * Predict's `orderbook`. Settlement ticks, trades and market metadata were
- * never throttled and are not touched.
+ * Thin book updates to the coarsest captured cadence per asset in the run.
+ * This avoids density changes across dates without making one asset's result
+ * depend on other assets in the run.
+ * Keep the first row per market in each window, as the collector does.
+ * Only Polymarket price_change and Predict orderbook are thinned; settlement
+ * ticks, trades and metadata are unchanged.
  */
 const THROTTLED = Object.freeze({ polymarket: 'price_change', predict: 'orderbook' });
 
 export function makeBookThrottle({ venue, assets = [], from, to }) {
   const dataset = THROTTLED[venue];
-  // One window per asset in scope, and the coarsest of them for anything whose
-  // asset we cannot tell — a row we cannot attribute must not be thinned less
-  // than the rows we can.
+  // Use per-asset windows; unidentified assets use the coarsest window.
   const perAsset = new Map();
   for (const a of assets) {
     perAsset.set(String(a).toUpperCase(), bookThrottleMs({ venue, asset: a, from, to }));
   }
-  // The floor for anything we cannot attribute — including the case where the
-  // caller passed no asset list at all. Deriving it from `assets` made an empty
-  // list mean "no throttling", which is fail-OPEN: a local `ot run` would then
-  // replay denser than the queue does, and "it passed locally" would stop
-  // meaning anything. `'*'` asks the table directly.
+  // Resolve the unidentified-asset floor from the table even with no asset list,
+  // so an empty list cannot disable throttling.
   const fallback = bookThrottleMs({ venue, asset: '*', from, to });
   const last = new Map();
   return {
@@ -380,12 +259,8 @@ export function makeBookThrottle({ venue, assets = [], from, to }) {
     get untouched() { return last.size === 0; },
 
     /**
-     * The window this gate will actually use for an asset.
-     *
-     * Asked rather than recomputed: the decoded-day cache is keyed on the
-     * cadence a day was thinned at, and a caller working that out for itself
-     * would be a second implementation of the rule that decides it — which is
-     * how a cache ends up serving a 500ms day to a run that asked for 20ms.
+     * Return the window used for this asset. Decoded-cache keys use this value
+     * to avoid reusing data thinned at a different cadence.
      */
     windowFor(asset) {
       if (dataset == null) return 0;
@@ -405,10 +280,8 @@ export function makeBookThrottle({ venue, assets = [], from, to }) {
       if (ms === 0) return true;
       const key = String(marketId);
       const prev = last.get(key);
-      // The FIRST row in each window, exactly as the collector keeps it. A
-      // window is measured from the row that opened it, not from a fixed grid:
-      // a grid would keep a different row than the collector did on a day it
-      // was actually throttling, and the two would disagree about the same day.
+      // Keep the first row in a window measured from the previous kept row.
+      // A fixed time grid would differ from the collector's sampling rule.
       if (prev != null && ts - prev < ms) return false;
       last.set(key, ts);
       return true;
@@ -417,26 +290,21 @@ export function makeBookThrottle({ venue, assets = [], from, to }) {
 }
 
 /**
- * The events one archived row produces, as [marketId, event] pairs.
+ * Decode an archive row to [marketId, event] pairs.
+ * Settlement rows fan out only to markets whose config names that stream.
  *
- * A settlement-feed row belongs to every market that settles on THAT stream —
- * which is decided per market from its own config, never from the date. One row
- * therefore fans out to many markets, and a row for a stream no market in scope
- * settles on produces nothing.
- *
- * @param {string} filePath   the archive path the row came from
+ * @param {string} filePath   archive path of the row
  * @param {object} row
  * @param {Map} markets       from indexMarkets
- * @param {Map} bySlug        slug -> record, built once by the caller
+ * @param {Map} bySlug        slug -> record, built by the caller
  */
 export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = null, { spot = false } = {}) {
   const meta = classifyPath(filePath);
   const slugIndex = bySlug ?? buildSlugIndex(markets);
 
   if (meta.dataset === 'prices' || meta.dataset === 'twap30s' || meta.dataset === 'twap60s') {
-    // Polymarket: `feed_ts_ms,value,...`. Predict: `...,publish_time,server_ts,price,recv_ms`
-    // with publish_time in SECONDS. Reading only one of the two spellings is
-    // how a whole venue ends up with no ticks at all.
+    // Polymarket uses feed_ts_ms/value. Predict uses publish_time/price,
+    // with publish_time in seconds (server_ts is also seconds; recv_ms is ms).
     const pubSec = num(row.publish_time);
     const ts = num(row.feed_ts_ms ?? row.ts_ms ?? row.timestamp_ms ?? row.event_ts_ms)
       ?? (pubSec == null ? null : pubSec * 1000);
@@ -448,24 +316,14 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
     for (const [id, m] of markets) {
       if (m.stream !== meta.dataset) continue;
       if (m.asset && meta.asset && String(m.asset) !== String(meta.asset)) continue;
-      // Predict publishes one file per feed, and a market settles on its own.
-      // STRICT EQUALITY, so an unreadable id on either side drops the row
-      // instead of letting it through: the old condition only rejected when
-      // BOTH sides parsed, so a price file with a missing or drifted column fed
-      // every market of that asset — not an empty report, but plausible-looking
-      // ticks from the wrong feed.
+      // Require matching readable feed ids; each Predict market uses its own feed.
       if (m.price_feed_id != null) {
         const rowFeed = num(row.price_feed_id);
         if (rowFeed == null || rowFeed !== m.price_feed_id) continue;
       }
-      // WINDOWED AT EMIT, not afterwards.
-      //
-      // The settlement stream is a whole day — 75,250 rows for twap60s — and a
-      // day of BTC is roughly 384 markets once 5- and 15-minute books are both
-      // in scope. Fanning every row out to every market and trimming later is
-      // 29 million objects held at once, which is an out-of-memory kill on a
-      // 2GB worker rather than a slow day. A market wants the ticks inside its
-      // own window and nothing else, so that is what it is given.
+      // Clip settlement fan-out to each market's window before allocating events.
+      // A BTC day with 75,250 twap60s rows and 384 markets would otherwise
+      // allocate about 29 million events before filtering.
       if (m.open_ts_ms != null && ts < m.open_ts_ms) continue;
       if (m.close_ts_ms != null && ts > m.close_ts_ms) continue;
       out.push([id, {
@@ -474,16 +332,14 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
         market_id: id,
         value,
         source: meta.dataset,
-        // Three timestamps kept apart on every row: it is what lets a fill be
-        // re-priced at an arbitrary delay instead of assumed instant.
+        // Keep feed, receive and event times separate for latency modelling.
         server_ts_ms: num(row.server_ts_ms) ?? (serverSec == null ? null : serverSec * 1000),
         recv_ts_ms: num(row.recv_ts_ms ?? row.recv_ms),
       }]);
     }
-    // SPOT, when the run declared it: Polymarket's 1 Hz report stream to EVERY
-    // market of its asset, whatever that market settles on, inside the same
-    // window. A different kind, so nothing that reads ticks sees it (see
-    // DATASETS.spot); ordered before ticks within a millisecond (finaliseMarket).
+    // When declared, send the 1 Hz Polymarket spot stream to all markets of
+    // its asset within their windows. It is separate from settlement ticks
+    // and sorts before them at equal timestamps.
     if (spot && meta.dataset === 'prices' && meta.venue === 'polymarket' && meta.asset) {
       const serverMs = num(row.server_ts_ms) ?? (serverSec == null ? null : serverSec * 1000);
       const recvMs = num(row.recv_ts_ms ?? row.recv_ms);
@@ -502,15 +358,13 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
   const id = market.market_id;
   const ts = num(row.event_ts_ms ?? row.update_ts_ms ?? row.ts_ms ?? row.timestamp_ms);
   if (ts == null) return [];
-  // Applied HERE, once, so both readers get it by decoding rather than by each
-  // remembering to. See makeBookThrottle.
+  // Apply the shared book throttle during decoding (see makeBookThrottle).
   if (throttle && !throttle.keep(meta.dataset, id, ts, market.asset)) return [];
   const payload = row.payload ?? row;
 
   if (meta.dataset === 'orderbook') {
-    // ONE normalised ladder per Predict market, on the UP side: 28,677 rows
-    // sampled and not one had a bid at or above the best ask, which is what a
-    // single book looks like. DOWN is its mirror, never a second stream.
+    // Predict supplies a UP ladder; derive DOWN by mirroring it.
+    // In 28,677 sampled rows, no bid met or exceeded the best ask.
     const asks = ladder(payload.asks);
     const bids = ladder(payload.bids);
     return [[id, {
@@ -525,17 +379,12 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
   }
 
   if (meta.dataset === 'book') {
-    // Polymarket publishes ONE SIDE PER ROW, named by asset_id. Merging the two
-    // is the reader's job; a row that names a token this market does not own is
-    // not ours.
+    // Polymarket rows describe one outcome, identified by asset_id.
+    // Ignore tokens outside this market.
     const side = sideOfToken(market, row.asset_id ?? payload.asset_id);
     if (!side) return [];
-    // ONLY THE SIDE THIS ROW IS ABOUT. An empty object for the other side is
-    // not "no information" to the engine — `Book.snapshot` resets whichever
-    // sides it is given, and an empty ladder is a side it was given. Sending
-    // both meant a UP snapshot wiped DOWN, the next DOWN snapshot wiped UP, and
-    // a strategy only ever saw whichever side arrived last. Omitting the key
-    // leaves that side untouched, in both engines.
+    // Include only the named side. Book.snapshot resets each supplied side,
+    // so an empty ladder for the other side would erase it.
     return [[id, {
       kind: 'book',
       ts_ms: ts,
@@ -546,46 +395,20 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
   }
 
   if (meta.dataset === 'best_bid_ask') {
-    // TOP OF BOOK AS A BOUND, not as a quote.
-    //
-    // This stream carries prices and no sizes, so it can never say what IS on
-    // the ladder — only what is NOT: "nothing better than this exists right
-    // now". The engine uses it to delete levels the venue has moved past and
-    // never to add one, because a level invented without a size is exactly the
-    // fabricated liquidity this product has had to fix five times.
-    //
-    // Emitted as kind:'book' deliberately: on_book already fires for the book,
-    // a strategy reads the refined ladder rather than this row, and no new hook
-    // or SDK surface appears. `bbo` marks it as a bound so the engine does not
-    // mistake it for a delta with a missing size.
+    // BBO prices have no sizes. Use them only to prune stale levels, never to
+    // add liquidity. Emit a book event with bbo=true so on_book sees the
+    // refined ladder through the existing hook.
     const side = sideOfToken(market, row.asset_id ?? payload.asset_id);
     if (!side) return [];
     const bid = num(payload.best_bid);
     const ask = num(payload.best_ask);
-    // MEASURED, over 900,000 rows across BTC-5m, SOL-15m and DOGE-5m on
-    // 2026-09-04: zero crossed, zero equal, zero outside [0,1], zero
-    // unparseable. So none of these guards fire on today's archive — they are
-    // here because the failure they prevent is silent and total. A garbage
-    // bound is a MAXIMAL deletion instruction: one unreadable row would empty a
-    // ladder, the market would stop filling, and the run would come back with
-    // an honest-looking report of a strategy that could not trade.
-    //
-    // Fail-safe rather than fail-closed, and that is the one place this differs
-    // from the rest of this file: dropping a bbo row costs nothing but the
-    // refinement, leaving the book exactly as it was before 2026-09-02. There
-    // is no wrong answer to propagate, so the market is not dropped.
+    // Ignore malformed bounds: an invalid deletion bound could empty a ladder.
+    // Dropping the row leaves the existing book usable without BBO refinement.
     if (bid == null || ask == null) return [];
     if (bid < 0 || bid > 1 || ask < 0 || ask > 1) return [];
     if (bid > ask) return [];
-    // 0 and 1 need NO special case, which is why the rule is phrased as a
-    // bound. `best_bid = "0"` is how the venue writes "no bid", and deleting
-    // every bid strictly better than 0 deletes all of them — correct. Its
-    // complement is `best_ask = "1"` on the other token of the same market,
-    // because UP + DOWN = 1: measured as an exact pairing, 3228 `bid=0 ask=0.01`
-    // against 3228 `bid=0.99 ask=1`, every count matching. An earlier version of
-    // this rule treated [0.001, 0.999] as the valid domain and would have
-    // thrown away precisely those rows — the ones carrying the MOST definite
-    // information about the book.
+    // Bounds include 0 and 1. A best bid of 0 removes all positive bids;
+    // the complementary best ask of 1 removes asks below 1.
     return [[id, {
       kind: 'book',
       ts_ms: ts,
@@ -607,17 +430,14 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
       const px = num(ch.price);
       const size = num(ch.size);
       if (px == null || size == null) continue;
-      // Same range rule as a snapshot: a delta is applied to the same ladder,
-      // so letting one through here would reach the engine by the other door.
+      // Apply the snapshot price-range validation to delta levels too.
       if (px < 0 || px > 1 || size < 0) continue;
       out.push([id, {
         kind: 'book',
         ts_ms: ts,
         snapshot: false,
         side,
-        // BUY sits on the bid ladder, SELL on the ask ladder. The venue names
-        // the taker's direction, not the book side, so this mapping is the
-        // whole meaning of the row.
+        // BUY updates the bid ladder; SELL updates the ask ladder.
         ladder: String(ch.side).toUpperCase() === 'SELL' ? 'asks' : 'bids',
         px,
         size,
@@ -631,9 +451,7 @@ export function eventsFromRow(filePath, row, markets, bySlug = null, throttle = 
     if (!side) return [];
     const px = num(payload.price);
     const size = num(payload.size);
-    // The same rule the book gets. A trade is a public SDK input a strategy
-    // sizes its own orders off, so a null or negative one is a bad signal, not
-    // a harmless field.
+    // Validate trade prices and sizes before exposing them to strategies.
     if (px == null || px < 0 || px > 1) return [];
     if (size == null || size <= 0) return [];
     return [[id, {
@@ -659,14 +477,8 @@ export function buildSlugIndex(markets) {
 }
 
 /**
- * The coverage block, in ONE shape.
- *
- * The docs promise a local run and a queued run produce "the identical files,
- * byte for byte, with the same checksums". They already shared the decoder and
- * the feed list; the coverage object was still built twice, so `ot run` emitted
- * five keys where the queue emitted ten, and anyone diffing the two saw a
- * schema difference rather than an answer. A field a local run genuinely cannot
- * know is present and null, which is a different statement from absent.
+ * Build the shared coverage schema for local and hosted runs.
+ * Fields a local run cannot determine remain present with null values.
  */
 export function buildCoverage({
   marketDaysRequested = null,
@@ -679,15 +491,8 @@ export function buildCoverage({
   droppedRows = 0,
   unreconciledRows = 0,
   /**
-   * Did the manifest declare `bbo`, and on which of the run's days did the
-   * archive actually have it?
-   *
-   * Always emitted, even when nothing declared it, because these three keys are
-   * the only place a reader can tell which book a report was computed against.
-   * `bbo` refines the ladder by deleting levels the venue has moved past, and a
-   * run over 2026-06-10 and a run over 2026-09-04 both succeed while using two
-   * different books. Same reason `fill_delay_ms` is written out: without it,
-   * whoever holds the archive cannot tell which of the two they have.
+   * Always report whether bbo was declared and where it was decoded.
+   * These fields identify which markets used refined books.
    */
   bboDeclared = false,
   bboDays = [],
@@ -699,55 +504,33 @@ export function buildCoverage({
   return {
     market_days_requested: marketDaysRequested,
     market_days_scanned: marketDaysScanned,
-    // Reported for transparency, never used to bill: this one comes from inside
-    // the sandbox.
+    // Replay counts reported by the sandbox.
     markets_reported_by_runner: marketsReportedByRunner,
-    // Gaps are published, never smoothed over. This is the number the whole
-    // product's credibility rests on.
+    // Include archive gaps in the report.
     missing,
-    // Reference days we could not read. Separate from `missing`, which is about
-    // OUR archive: a customer needs to know which of the two was short, because
-    // only one of them is something they paid us for.
+    // Unreadable reference days, separate from missing archive data.
     reference_declared: referenceDeclared,
     reference_missing: referenceMissing,
     streams,
     dropped_rows: droppedRows,
-    // Rows the harness produced that do not describe a market the caller
-    // supplied. Published rather than swallowed.
+    // Report harness rows that do not match a supplied market.
     unreconciled_rows: unreconciledRows,
-    // Which book this report was computed against. `bbo_missing_days` is not an
-    // error and is not a gap in the archive for the days before 2026-09-02 —
-    // nothing was ever captured then. It is the list of days that ran exactly
-    // as this product ran for its whole life before that stream existed.
+    // Days without decoded BBO refinement, including dates before capture began.
     bbo_declared: bboDeclared,
     bbo_days: bboDays,
     bbo_missing_days: bboMissingDays,
-    // Dates where SOME market-days got the refinement and some did not, each
-    // naming the `asset|interval` that did not. A date is never in more than
-    // one of these three, and the three together are every date scanned.
+    // Partial dates name the asset|interval entries without refinement.
+    // Full, missing and partial lists partition the scanned dates.
     bbo_partial_days: bboPartialDays,
-    // Local-only, and last: a queued run has no source directory to name.
+    // Append the local source directory only for local runs.
     ...(local ? { local: true, source } : {}),
   };
 }
 
 /**
- * Which of a run's days the unthrottled top-of-book stream actually covered.
- *
- * SHARED, for the reason every predicate in this file is shared: `ot run` and
- * the queue have drifted apart nine times, always by each computing a rule the
- * other also computes. This one decides what a report SAYS about itself, so a
- * second copy would let the local run and the queue describe the same archive
- * differently.
- *
- * Days come from the markets actually scanned rather than from the requested
- * range, so the answer describes the run that happened.
- *
- * `bbo_missing_days` is not an error and not a gap in our archive: before
- * 2026-09-02 nothing was captured, so those days ran exactly as this product
- * ran for its whole life before the stream existed. Reported anyway, because
- * two runs that used different books are otherwise indistinguishable — the same
- * reason `fill_delay_ms` is written out.
+ * Summarise decoded BBO coverage over the markets actually scanned.
+ * Missing refinement does not necessarily indicate missing archive data;
+ * some dates precede BBO capture. Shared by local and hosted runs.
  */
 export { inputKeys };
 
@@ -755,19 +538,13 @@ export function bboCoverage({ venue, datasets, markets, applied = null }) {
   if (!(datasets ?? []).includes('bbo')) {
     return { bboDeclared: false, bboDays: [], bboMissingDays: [], bboPartialDays: [] };
   }
-  // MEASURED OR NOTHING. There used to be a fallback that inferred coverage
-  // from CAPTURE_WINDOWS when no measurement was passed, and that is fail-OPEN
-  // for precisely the bug this function exists to prevent: a caller added later
-  // — or a refactor that drops an argument — would silently go back to claiming
-  // a refinement the replay never had. The window says what SHOULD have been
-  // possible; only the decode knows what happened.
+  // Require decode measurements; capture schedules cannot prove rows were replayed.
   if (!applied) {
     throw new Error('bboCoverage: `applied` is required when the manifest declares bbo '
       + '— coverage must be measured from what was decoded, never inferred from the capture window');
   }
 
-  // THE UNIT IS THE MARKET-DAY, the same `asset|day|interval` the run is billed
-  // on. Collapsing to the date makes one asset speak for every asset.
+  // Measure asset|day|interval coverage so one asset cannot stand in for another.
   const byDay = new Map();
   for (const m of markets ?? []) {
     const day = m?.day;
@@ -783,36 +560,21 @@ export function bboCoverage({ venue, datasets, markets, applied = null }) {
     const without = scanned.filter((k) => !got.has(k)).sort();
     if (without.length === 0) full.push(day);
     else if (without.length === scanned.length) none.push(day);
-    // NAMED, not counted. "Some of 2026-09-04 ran on the old book" is not
-    // actionable; "ETH|5m did" is. Same reason uncapturedRange returns the gap.
+    // Name the unrefined asset|interval entries for partial dates.
     else partial.push({ day, without });
   }
   return { bboDeclared: true, bboDays: full, bboMissingDays: none, bboPartialDays: partial };
 }
 
-/**
- * The billing unit: one asset on one UTC day.
- *
- * SHARED, because a run's size is a number the customer is charged for and
- * shown. `ot run` counted MARKETS here and called them market-days — a single
- * day of BTC 15-minute markets is ninety-six of them — so a local report claimed
- * a run a hundred times larger than the queue would bill for, off the same
- * archive.
- */
+/** Count distinct asset|UTC day|interval combinations, shared by both readers. */
 export function countMarketDays(markets) {
-  // THE BILLING UNIT: one asset, one UTC day, one market length.
-  //
-  // The interval is in the key because asking for 5m and 15m replays two
-  // disjoint sets of markets over the same days — twice the data, twice the
-  // work, twice the price. The quote multiplies by the same thing; if these
-  // two ever disagree, `completeRun` refunds the difference and the customer
-  // is charged whichever is smaller, silently.
+  // Include interval: 5m and 15m contain disjoint market sets.
   return new Set(markets.map(
     (m) => `${m.market?.asset ?? 'unknown'}|${m.day}|${m.market?.interval ?? 'none'}`,
   )).size;
 }
 
-/** How many markets settled on each stream. Shared for the same reason. */
+/** Count markets by settlement stream. */
 export function countStreams(items) {
   const out = {};
   for (const m of items) {
@@ -823,42 +585,13 @@ export function countStreams(items) {
 }
 
 /**
- * Why a market cannot be replayed, or null if it can.
- *
- * ONE PREDICATE, because both readers have to agree about which markets exist.
- * A rule written in the worker and not in `ot run` is the same drift the feed
- * selection and the decoder each already produced: the local run replays a
- * market the queue drops, and a market-making strategy — which never looks at
- * the settlement price — is exactly the case that would never notice.
- *
- * Every reason here is fail-closed. A dropped market-day is visible in coverage
- * and costs the customer nothing; a market replayed without its settlement
- * stream, or settled off an outcome we could not read, is invisible and makes
- * the report wrong.
+ * Shared replay eligibility checks for local and hosted readers.
+ * Return a reason for missing metadata, outcomes, or required events.
  */
 /**
- * Put one day's markets in the order they will be replayed.
- *
- * ASSET, THEN OPENING TIME, THEN ID — and shared, because `ot run` and the
- * queue both feed markets to a strategy and a difference here is a difference
- * in what a reader sees from the same archive.
- *
- * The decoder produces market_id order, which is a hash and therefore
- * unrelated to time. Nothing about a RESULT depends on it — state is reset at
- * every on_market_open, which is what lets these be sharded — but `ctx.log`
- * from every market lands in one stream, and a human reads that stream as a
- * timeline. In hash order its timestamps jump hours in both directions for no
- * visible reason.
- *
- * Asset before time so each market-day stays a CONTIGUOUS block:
- * `marketDayPrefix` counts a market-day done when its last market is done, and
- * interleaving two assets pushes both of their last markets to the end of the
- * run — a progress bar that sits still and then jumps, which is the "looks
- * stuck" this channel exists to remove.
- *
- * The id breaks ties because many strikes open at the same instant, and an
- * unstable order would make two runs of the same strategy over the same days
- * emit their logs differently.
+ * Order markets deterministically. Market mode groups by asset, then opening
+ * time and id; session mode uses opening time and id across assets.
+ * Grouping keeps market-days contiguous for marketDayPrefix progress counts.
  */
 export function sortMarketsForReplay(markets, { mode = 'market' } = {}) {
   const byId = (a, b) => {
@@ -868,26 +601,11 @@ export function sortMarketsForReplay(markets, { mode = 'market' } = {}) {
   };
   const byTime = (a, b) => (a.market?.open_ts_ms ?? 0) - (b.market?.open_ts_ms ?? 0);
 
-  // SESSION MODE IS ONE STREAM, so it is ordered by time and by nothing else.
-  //
-  // Session shares one instance and one Portfolio across every market in the
-  // range — the docs call it "one ordered stream across the range" — which
-  // makes the feed order part of the RESULT, not just of the log. Its equity
-  // curve, its position and its P&L accumulate in whatever order markets
-  // arrive. Feeding it asset-major would build that curve by walking all of
-  // BTC and then going back in time to walk all of ETH: not a sequence that
-  // ever happened, and not a number anyone can act on.
-  //
-  // Before this function existed, session got market_id order — a hash. The
-  // "ordered stream" in the docs was ordered by nothing at all.
+  // Session state is shared across markets, so opening order must follow time.
   if (mode === 'session') return markets.sort((a, b) => byTime(a, b) || byId(a, b));
 
-  // Market mode: each market is independent (state resets at every
-  // on_market_open), so the order changes no result — only what a human reads.
-  // Asset-major keeps each market-day a CONTIGUOUS block, which is what
-  // marketDayPrefix needs: it counts a market-day done when its LAST market is
-  // done, and interleaving assets pushes every asset's last market to the end
-  // of the run — a progress bar that sits still and then jumps.
+  // Market mode resets strategy state per market. Asset grouping keeps
+  // market-day completion contiguous for progress reporting.
   return markets.sort((a, b) => {
     const aa = a.market?.asset ?? '';
     const ba = b.market?.asset ?? '';
@@ -898,43 +616,21 @@ export function sortMarketsForReplay(markets, { mode = 'market' } = {}) {
 
 export function marketUnusable(market, inWindow) {
   if (!market) return 'no market metadata';
-  // WHICH ASSET IS THIS? Every layer above needs the answer and none of them
-  // can work it out later: the billing key is `asset|day|interval`, the book
-  // cadence is chosen per asset, and — since the decoded day became per-asset —
-  // a market with no asset belongs to no cache entry in particular. Predict
-  // publishes ONE venue-wide markets file, and the per-asset row filter is
-  // `if (m.asset && …)`, so a row missing its category lands in every asset's
-  // read at once, each carrying a different slice of its events under the same
-  // name. Keeping any one of those replays a market with half its data and
-  // nothing to say so.
-  //
-  // Decided HERE because this is the one function both the queue and `ot run`
-  // ask. The first version of this rule lived in the queue's merge step, which
-  // meant the local runner kept the market, and a single-asset run — which has
-  // nothing to merge — replayed it out of the cache anyway.
+  // An asset is required for cadence, coverage and per-asset cache attribution.
+  // Without it, venue-wide Predict metadata could enter multiple asset reads
+  // with different subsets of events.
   if (!market.asset) return 'market has no asset';
-  // WHICH TOKEN IS UP? Book, bbo, price_change and trade rows of a Polymarket
-  // market are attributed by indexOf into its token_ids (sideOfToken), so
-  // without two distinct ids EVERY one of them is dropped while the ticks
-  // still flow — the day would run against an empty book and be billed in
-  // full. polymarketRecord sets token_ids to null in exactly that case
-  // (Predict records carry [] and are untouched). Polymarket Protocol V2 (new
-  // markets from ~2026-11-02) is where a drifted id field would land here.
-  // Verified 2026-10-11: all 357,503 archived markets have two distinct ids,
-  // so no cached verdict changes and the decoder version stays.
+  // Polymarket book and trade rows need two distinct [Up, Down] token ids.
+  // Reject null pairs; Predict records use [] and route without token ids.
   if (market.token_ids === null) return 'market has no usable [Up, Down] token ids';
   if (market.stream == null) return 'settlement stream could not be resolved';
   if (!OUTCOMES.includes(market.outcome)) {
     return 'outcome could not be read';
   }
-  // Trades do not count towards "has events". A day is decoded with trades
-  // whether or not the run declared them (decodeDatasetsFor), so the verdict —
-  // and the reason a customer reads in coverage — must not depend on them.
-  // Only the wording can change: a market with ticks is usable either way.
+  // Do not use trades to determine eligibility: decoded caches include them
+  // even when the run does not declare them.
   if (!inWindow || !inWindow.some((e) => e.kind !== 'trade')) return 'no events inside the market window';
-  // Book rows alone make the window non-empty, so without this a day whose
-  // settlement file was missing came back as scanned and billable while
-  // `on_tick` never fired.
+  // Require settlement ticks; book rows alone cannot drive on_tick.
   if (!inWindow.some((e) => e.kind === 'tick')) {
     return `no settlement ticks on ${market.stream}`;
   }
@@ -942,95 +638,38 @@ export function marketUnusable(market, inWindow) {
 }
 
 /**
- * Order one market's events and cut them at its close.
- *
- * The truncation is not tidying. The settlement feed is a per-DAY stream and
- * every row of it lands on every market settling on that stream, so a market
- * closing at 10:00 collects 14:00's rows too. Cutting here — upstream of both
- * the engine and the closing-quote scan below — is what keeps a post-close book
- * out of the strategy's view AND out of the report's baselines.
+ * Sort events and clip to the market's inclusive opening and closing bounds.
+ * Apply the same window to replay events and baseline quotes.
  */
 export function finaliseMarket(events, market) {
-  // Sorted by event time, and TIES BROKEN BY KIND — never by insertion order.
-  //
-  // Insertion order is the order the archive files happened to be read in: the
-  // catalog's order for the queue, the directory's for `ot run`. So a book
-  // update and a tick stamped the same millisecond could arrive either way
-  // round, and a strategy reacting to that tick would price against a book it
-  // had not been shown yet. Worse, the two readers could disagree — the same
-  // archive producing two different reports, which is exactly what `ot run`
-  // promises cannot happen.
-  //
-  // The order within a millisecond is part of the contract: the book is brought
-  // up to date, then what traded on it, then the tick a strategy reacts to. A
-  // hook sees the world as it already was, never as it is about to be.
-  //
-  // Within `book`, a full snapshot comes before a delta: a snapshot is the
-  // state AT that moment and a delta refines it, so applying them the other way
-  // round throws the delta away. The remaining ties are between rows of the
-  // same kind from the same file, where the archive's own order is the answer
-  // and the caller reads files in a fixed order — see the feed selection.
-  // `spot` first: a hook firing on this millisecond's book or tick reads the
-  // spot value of the same millisecond (a tie-break, not a recorded order).
+  // Equal timestamps sort by spot, book, trade, tick, ref, ext, independent
+  // of source-file read order. Book snapshots precede deltas so deltas are
+  // not overwritten. Remaining ties retain input order. Spot comes first
+  // so same-millisecond hooks can read it.
   const RANK = { spot: -1, book: 0, trade: 1, tick: 2, ref: 3, ext: 4 };
   const rank = (e) => RANK[e?.kind] ?? 9;
   const sub = (e) => (e?.kind === 'book' && e.snapshot !== true ? 1 : 0);
   events.sort((a, b) => (a.ts_ms - b.ts_ms) || (rank(a) - rank(b)) || (sub(a) - sub(b)));
 
-  // BOTH ENDS. The upper cut was here from the start; the lower one was not,
-  // and only the settlement fan-out applied it. So a book or trade row printed
-  // before the market opened was replayed to the strategy and priced the
-  // "opening" baseline — a quote from before there was anything to quote.
+  // Clip both ends so pre-open data cannot reach hooks or price baselines.
   const open = market.open_ts_ms;
   const close = market.close_ts_ms;
   const inWindow = events.filter((e) => (open == null || e.ts_ms >= open)
     && (close == null || e.ts_ms <= close));
 
-  // The closing quote on each side, from the events that survived the cut. The
-  // report's naive baselines are priced off this.
-  //
-  // Walked back PER SIDE. Polymarket publishes one side per row, so the last
-  // snapshot in the file is a single token's book and the other side's entry is
-  // empty — taking both from one row left every DOWN baseline null, and a null
-  // baseline silently drops a comparison the report claims to make.
-  // The price each side could first have been BOUGHT at — the entry a naive
-  // baseline would have taken.
-  //
-  // The opening quote, not the closing one. "Always buy UP" means buying when
-  // the market opens and holding to settlement, so pricing it at the close
-  // compares the strategy against a trade nobody could make: by then the
-  // outcome is decided, "the favourite" is simply the winner, and the panel
-  // labelled `always_favourite` becomes a perfect strategy at no cost. Measured
-  // on a real day, the closing ask also does not exist for the winning side in
-  // 384 of 388 markets — nobody offers a certain winner below a dollar — so the
-  // baselines were computed over 1% of the markets they claimed to cover.
-  //
-  // Advanced through the SAME Book the engine uses, so the two cannot disagree
-  // about what the book was. Reading a raw ladder instead was wrong twice over:
-  // element zero is the worst offer on a venue that publishes descending, and
-  // stopping at the last snapshot ignored every delta after it.
+  // Find the first simultaneous UP and DOWN asks for opening baselines.
+  // Use the engine's Book to apply snapshots, deltas and BBO bounds consistently.
   const book = new Book();
   let upPx = null;
   let downPx = null;
   for (const ev of inWindow) {
     if (ev.kind !== 'book') continue;
-    // THE SAME THREE BRANCHES AS replay.mjs, IN THE SAME ORDER. A bound was
-    // missing here while the engine applied it, so the strategy traded against
-    // a pruned ladder and the report compared it to an unpruned one: a bound
-    // landing between the UP and DOWN snapshots left up_px at the stale 0.44
-    // while ctx.book() already said 0.45. The baseline is what every headline
-    // number is measured against, so a book it never traded on is worse than a
-    // missing baseline.
+    // Keep these branches and their order in sync with engine/replay.mjs.
     if (ev.bbo) book.bbo(ev.ts_ms, ev.side, ev.bid, ev.ask);
     else if (ev.snapshot) book.snapshot(ev.ts_ms, ev.levels);
     else if (ev.side && ev.ladder) book.delta(ev.ts_ms, ev.side, ev.ladder, ev.px, ev.size);
-    // BOTH SIDES FROM ONE BOOK STATE, captured together.
-    //
-    // Polymarket publishes one side per row, so locking each side the moment it
-    // first appears mixes a UP price from one instant with a DOWN price from
-    // another — and `always_favourite`, which picks the dearer of the two, then
-    // compares prices that never coexisted. Waiting until the book quotes both
-    // is the first moment the comparison is about a real market.
+    // Capture both prices from one book state. Independent per-side captures
+    // could compare quotes that never coexisted.
     const up = book.best('UP');
     const down = book.best('DOWN');
     if (up != null && down != null) { upPx = up; downPx = down; break; }
@@ -1051,31 +690,16 @@ export function parseRow(line, { isCsv, header }) {
   return row;
 }
 
-// Merging point-in-time feeds into a market's event stream.
-//
-// MOVED HERE FROM THE WORKER, and the move is not cosmetic. `ot run` needs this
-// to replay a submitter's own CSV locally, and the npm package ships from an
-// explicit file list — importing it from `worker.mjs` meant the published CLI
-// would load a module that is not in the tarball, and would drag `pg` and the
-// AWS SDK with it if it were. It worked in this repo and nowhere else.
+// Point-in-time feed merging lives here so the public CLI does not import
+// worker.mjs or its PostgreSQL and AWS dependencies.
 
 /**
- * Merge one market-day's events with the reference rows that fall inside it.
- *
- * Both sides are already in time order, so this is a merge rather than a sort:
- * a sort over a day of 1s klines plus a day of book updates is millions of
- * comparisons per market, repeated for every market on that day.
- *
- * Rows are clipped to the market's own window. A reference row from outside it
- * would reach a strategy replaying a market that had already closed — and on
- * the next market, the feed's monotone cursor would have already walked past
- * it, so it would be silently invisible instead. Neither is a thing to ship.
+ * Merge time-ordered market events with reference rows inside the market window.
+ * Use a linear merge after selecting and ordering the reference rows.
  */
 /**
- * First index whose ts_ms is >= `at`, over rows already sorted by ts_ms.
- *
- * Rows with a non-finite ts_ms sort to the end via the comparator that built
- * the list, so they are handled by the caller rather than here.
+ * Find the first index with ts_ms >= at in sorted rows.
+ * The caller handles non-finite timestamps, which sort to the end.
  */
 function lowerBound(rows, at) {
   let lo = 0;
@@ -1089,14 +713,9 @@ function lowerBound(rows, at) {
 }
 
 export function mergeReferenceRows(eventLines, rowsByName, market, kind = 'ref', lags = null) {
-  // A bound only when there IS one. `Number(null)` is 0, not NaN, so a market
-  // whose close time is null — an empty cell normalises to null, and some
-  // streams carry no window at all — would require every reference row to be
-  // stamped at or before the epoch. Every one of them would be dropped, and the
-  // strategy would get an empty ctx.ref() with nothing anywhere saying why.
+  // Missing bounds remain null; numeric conversion would turn null into epoch 0.
   const bound = (v) => {
-    // Empty string too: `Number('')` is also 0. An empty CSV cell reaching here
-    // as '' rather than null is the same bug wearing different clothes.
+    // Empty CSV cells also convert to 0, so treat them as missing bounds.
     if (v == null || v === '') return null;
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
@@ -1105,38 +724,22 @@ export function mergeReferenceRows(eventLines, rowsByName, market, kind = 'ref',
   const closeMs = bound(market?.close_ts_ms);
 
 
-  // One flat, time-ordered list of ref lines across every declared feed.
-  //
-  // The rows are already sorted, so the window is found by BINARY SEARCH rather
-  // than by scanning. It matters at the top end: a submitted series is held for
-  // the whole run, and a 90-day BTC 1h scope is 2160 markets — scanning half a
-  // million rows for each of them, six times over for the latency curve, turns
-  // a linear job into a quadratic one against a 20-minute budget.
+  // Binary-search each sorted feed's window to avoid rescanning the full
+  // series for every market.
   const refs = [];
   for (const [name, rows] of Object.entries(rowsByName ?? {})) {
     const list = rows ?? [];
-    // A LAGGED row stamped before the open can still become visible inside the
-    // market: declared lag L means a row at t is readable at t+L, so a market
-    // opening at 10:00 with L=60s must be sent the row stamped 09:59:30. Slicing
-    // from the open dropped it, and the feed's monotone cursor had already
-    // walked past it by the next market — invisible for the whole run, with
-    // nothing saying so.
+    // A row stamped at t becomes readable at t + lag. Include pre-open rows
+    // whose visibility time falls inside the market window.
     const lag = Number(lags?.[name]) || 0;
-    // Rows stamped before the open can still become readable inside it.
+    // Search by the source timestamp after subtracting the lag.
     const from = openMs == null ? 0 : lowerBound(list, openMs - lag);
     for (let i = from; i < list.length; i += 1) {
       const r = list[i];
       if (!Number.isFinite(r?.ts_ms)) continue;
-      // ORDERED BY WHEN IT BECOMES READABLE, not by when it is stamped.
-      //
-      // A lagged row is not knowable until ts_ms + lag, and "the future is not
-      // in this process" has to mean exactly that: PointInTimeFeed would hide
-      // it either way, but queueing it at ts_ms puts it on stdin — and into the
-      // harness's array — before the events it is supposed to trail. Filtered
-      // is not the same as absent, and absent is the promise.
+      // Schedule at ts_ms + lag so the harness receives rows only when readable.
       const visibleAt = r.ts_ms + lag;
-      // Sorted by ts_ms, so lag being constant per feed means visibleAt is
-      // sorted too: the first row past the close ends this feed.
+      // A constant per-feed lag preserves order; stop at the first row past close.
       if (closeMs != null && visibleAt > closeMs) break;
       if (openMs != null && visibleAt < openMs) continue;
       refs.push([visibleAt, JSON.stringify({ kind, name, ...r })]);
@@ -1148,14 +751,11 @@ export function mergeReferenceRows(eventLines, rowsByName, market, kind = 'ref',
   const out = [];
   let i = 0;
   for (const line of eventLines) {
-    // The event's timestamp, without parsing the whole row: these lines are
-    // JSON objects whose ts_ms is a plain number, and a day of book updates is
-    // an expensive thing to parse twice.
+    // Read the numeric ts_ms field without parsing each event again.
     const m = /"ts_ms"\s*:\s*(\d+)/.exec(line);
     const ts = m ? Number(m[1]) : Number.POSITIVE_INFINITY;
-    // Strictly before: a reference row stamped at the same millisecond as a
-    // market event goes AFTER it, so a strategy handling that event cannot
-    // already see a bar that closed on the same tick.
+    // At equal visibility times, reference rows follow market events so
+    // a hook cannot see a bar closing on the same tick.
     while (i < refs.length && refs[i][0] < ts) out.push(refs[i++][1]);
     out.push(line);
   }

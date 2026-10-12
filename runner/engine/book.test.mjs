@@ -22,8 +22,7 @@ test('asks read best-cheapest and bids read best-dearest', () => {
 
 test('an empty side reports null rather than zero', () => {
   const b = new Book('m');
-  // Zero would be a real price — the cheapest possible one — and a strategy
-  // comparing against it would read "free" instead of "no market".
+  // A missing quote is null; zero is a valid price.
   assert.equal(b.best('UP'), null);
   assert.equal(b.bestBid('UP'), null);
   assert.equal(b.mid('UP'), null);
@@ -99,7 +98,7 @@ test('size beyond the top level walks the book and is priced worse', () => {
   assert.equal(r.notional, 126.5);
   assert.equal(r.avgPx, 0.506);
   assert.equal(r.worstPx, 0.51);
-  // The screen price when the order was sent — what slippage measures against.
+  // Slippage uses the quote visible when the order was sent.
   assert.equal(r.quotedPx, 0.50);
 });
 
@@ -129,7 +128,7 @@ test('an order larger than the whole book takes all of it', () => {
 });
 
 test('matching consumes depth, so two orders in one event cannot share it', () => {
-  // This is what makes "close and reverse in one event" honest.
+  // Closing and reversing share an event without reusing consumed depth.
   const b = bookWithUp();
   const first = matchOrder(b, { side: 'UP', size: 100, limit: 0.55 });
   const second = matchOrder(b, { side: 'UP', size: 100, limit: 0.55 });
@@ -148,8 +147,7 @@ test('a reduce_only order sells into the bid, not the ask', () => {
 });
 
 test('a reduce_only limit is a floor, not a ceiling', () => {
-  // Opening protects you from paying too much; exiting protects you from
-  // selling too cheap. The same field means the opposite bound.
+  // The limit is a ceiling for buys and a floor for sells.
   const b = bookWithUp();
   const r = matchOrder(b, { side: 'UP', size: 400, limit: 0.49, reduce_only: true });
   assert.equal(r.filled, 150, 'only the 0.49 bid clears the floor');
@@ -193,17 +191,8 @@ test('a snapshot drops levels with no size', () => {
   assert.equal(b.best('UP'), 0.51);
 });
 
-// A huge but finite order reports what it actually took.
-//
-// `filled` used to be `size - remaining`, and `remaining` is the requested
-// size with each level's depth subtracted from it. At IEEE-754 precision
-// `1e308 - 1000` is still `1e308`, so the subtraction did nothing: the ladder
-// was consumed and `filled` came out 0. No position, no cash, no trade row —
-// and an empty book for every order after it in that market. The report said
-// nothing happened; the book said otherwise.
-//
-// Summing the levels actually taken cannot drift from what was removed,
-// because it IS what was removed.
+// Sum consumed depth directly: at IEEE-754 precision, 1e308 - 1000 is
+// still 1e308, so requested size minus remaining size can hide a fill.
 test('an order far larger than the book reports the depth it consumed', () => {
   for (const size of [1e308, 1e300, 5000]) {
     const book = new Book();
@@ -211,9 +200,7 @@ test('an order far larger than the book reports the depth it consumed', () => {
     const res = matchOrder(book, { side: 'UP', size });
 
     assert.equal(res.filled, 1000, `size ${size} reported ${res.filled} filled from a 1000-deep book`);
-    // And the numbers derived from it are consistent with the fill rather than
-    // with the request: an avgPx computed off a zero fill is null, which reads
-    // as "no information" when the truth is "walked the whole book".
+    // Derived values must describe the consumed depth.
     assert.ok(res.notional > 0, `size ${size} took depth but reported no notional`);
     assert.equal(res.avgPx, res.notional / res.filled);
     assert.equal(book.ladders.UP.asks.best(), null, 'the ladder was not actually consumed');
@@ -230,32 +217,19 @@ test('a normal order is unaffected by the change', () => {
   assert.equal(Number(res.notional.toFixed(4)), Number((400 * 0.51 + 100 * 0.52).toFixed(4)));
 });
 
-// filled + unfilled is what was asked for, at every magnitude.
-//
-// `filled` is now summed from the levels taken while `unfilled` is still the
-// requested size with each level subtracted from it. Two different derivations
-// of the same event, so it is worth stating that they still agree: if a later
-// change makes one of them measure something else, the shortfall reported to
-// the customer stops adding up to the order they wrote.
+// Filled plus unfilled must equal the requested size across magnitudes.
 test('filled and unfilled still account for the whole request', () => {
   for (const size of [500, 5000, 1e18, 1e308]) {
     const book = new Book();
     book.snapshot(1000, { UP: { asks: [[0.51, 400], [0.52, 600]], bids: [[0.49, 1000]] } });
     const r = matchOrder(book, { side: 'UP', size });
-    // At 1e308 the addition is absorbed by float precision — which is the
-    // honest answer, not a defect: 1e308 + 1000 IS 1e308.
+    // Float precision absorbs the addition: 1e308 + 1000 is 1e308.
     assert.equal(r.filled + r.unfilled, size,
       `size ${size}: filled ${r.filled} + unfilled ${r.unfilled} is not the order`);
   }
 });
 
-// ---------------------------------------------------------------------------
-// The unthrottled top-of-book bound.
-//
-// It is the only book input with no size behind it, so the rule is narrow on
-// purpose: it may DELETE levels the venue has moved past and may never add one.
-// A level invented without a size is the fabricated-liquidity bug this engine
-// has had to fix five times.
+// Top-of-book bounds have no size. They may delete stale levels, never add liquidity.
 test('a bound deletes levels strictly better than itself, on both ladders', () => {
   const b = new Book('m');
   b.snapshot(100, { UP: {
@@ -264,9 +238,7 @@ test('a bound deletes levels strictly better than itself, on both ladders', () =
   } });
   // "Nothing better than 0.45 to buy, nothing better than 0.42 to sell into."
   assert.equal(b.bbo(200, 'UP', 0.42, 0.45), 2);
-  // 0.44 was cheaper than the bound and is gone; 0.45 is AT it and stays —
-  // strictly better, not "at least as good". 0.43 was dearer than the bid bound
-  // and is gone; 0.42 is at it and stays.
+  // Delete strictly better levels; preserve levels at the bound.
   assert.deepEqual(b.levels('UP'), [[0.45, 20], [0.46, 30]]);
   assert.deepEqual(b.bidLevels('UP'), [[0.42, 20], [0.40, 30]]);
 });
@@ -274,8 +246,7 @@ test('a bound deletes levels strictly better than itself, on both ladders', () =
 test('a bound never adds a level, however far it is from the book', () => {
   const b = new Book('m');
   b.snapshot(100, { UP: { asks: [[0.90, 5]], bids: [[0.10, 5]] } });
-  // A bound of 0.50/0.55 says the top of book is far better than anything
-  // resting here. It must not conjure one: there is no size to conjure it with.
+  // Better bounds cannot create levels without a quoted size.
   assert.equal(b.bbo(200, 'UP', 0.50, 0.55), 0);
   assert.deepEqual(b.levels('UP'), [[0.90, 5]]);
   assert.deepEqual(b.bidLevels('UP'), [[0.10, 5]]);
@@ -284,10 +255,8 @@ test('a bound never adds a level, however far it is from the book', () => {
 test('an empty side is written as 0 or 1 and clears that ladder', () => {
   const b = new Book('m');
   b.snapshot(100, { UP: { asks: [[0.01, 5], [0.02, 5]], bids: [[0.005, 5]] } });
-  // How the venue writes "no quotes": best_bid "0" and, on the other token of
-  // the same market, best_ask "1" — measured as an exact pairing in the
-  // archive. No special case is needed, because deleting everything strictly
-  // better than 0 (bids) or 1 (asks) is precisely what those mean.
+  // Archived no-quote sentinels are best_bid 0 and best_ask 1.
+  // Ordinary strict pruning handles them without a special case.
   assert.equal(b.bbo(200, 'UP', 0, 1), 3);
   assert.deepEqual(b.levels('UP'), []);
   assert.deepEqual(b.bidLevels('UP'), []);
@@ -297,10 +266,7 @@ test('a level stamped the same millisecond as the bound survives it', () => {
   const b = new Book('m');
   b.snapshot(100, { UP: { asks: [[0.45, 10]], bids: [] } });
   b.delta(200, 'UP', 'asks', 0.44, 7);
-  // The delta and the bound contradict each other and the archive does not say
-  // which came first. Requiring the level to be STRICTLY older makes the result
-  // independent of how a tie was sorted — otherwise the same archive replays
-  // two ways depending on the reader.
+  // Keep same-timestamp levels: their order relative to the bound is unknown.
   assert.equal(b.bbo(200, 'UP', null, 0.45), 0);
   assert.deepEqual(b.levels('UP'), [[0.44, 7], [0.45, 10]]);
   // One millisecond later the same bound does remove it.
@@ -311,14 +277,8 @@ test('a level stamped the same millisecond as the bound survives it', () => {
 test('an unusable bound changes nothing rather than emptying the ladder', () => {
   const b = new Book('m');
   const fresh = () => { b.snapshot(100, { UP: { asks: [[0.44, 10]], bids: [[0.40, 10]] } }); };
-  // A bound is a MAXIMAL deletion instruction, so an unreadable one would empty
-  // the book and the market would silently stop filling — an honest-looking
-  // report of a strategy that could not trade. The decoder already refuses
-  // these; this is the second door.
-  // Strings and booleans are in this list because the two engines disagreed
-  // about them: float('0.45') is 0.45 in Python while Number.isFinite('0.45')
-  // is false in JS, and a Python bool is an int, so `false` would have read as
-  // the bound 0 and deleted every bid.
+  // Reject invalid bounds before pruning. Numeric strings and booleans are
+  // excluded because JS and Python coerce them differently.
   for (const bad of [NaN, Infinity, -Infinity, null, undefined, 1.5, -0.1, '0.45', true, false]) {
     fresh();
     assert.equal(b.bbo(200, 'UP', bad, bad), 0, `bound ${bad} should be ignored`);

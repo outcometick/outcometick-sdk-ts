@@ -1,15 +1,5 @@
-// `ot run` — replay locally, against a cloned sample archive.
-//
-// The same engine, the same harnesses, the same report and the same archive
-// writer the queue uses. That is the whole point of the command: the docs
-// promise "a backtest here and a backtest on your own machine after subscribing
-// read the same bytes", and the only way that holds is by not having a second
-// implementation of any of it.
-//
-// What differs from the worker: the data comes off disk instead of R2, and
-// there is no container. `ot run` says so plainly rather than implying the
-// isolation is the same — locally the strategy runs with the user's own
-// privileges, which is fine, because it is their code on their machine.
+// Replay a local archive with the hosted engine, harnesses and report writer.
+// Data comes from disk. Strategies run without a container, with local privileges.
 
 import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -48,8 +38,7 @@ const RUNNER = path.join(HERE, '..', '..', 'runner');
 /** Run one pass of the local harness over the given markets. */
 function runHarness({
   languageId, jobDir, job, markets, outputKey, eventsDir,
-  // The submitter's own CSV, already parsed. Threaded in rather than read here
-  // so it is parsed once for the whole run, exactly as the worker does.
+  // Parse the strategy's CSV once for the run, as the hosted worker does.
   seriesRows = {}, seriesLags = {}, seriesNames = [],
 }) {
   const cmd = languageId === 'python' ? (process.env.OT_PYTHON || 'python3') : process.execPath;
@@ -58,9 +47,7 @@ function runHarness({
     : [path.join(RUNNER, 'harness/node/harness.mjs'), jobDir];
 
   return new Promise((resolve, reject) => {
-    // stdout is the result channel (see runner/harness/protocol.mjs), so it
-    // cannot be inherited: a strategy's own output would land mid-line. The
-    // harness discards that output for the same reason a container does.
+    // stdout carries protocol results; strategy output would corrupt the stream.
     const child = spawn(cmd, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     const lines = [];
     let forged = 0;
@@ -74,42 +61,25 @@ function runHarness({
       for (const line of parts) {
         if (!line) continue;
         const parsed = parseOutputLine(outputKey, line);
-        // Counted, not shrugged off. The queued worker counts the same bytes as
-        // forged, and a stray write between two real lines corrupts the one
-        // after it — so a local replay that quietly drops them can hand back a
-        // report the queued run would never have produced. Silence here is the
-        // exact shape of the divergence this CLI exists to rule out.
+        // Count malformed output as forged bytes, as the hosted worker does.
         if (parsed) lines.push(parsed);
         else forged += 1;
       }
     });
     child.on('error', reject);
     child.on('close', (code) => {
-      // A short feed that still exited 0 is the dangerous case: the harness
-      // replayed whatever reached it, reported cleanly, and the report looks
-      // complete. It must not be resolved as a successful run. When the harness
-      // died first the pipe breaks as a CONSEQUENCE, and its own exit code and
-      // stderr say more than the EPIPE does — so let that path through
-      // unchanged and let the caller report the real failure.
+      // A truncated feed with exit code 0 is a failed run. For a nonzero exit,
+      // preserve the harness error rather than masking it with EPIPE.
       if (streamError && code === EXIT.ok) { reject(streamError); return; }
       resolve({ code, stderr, lines, forged });
     });
 
-    // THE SAME writer the queue uses (runner/stdin-writer.mjs). This loop used
-    // to ignore what write() returned and swallow every stdin error, so once
-    // the pipe's buffer filled the rows simply stopped arriving: a 289-market
-    // day came back as a 2-market report, exit 0, no warning. `ot run` and the
-    // worker have drifted eight times; sharing the writer is how this one stops
-    // being a ninth.
+    // Share the backpressure-aware writer with the hosted worker.
     let streamError = null;
     const write = createLineWriter(child.stdin);
-    // Series rows are INTERLEAVED into the same stream in event time, exactly
-    // as the worker sends them — and `lags` travels with them, or a signal that
-    // declared a publication delay would be visible the instant its row was
-    // stamped rather than when it could have existed.
-    // One market read back from its spool file (see spoolDay): the day is
-    // never all in memory, only the markets being fed.
-    // A generic-data market is streamed, never read whole (it can span months).
+    // Interleave series rows in event time, including their publication lags.
+    // Read spooled events one market at a time; stream generic markets, which
+    // can span months.
     const cursorOf = (m) => fileLines(path.resolve(eventsDir, m.eventsFile));
     const linesOf = async (m) => {
       const lines = await readEventLines(path.resolve(eventsDir, m.eventsFile));
@@ -130,8 +100,7 @@ function runHarness({
     (async () => {
       await write(JSON.stringify({ ...job, outputKey }));
       if (job.mode === 'session') {
-        // ONE time order across every market — the same stream the worker
-        // writes (runner/session-feed.mjs).
+        // Merge markets in time order using runner/session-feed.mjs.
         for await (const line of sessionLines(markets, { linesOf, headerOf, cursorOf, timed: job.engine?.scheduler === 'global' })) await write(line);
       } else {
         for (const m of markets) {
@@ -159,10 +128,7 @@ function demux(lines) {
   const fills = [];
   const records = [];
   const logs = [];
-  // Counted, not swallowed. The queue publishes `dropped_rows`, and a local run
-  // that discarded the same rows in silence reported a clean report over the
-  // identical archive — the number exists precisely so a customer can tell that
-  // something did not parse.
+  // Include dropped_rows in local reports, as in hosted reports.
   let malformed = 0;
   let result = parseResult({});
   for (const { channel, payload } of lines) {
@@ -220,18 +186,9 @@ export async function cmdRun({ dir, flags }) {
     throw new Error(`${unknown.join(', ')} not in ${path.resolve(dataRoot)} — it holds ${available[0]}..${available[available.length - 1]}`);
   }
 
-  // REFERENCE FEEDS ARE REFUSED. SERIES ARE NOT.
-  //
-  // The distinction is where the data lives, and it took a review to get right:
-  // a reference feed is the Binance archive, which sits on the worker's own disk
-  // and was deliberately never put in R2 — no local run can reach it. A series
-  // is the submitter's own CSV, and it is right here in the directory being run.
-  //
-  // Refusing both was the safe-looking answer and the wrong one: it would have
-  // forced every strategy using `ctx.ext()` to spend credits in the queue to
-  // discover a runtime mistake it could have found locally in a second. What
-  // must not happen is running with an EMPTY feed, which produces a report that
-  // looks comparable to the queued one and is not.
+  // Reference feeds live on the hosted worker and are unavailable locally.
+  // Strategy CSV series are local and supported. Reject missing feeds rather
+  // than replaying with empty input.
   const refs = (manifest.reference ?? []).map((r) => (typeof r === 'string' ? r : r.name));
   if (refs.length) {
     throw new Error(
@@ -243,8 +200,7 @@ export async function cmdRun({ dir, flags }) {
     );
   }
 
-  // The submitter's own CSV, parsed by the SAME reader the queue uses, so a
-  // header it would reject there is rejected here too.
+  // Use the hosted CSV reader so header validation agrees.
   const seriesRows = manifest.series?.length
     ? loadSeries(manifest.series, checked.files)
     : { rowsByName: {}, problems: [] };
@@ -272,8 +228,7 @@ export async function cmdRun({ dir, flags }) {
   // depth): one decision for the run, the same function the worker calls.
   const enginePolicy = enginePolicyFor({ manifest, venue, data: generic ? 'generic' : 'archive' });
 
-  // LOCAL ONLY: the archive's book thinning, on (the default, what the queue
-  // replays) or off. Given either way, the report states what was applied.
+  // Local book thinning can be disabled. Record the applied setting.
   const throttleFlag = flags['book-throttle'];
   if (throttleFlag != null && throttleFlag !== 'on' && throttleFlag !== 'off') {
     throw new Error(`--book-throttle must be on or off, got ${throttleFlag}`);
@@ -284,14 +239,8 @@ export async function cmdRun({ dir, flags }) {
   const assets = (flags.assets ?? '').split(',').map((a) => a.trim().toUpperCase()).filter(Boolean);
 
   const markets = [];
-  // Gaps are part of the answer, not noise to drop.
-  //
-  // A queued run's coverage names every market it could not use; a local run
-  // reading the same archive said nothing, so the two disagreed about what had
-  // been covered while agreeing about everything else. That is the harder
-  // discrepancy to notice, because the report looks complete.
-  // Where each day's events are spooled, one file per market (see spoolDay).
-  // Removed on every exit path: a day of Predict BTC is hundreds of MB.
+  // Include unusable markets in coverage. Spool each market to its own file
+  // and remove the temporary directory on every exit path.
   const eventsDir = await mkdtemp(path.join(tmpdir(), 'ot-events-'));
   try {
     const missing = [];
@@ -311,9 +260,8 @@ export async function cmdRun({ dir, flags }) {
       markets.push(...genericDecoded.markets);
     }
     const runInputs = [];
-    // Days are decoded on every core, as many as half the memory allows (each
-    // thread holds its own heap), unless --workers says otherwise; the events
-    // are the same either way (cli/parallel-decode.mjs).
+    // Limit decode threads to half the available memory unless --workers is set.
+    // cli/parallel-decode.mjs preserves sequential output.
     const decodeWorkers = flags.workers == null
       ? defaultDecodeWorkers({ cores: availableParallelism(), totalBytes: totalmem() })
       : Number(flags.workers);
@@ -325,10 +273,8 @@ export async function cmdRun({ dir, flags }) {
     const cacheRoot = cacheFlag === 'off' ? null : path.resolve(cacheFlag ?? defaultCacheRoot());
     const decoder = cacheRoot && !generic ? await decoderDigest() : null;
     for (const day of days) {
-      // The SAME cadence the queue would replay this range at — built from the
-      // whole range, not this day, so an asset's density never changes partway
-      // through a run. Per asset, not run-wide: see makeBookThrottle. A fresh
-      // gate per decode: it remembers the rows it has kept.
+      // Choose per-asset cadence from the whole range. Each decode gets a fresh
+      // stateful throttle so earlier days cannot affect the rows it keeps.
       const newThrottle = throttleFlag === 'off' ? null : () => makeBookThrottle({
         venue,
         assets: assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'],
@@ -344,9 +290,7 @@ export async function cmdRun({ dir, flags }) {
       const loaded = cacheRoot
         ? await loadLocalDayCached({ ...request, cacheRoot, decoder, newThrottle })
         : await loadLocalDay({ ...request, throttle: newThrottle ? newThrottle() : null });
-      // Measured from EVENTS, keyed by market-day — the same fact the queue
-      // records, produced by the same decoder. See fetchDay's bboKeys.
-      // Every archive file this day was read from (the fingerprint's inputs_sha256).
+      // Track top-of-book coverage by market-day and files for inputs_sha256.
       runInputs.push(...(loaded.inputs ?? []));
       if (loaded.bboKeys?.length) {
         const acc = bboApplied.get(day) ?? new Set();
@@ -374,7 +318,7 @@ export async function cmdRun({ dir, flags }) {
         process.stderr.write(`  ${day}: ${why}\n`);
         missing.push({
           day, partial: true, markets: loaded.unusable.length, reason: why,
-          // Same bound the queue applies — see MAX_DROPPED_LISTED there.
+          // Same bound the queue applies; see MAX_DROPPED_LISTED there.
           dropped: loaded.unusable.slice(0, 10),
           ...(loaded.unusable.length > 10
             ? { dropped_truncated: loaded.unusable.length - 10 } : {}),
@@ -386,20 +330,13 @@ export async function cmdRun({ dir, flags }) {
     if (markets.length === 0) {
       throw new Error(generic ? 'no market of that dataset could be replayed (reasons above)' : 'no market-days could be read from that archive');
     }
-    // SESSION IS ONE STREAM ACROSS THE RANGE, so it is ordered once over every
-    // day — the same thing fetchMarketDays does for the queue. Ordering it a day
-    // at a time leaves the stream day-major, which is chronological only by
-    // accident and stops being so as soon as two assets are in scope. Session
-    // shares one Portfolio across every market, so this is part of the ANSWER,
-    // not of the log.
+    // Session mode shares a portfolio across markets. Sort across the whole
+    // range; day-major order is not chronological when markets overlap.
     if ((manifest.mode ?? 'market') === 'session') {
       sortMarketsForReplay(markets, { mode: 'session' });
     }
-    // ONE ASSET ON ONE UTC DAY — the unit the queue bills in. `markets` is one
-    // entry per market, and a day of BTC 15-minute markets is ninety-six of them,
-    // so counting entries reported a run as being a hundred times bigger than the
-    // customer is charged for and disagreed with the queue's own coverage.
-    // Generic data has no days: the unit is the market.
+    // Count archive coverage by asset and UTC day, not by individual market.
+    // Generic data is counted by market.
     const marketDaysScanned = generic ? markets.length : countMarketDays(markets);
 
     const jobDir = await mkdtemp(path.join(tmpdir(), 'ot-run-'));
@@ -411,8 +348,7 @@ export async function cmdRun({ dir, flags }) {
         await mkdir(path.dirname(dest), { recursive: true });
         await writeFile(dest, f.content);
       }
-      // The SDK has to be resolvable exactly as it is in the image, or the
-      // documented `import … from "outcometick"` fails locally and works remotely.
+      // Resolve SDK imports as in the sandbox image.
       if (languageId === 'nodejs') {
         const { cp } = await import('node:fs/promises');
         await cp(path.join(RUNNER, 'harness/node/sdk'),
@@ -428,7 +364,7 @@ export async function cmdRun({ dir, flags }) {
         mode: manifest.mode,
         seed: Number(flags.seed ?? 1),
         // The venue's own schedule, market by market, unless the manifest or
-        // --fee-bps says otherwise — the same rule the worker applies.
+        // --fee-bps says otherwise; the same rule the worker applies.
         fees: feePolicy,
         // Same rule as the worker: Polymarket with book + trades declared.
         resting: restingPolicyFor({ manifest, venue }),
@@ -447,9 +383,7 @@ export async function cmdRun({ dir, flags }) {
       }
 
       const passes = [];
-      // ONE pass, at whatever delay the manifest asked for — the same shape the
-      // queue runs (runner/worker.mjs). These two have drifted eight times and
-      // every one was "we shared the decoder and nothing else".
+      // Run one pass at the manifest delay, as runner/worker.mjs does.
       const delayMs = manifest.latency ?? 0;
       const steps = [{ label: delayMs ? `+${delayMs} ms` : '0 ms', ms: delayMs }];
       for (const step of steps) {
@@ -461,9 +395,7 @@ export async function cmdRun({ dir, flags }) {
         });
         const out = demux(res.lines);
         if (res.forged > 0) {
-          // Almost always a dependency writing to stdout: the harness takes
-          // console away from the strategy before loading it, but a library that
-          // reaches the descriptor another way still lands on the channel.
+          // Libraries can bypass redirected console output and write to stdout.
           const err = new Error(
             `${res.forged} line(s) on the result channel did not authenticate.`
             + ' Something in this strategy or its dependencies writes to stdout;'
@@ -474,13 +406,7 @@ export async function cmdRun({ dir, flags }) {
           err.detail = err.message;
           throw err;
         }
-        // UNCONDITIONAL. This used to be wrapped in `if (step.ms === 0)`, from
-        // when pass 0 was the report and the rest were a comparison curve whose
-        // failures were survivable. There is one pass now, and its delay is
-        // whatever the manifest asked for — so the guard silently stopped
-        // running the moment anyone wrote `latency: 250`, and a rejected or
-        // over-budget replay became a report: locally successful, marked
-        // `fill_delay_ms: 250`, and refused by the queue.
+        // Validate the single replay pass at any configured delay.
         if (res.code === EXIT.rejected || res.code === EXIT.budget) {
           const r = out.result.rejection ?? { code: 'E_RUNTIME', detail: res.stderr.slice(0, 2000) };
           const err = new Error(r.detail);
@@ -493,17 +419,8 @@ export async function cmdRun({ dir, flags }) {
       }
 
       const base = passes[0];
-      // A SHORT REPLAY MUST FAIL EVEN WHEN NOTHING REPORTED AN ERROR.
-      //
-      // The backpressure bug produced exactly that shape: every write "succeeded",
-      // the harness exited 0, and 2 of 289 markets came back as a clean, complete
-      // looking report. Fixing the writer closes the cause we found; counting what
-      // came back is what catches the next one, whatever it turns out to be.
-      //
-      // `markets_run` is incremented by the harness only after a market is fully
-      // replayed, so on a clean exit it equals what was fed. A rejected or
-      // over-budget run never reaches here — those exit non-zero and are raised
-      // above with the sandbox's own reason, which says more than this count.
+      // On a clean exit, markets_run counts fully replayed markets and must
+      // equal the number fed. Nonzero exits were handled above.
       if (base.result.marketsRun < markets.length) {
         const err = new Error(
           `only ${base.result.marketsRun} of ${markets.length} market(s) were replayed —`
@@ -538,8 +455,7 @@ export async function cmdRun({ dir, flags }) {
         runId: generic ? 'local_generic' : `local_${days[0]}`,
         submittedAt: 0,
         manifest,
-        // Local runs have no stored submission to hash, and saying null is
-        // truthful: this report is not tied to a submission at all.
+        // Local runs have no stored submission to hash.
         sourceSha256: null,
         fingerprint: fingerprintOfFiles(files, {
           // Your own data has no archive scope: its bytes are its scope.
@@ -566,10 +482,7 @@ export async function cmdRun({ dir, flags }) {
           from: days[0],
           to: days[days.length - 1],
           marketDays: marketDaysScanned,
-          // MARKET-DAYS, the unit the queue reports here (it passes the run's
-          // market_days). This was the calendar-day count, so the same archive
-          // reported a different `metrics.market_days` locally whenever a run
-          // spanned more than one asset or market length.
+          // Use market-days, matching hosted metrics.market_days.
           archivedDayCount: marketDaysScanned,
         },
         scanned: {
@@ -596,11 +509,7 @@ export async function cmdRun({ dir, flags }) {
         seed: Number(flags.seed ?? 1),
         coverage: buildCoverage({
           marketDaysScanned,
-          // NOT backfilled from `scanned`. Filling it in that way meant the
-          // headline always said "asked for N, scanned N" — so a day that was
-          // entirely unusable was recorded in `missing` and simultaneously denied
-          // at the top of the same file. A local run does not know what was asked
-          // for; null says that, and saying it is the point.
+          // The requested count is unknown locally; do not infer it from scanned.
           marketDaysRequested: null,
           marketsReportedByRunner: base.result.marketsRun,
           missing,
@@ -616,7 +525,7 @@ export async function cmdRun({ dir, flags }) {
         budget: base.result.budget,
       });
       if (throttleFlag != null && report.coverage) {
-        // What was actually applied, per asset — asked of the gate itself.
+        // What was actually applied, per asset; asked of the gate itself.
         const scopeAssets = assets.length ? assets : ['BTC', 'ETH', 'SOL', 'XRP'];
         const gate = makeBookThrottle({ venue, assets: scopeAssets, from: days[0], to: days[days.length - 1] });
         report.coverage.book_throttle = throttleFlag === 'off'

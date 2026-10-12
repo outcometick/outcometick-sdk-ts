@@ -1,34 +1,18 @@
-// Session mode's stream: every market of a run, merged into ONE time order.
-//
-// Session mode shares one strategy instance and one portfolio across the whole
-// range. It used to be fed exactly like market mode — each market's events in
-// full, one market after another — which is fine while markets never overlap
-// and a look-ahead hole the moment they do: a 15-minute market open
-// 00:00–00:15 was replayed to its end before a 5-minute market that opened at
-// 00:05, so whatever the instance learned at 00:15 was already in hand when it
-// started trading 00:05. Two assets, or 5m and 15m together, overlap all day.
-//
-// So the session stream is a k-way merge by event time, and the harness drives
-// every open market from it (runner/harness/node/harness.mjs `runSession`,
-// otharness.py `_run_session`). Three kinds of line:
+// Merge session markets by event time. One strategy instance and portfolio
+// span the range, so overlapping markets must be interleaved to avoid look-ahead.
+// The harnesses consume a k-way merge with these archive protocol lines:
 //
 //   {"open":{"i":k, market, stream, references?, series?, lags?}}
 //   {"i":k,"e":<event or feed row>}
 //   {"close":k}
 //
-// SHARED by the worker and `ot run` for the reason everything in runner/ that
-// both of them do is shared: the two have drifted nine times. The pure-Python
-// local backtest ports it (outcometick/backtest/feed.py) and the equivalence
-// suite compares the two outputs line for line.
+// Shared by the worker and ot run. Keep in sync with client/backtest/feed.py;
+// the equivalence suite compares protocol lines.
 
 /**
- * When a line becomes visible, without parsing a whole event.
- *
- * Events carry `ts_ms`. Feed rows (`ref`/`ext`) were placed in the market's
- * stream by WHEN THEY BECOME READABLE — stamp plus the feed's declared lag
- * (mergeReferenceRows) — so that is their position here too; releasing one at
- * its stamp would hand a lagged row to the strategy before it could have
- * existed.
+ * Read a line's visibility time without parsing the event.
+ * Market events use ts_ms; ref/ext rows use ts_ms plus their declared lag,
+ * matching mergeReferenceRows.
  */
 function lineTime(line, lags) {
   const m = /"ts_ms"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(line);
@@ -50,9 +34,8 @@ function lineSeq(line) {
 }
 
 /**
- * A binary heap of market cursors, ordered by (time, phase, s, market index).
- * `s` is 0 for every archive cursor — so the archive order is exactly (time,
- * phase, market index) — and the global input sequence for a generic event.
+ * Heap of market cursors ordered by (time, phase, s, market index).
+ * s is 0 for archive cursors and the global input sequence for generic events.
  */
 class CursorHeap {
   constructor() { this.a = []; }
@@ -103,27 +86,22 @@ class CursorHeap {
 }
 
 /**
- * The session stream for a run.
+ * Merge markets into the session protocol stream.
  *
- * @param {Array} markets  in session order (sortMarketsForReplay mode 'session':
- *   opening time, then id) — the index in this list is the market's `i`.
+ * @param {Array} markets  opening-time/id order (sortMarketsForReplay session
+ *   mode); the list index is the market's i.
  * @param {object} opts
- * @param {(m:object)=>Promise<string[]>} opts.linesOf  one market's lines, in
- *   order, feed rows already merged in (what market mode would send after its
- *   header).
- * @param {(m:object)=>object} opts.headerOf  the market-mode header minus `n`.
- * @yields {string} protocol lines, without newlines
+ * @param {(m:object)=>Promise<string[]>} opts.linesOf  ordered market lines
+ *   with feed rows already merged, as sent after a market-mode header.
+ * @param {(m:object)=>object} opts.headerOf  market-mode header without n.
+ * @yields {string} protocol lines without newlines
  *
- * A market is opened when the merge reaches its opening time, so only the
- * markets live at one moment are held in memory, never the whole range.
- * Ties: at one millisecond, an opening comes first, then events in market
- * order, then closings — so a market can trade on the instant it opens, and
- * every event stamped at a market's close reaches it before it settles.
+ * Open markets at their opening times, holding only currently live markets.
+ * At equal times, opens precede events and closes follow them. Archive events
+ * tie-break by market order; generic events use global input sequence.
  */
 export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = null, timed = false }) {
-  // `timed` (phase 2b, the global scheduler): every line carries the time it was
-  // ordered by as "t", and the harness schedules by that and nothing else — so
-  // producer and consumer cannot disagree about when a line happened.
+  // With timed=true, include the merge time as t for the harness scheduler.
   const T = (t) => (timed ? `,"t":${Number.isFinite(t) ? t : 'null'}` : '');
   const heap = new CursorHeap();
   const openAt = (m) => {
@@ -133,10 +111,8 @@ export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = nul
   let next = 0;
 
   /**
-   * A GENERIC market (runner/generic-data.mjs) is read as a stream, one line of
-   * look-ahead, so a months-long market is never held whole. Its lifecycle has
-   * two closing instants: `end` at trade_until (phase 2), then `close` at its
-   * settlement (phase 3). Events tie-break on the global input sequence.
+   * Read generic markets with one line of look-ahead. Emit end at trade_until
+   * (phase 2) and close at settlement (phase 3). Events tie-break by input sequence.
    */
   const advanceGeneric = async (c) => {
     const nx = await c.it.next();
@@ -203,8 +179,8 @@ export async function* sessionLines(markets, { linesOf, headerOf, cursorOf = nul
       }
       const lines = await linesOf(m);
       const lags = header.lags ?? null;
-      // Each line's time, made monotone within the market: the stream is
-      // already in order, so a line whose time cannot be read sits where it is.
+      // Keep times monotone within each market. Unreadable times inherit
+      // the previous time without moving the line.
       const times = new Array(lines.length);
       let run = openAt(m);
       for (let j = 0; j < lines.length; j += 1) {

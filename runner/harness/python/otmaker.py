@@ -1,12 +1,8 @@
-"""Resting (maker) orders: a conservative queue-position model for Polymarket.
+"""Resting orders with a conservative Polymarket queue-position model.
 
-The Python mirror of runner/engine/maker.mjs. The reasoning for every rule —
-the mirrored book, one print per transaction on the taker's token, the
-depletion ledger, the single volume waterfall, the entry and cancel windows —
-is written down there once; this file follows it rule for rule and in the order
-of every floating-point operation, and runner/conformance holds the two engines
-to the same rows.
-"""
+Keep in sync with runner/engine/maker.mjs, including floating-point operation
+order. Shared rules cover mirrored books, taker-token prints, depletion,
+volume allocation and entry/cancel windows; runner/conformance checks parity."""
 
 from __future__ import annotations
 
@@ -17,7 +13,7 @@ from otengine import PRICE_SCALE, to_ticks, from_ticks
 
 QUEUE_MODEL = "polymarket-queue-v1"
 PRINT_LAG_MS = 800
-# Probabilistic queue models -- see QUEUE_PROB_VERSION in maker.mjs.
+# Probabilistic queue models, see QUEUE_PROB_VERSION in maker.mjs.
 QUEUE_PROB_VERSION = "prob-v1"
 QUEUE_PROBS = ("power", "power2", "power3", "log", "log2")
 _PROB_INPUT_MAX = 1e15
@@ -47,7 +43,7 @@ def _pow_n(r, n):
 
 
 def ln1p(x):
-    """ln(1 + x) by + - * / alone -- MUST MATCH ln1p in maker.mjs bit for bit."""
+    """ln(1 + x) by + - * / alone, Keep in sync with ln1p in maker.mjs bit for bit."""
     if x == 0:
         return 0
     if x < _SMALL_X:
@@ -166,16 +162,16 @@ class MakerBook:
         self.market_id = market_id
         self.pf = portfolio
         self.lag = print_lag_ms
-        # job.engine.queue_prob or None -- see maker.mjs.
+        # job.engine.queue_prob or None, see maker.mjs.
         self.prob = queue_prob
         self.unseen: dict[str, list[list]] = {"asks": [], "bids": []}  # [ts, q, amount]
         self.by_id: dict[str, _Order] = {}
-        # Non-final orders in submission order -- see `open` in maker.mjs.
+        # Non-final orders in submission order, see `open` in maker.mjs.
         self.open: list[_Order] = []
         self.seq = 0
         self.ledger: dict[str, list[list]] = {"asks": [], "bids": []}  # [ts, q, amount]
         self.stats = new_maker_stats()
-        # One FIFO per horizon, sorted by due time -- see markoutQ in maker.mjs.
+        # One FIFO per horizon, sorted by due time, see markoutQ in maker.mjs.
         self.markout_q = [{"items": [], "head": 0} for _ in MARKOUT_HORIZONS]
         self.token_ts = {"UP": None, "DOWN": None}
         self.rows: list[dict] = []
@@ -258,7 +254,7 @@ class MakerBook:
             rec.state = "rejected"
             self.stats["rejected_invalid"] += 1
             return
-        # quote_guard refuses the WHOLE order -- see activate in maker.mjs.
+        # quote_guard refuses the whole order, see activate in maker.mjs.
         if self.pf.quote_guard and self.pf.quote_guard_failure(book, ts, eff):
             rec.state = "rejected"
             self.pf.count_reject("quote_guard")
@@ -267,7 +263,7 @@ class MakerBook:
         opp = "bids" if kind == "asks" else "asks"
         self._compact()
         for o in self.open:
-            # Only live orders -- see activate in maker.mjs.
+            # Only live orders, see activate in maker.mjs.
             if o.state != "live" or o.kind != opp:
                 continue
             if (o.q <= q) if kind == "bids" else (o.q >= q):
@@ -366,7 +362,7 @@ class MakerBook:
         if not self.tracking():
             apply()
             return
-        # Only events that can change the UP ladders -- see bookEvent in maker.mjs.
+        # Only events that can change the UP ladders, see bookEvent in maker.mjs.
         touches_up = (ev.get("levels") or {}).get("UP") is not None if snapshot else side == "UP"
         if not touches_up:
             apply()

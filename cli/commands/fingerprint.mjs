@@ -1,9 +1,6 @@
-// `ot fingerprint`: a run's pre-registration fingerprint, without running it.
-//
-// Publish the value before you look at any result; the report of the run you
-// then make (`ot run`, `ot submit`, or outcometick.backtest) carries the same
-// sha256 when the code, manifest, params, options, scope and seed are the same.
-// See api/lib/backtest-fingerprint.mjs for exactly what it covers.
+// Compute a pre-registration fingerprint without replaying the strategy.
+// Matching code, manifest, params, options, scope and seed produce the same
+// sha256 in local and hosted reports. See api/lib/backtest-fingerprint.mjs.
 
 import { fingerprintOfFiles, expandDays, datasetDigest } from '../../api/lib/backtest-fingerprint.mjs';
 import { looksLikeGenericDataset, datasetFiles, marketsFileOf } from '../../runner/generic-data.mjs';

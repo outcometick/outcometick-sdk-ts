@@ -1,11 +1,5 @@
-// Tests for the CLI commands that talk to the API: `ot status` and `ot fetch`.
-//
-// Both exist because other parts of the CLI print them — `ot submit` tells you
-// to run `ot status`, and `ot status` tells you to run `ot fetch`. These drive
-// them against a stub API so the printed commands are known to work rather than
-// known to be spelled correctly.
-//
-// Split from ot.test.mjs because these are the only tests that open a socket.
+// Exercise status and fetch commands against a stub API.
+// Kept separate from ot.test.mjs because these tests open sockets.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -88,9 +82,7 @@ test('ot status prints the run, and the refund alongside what was spent', async 
     assert.equal(code, 0);
     assert.match(stdout, /run_abc/);
     assert.match(stdout, /status\s+complete/);
-    // Both halves of the money. A partial run bills for the market-days it
-    // actually read; printing only the spend makes a refund look like an
-    // overcharge.
+    // Show both spent and refunded amounts for partial runs.
     assert.match(stdout, /96 spent \(4 returned\)/);
     assert.match(stdout, /net pnl\s+\+\$1,234\.5/);
     assert.match(stdout, /ot fetch run_abc/);
@@ -136,9 +128,7 @@ test('ot status exits non-zero for a run this key cannot see', async () => {
 });
 
 test('ot status needs a run id rather than defaulting to the directory', async () => {
-  // parseArgs hands back '.' when there is no positional, and '.' is not a run
-  // id. Sending it to the API would 404 confusingly instead of saying what is
-  // actually wrong.
+  // parseArgs defaults the positional argument to '.', which is not a run id.
   const { code, stderr } = await ot(['status']);
   assert.equal(code, 1);
   assert.match(stderr, /usage: ot status <run_id>/);
@@ -193,13 +183,7 @@ test('ot fetch distinguishes "not finished" from "no such run"', async () => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// `ot submit` with a series
-//
-// The CLI stages series in R2 exactly as the web editor does. Not for the CLI's
-// benefit: it is what makes "a series never passes through the API box" true
-// rather than true-for-browsers, and one client still inlining would keep the
-// whole cost while the claim said it was gone.
+// Series uploads go directly to R2, using the same protocol as the editor.
 
 const PY_STRATEGY = 'class S:\n    def on_tick(self, ctx, tick):\n        pass\n';
 
@@ -236,8 +220,7 @@ test('ot submit stages a series in R2 and sends it by reference', async () => {
       let body = '';
       req.on('data', (c) => { body += c; });
       req.on('end', () => {
-        // Mirrors R2: the url is write-once, so the client must send exactly
-        // what the server signed.
+        // R2 requires the headers signed for this write-once URL.
         puts.push({ body, ifNoneMatch: req.headers['if-none-match'] });
         res.writeHead(200).end();
       });
@@ -266,12 +249,12 @@ test('ot submit stages a series in R2 and sends it by reference', async () => {
     ]);
     assert.equal(code, 0, stdout);
 
-    // The bytes went to R2, once.
+    // Upload the series once.
     assert.equal(puts.length, 1);
     assert.match(puts[0].body, /1750000000000/);
     assert.equal(puts[0].ifNoneMatch, '*', 'must send what the signature covered, or R2 returns 403');
 
-    // And NOT to the API.
+    // Keep series bytes out of the API request.
     const sent = JSON.stringify(submitBody);
     assert.ok(!sent.includes('1750000000000'), 'the csv content reached the API after all');
     assert.deepEqual(submitBody.files.map((f) => f.name).sort(), ['outcometick.json', 'strategy.py']);
@@ -309,8 +292,7 @@ test('ot submit without a series is unchanged', async () => {
 });
 
 test('ot submit fails loudly when a series cannot be staged', async () => {
-  // Silently submitting without the series would queue a run whose strategy
-  // reads an empty feed — a report that cost credits and means nothing.
+  // Abort submission if a declared series cannot be uploaded.
   const dir = await submissionDir(
     { ...BASE_MANIFEST, series: [{ name: 'px', file: 'px.csv' }] },
     { 'px.csv': 'ts_ms,value\n1750000000000,1.5\n' },
@@ -470,8 +452,7 @@ test('ot submit without a range, or with a bad --days, says how to ask', async (
 });
 
 test('ot status shows a run the queue gave up on as fully refunded, not held', async () => {
-  // leaseRun's attempts-exhausted branch fails the run and refunds it in full
-  // but writes no credits_spent; the API returns that null as it is.
+  // Exhausted attempts leave credits_spent null; preserve the API response.
   const api = await stubApi({
     'GET /v1/backtest/run/run_gaveup': (req, res) => json(res, 200, {
       ...DONE_RUN, run_id: 'run_gaveup', status: 'failed', credits_held: 7, credits_spent: null,
@@ -489,11 +470,7 @@ test('ot status shows a run the queue gave up on as fully refunded, not held', a
   }
 });
 
-// Only in the monorepo: the published package carries neither the server nor
-// its database module. This is the check that was missing when the table said
-// done/expired and the server said complete/cancelled — the stub above had the
-// same wrong names, so every test passed while every finished run showed its
-// credits as "held".
+// Monorepo-only: compare terminal status names with the server database module.
 const DB = fileURLToPath(new URL('../api/lib/backtest-db.mjs', import.meta.url));
 test('ot status knows every run status the server writes', (await import('node:fs')).existsSync(DB) ? {} : { skip: 'not in the monorepo' }, async () => {
   const { STATUS_LINE, SETTLED } = await import('./commands/status.mjs');

@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""The Python harness. Runs INSIDE the sandbox, in the same process as the
-submitted strategy.
+"""Python sandbox entrypoint, running in the strategy's process.
+Keep job framing, authenticated output and exit codes in sync with
+runner/harness/node/harness.mjs.
 
-The mirror of runner/harness/node/harness.mjs: same job file, same output files,
-same exit codes. The worker does not know or care which language produced a
-run's logs, which is what stops the report shape depending on the customer's
-choice of language.
-
-    python3 harness.py <job-dir>      job on stdin, results on stdout
-"""
+    python3 harness.py <job-dir>      job on stdin, results on stdout"""
 
 from __future__ import annotations
 
@@ -26,24 +21,11 @@ from otengine import RunAbort  # noqa: E402
 from otreplay import write_all  # noqa: E402
 from otharness import run_job  # noqa: E402
 
-# Results go out over stdout, authenticated — see the long note in protocol.mjs.
-# /out used to be a writable bind mount, and a strategy declaring the allowed
-# `pandas` could rewrite trades.jsonl from on_settle, after being told the
-# official outcome.
-# The authenticated result channel.
-#
-# Docker hands a container stdin/stdout/stderr and nothing else. The worker
-# spawns `docker run` with a fourth pipe, but that fd belongs to the docker
-# CLIENT — inside the container fd 3 is closed, and every write to it failed
-# with EBADF. That is why no containerised run had ever produced a result.
-#
-# So the real stdout is duplicated to a private fd and fd 1 is pointed at
-# /dev/null, HERE, before any strategy code is imported: results leave over the
-# container's stdout, and a strategy's print() goes nowhere. Which was already
-# the intent — the worker used to discard stdout for exactly that reason.
-#
-# /proc/self/fd/<n> stays addressable. The MAC is what makes forgery
-# impossible, and always was.
+# Duplicate stdout for authenticated results before importing strategy code,
+# then redirect fd 1 to /dev/null to discard strategy output. Docker exposes
+# only stdin/stdout/stderr, so results use stdout rather than a fourth pipe.
+# /proc/self/fd remains addressable; MACs protect result authenticity.
+# See protocol.mjs for the protocol and its limits.
 RESULT_FD = os.dup(1)
 _devnull = os.open(os.devnull, os.O_WRONLY)
 os.dup2(_devnull, 1)
@@ -51,11 +33,7 @@ os.close(_devnull)
 
 
 def _print_is_gone(*_args, **_kwargs):
-    """print() writes to /dev/null now; say so once, on stderr.
-
-    Not silent: a strategy author whose print() vanishes without a word will
-    spend an afternoon on it. `ot run` shows stderr.
-    """
+    """Warn once on stderr that print() is discarded. ot run displays stderr."""
     if not _print_is_gone.warned:
         _print_is_gone.warned = True
         try:
@@ -69,16 +47,10 @@ builtins.print = _print_is_gone
 
 
 def load_strategy_class(src_dir: str, entry: dict):
-    """Import the submitted module and resolve the class by EXACT name.
+    """Import the submitted module and resolve the class named in the manifest.
 
-    No discovery. A module that exports one class under a different name is a
-    rejection rather than a guess — guessing is how a run silently executes
-    something other than what the submitter meant.
-
-    Note this is the one place the submitted code is executed at import time,
-    which is exactly why the static analyser refuses import-time side effects
-    and why this runs inside the sandbox rather than in the validator.
-    """
+    Import executes submitted code, so this runs inside the sandbox, not in
+    the static validator."""
     file_name = entry["file"]
     path = os.path.join(src_dir, file_name)
     module_name = os.path.splitext(os.path.basename(file_name))[0]
@@ -113,24 +85,15 @@ def check_hooks(klass, hooks: dict) -> None:
             )
 
 
-# The parser, bound at import — BEFORE any strategy is loaded.
-#
-# `import json` is on the strategy allowlist and `json.loads = ...` passes
-# static analysis, so an unbound lookup would let a strategy see every row the
-# harness decodes. Defence in depth behind the streaming below.
+# Capture the parser before loading strategy code to prevent json.loads
+# rebinding from intercepting the job stream.
 _LOADS = json.loads
 
 
 def read_line(stream):
-    """One line off the job stream, or None at end.
+    """Read one job-stream line, or return None at EOF.
 
-    The job arrives on stdin rather than as files, and events are pulled ONE AT
-    A TIME as the replay loop asks for them — see the long note on
-    syncLineReader in harness.mjs. The previous version decoded a whole
-    market's events before replay started, which put the future in the process
-    and only required the strategy to intercept `json.loads` at import time to
-    steal it.
-    """
+    Replay pulls events as needed rather than decoding a whole market up front."""
     line = stream.readline()
     if not line:
         return None

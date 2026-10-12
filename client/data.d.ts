@@ -1,7 +1,7 @@
 // Types for the data-subscription client, `outcometick/data`.
 //
 // Hand-written against api/subscription-api.mjs, like the strategy SDK's
-// declarations, and guarded the same way — see client/data-types.test.mjs.
+// declarations, and guarded the same way; see client/data-types.test.mjs.
 
 /** A filter value: one alternative, or several meaning "any of these". */
 export type Filter = string | readonly string[];
@@ -17,9 +17,7 @@ export declare class OutcometickError extends Error {
   /** The API's `error` string. */
   readonly detail: string;
   /**
-   * The parsed response. A 403 on a date outside coverage also carries `floor`
-   * and `ceiling` — the difference between "no" and "no, but here is the range
-   * you do have".
+   * Parsed response. Out-of-coverage 403 responses include floor and ceiling.
    */
   readonly body: unknown;
   readonly url: string;
@@ -33,7 +31,7 @@ export interface FileRow {
   dataset: string;
   /** null for datasets that are not per-asset. */
   asset: string | null;
-  /** null for streams with no period — the settlement feeds. */
+  /** null for streams without a period, such as settlement feeds. */
   interval: string | null;
   bytes: number;
   sha256: string;
@@ -69,9 +67,9 @@ export interface FilesQuery {
   venue?: Filter;
   dataset?: Filter;
   /**
-   * The BASE symbol — `BTC`, `ETH`, `SOL`, … NOT the trading pair. Files are
-   * named `BTCUSD-…`, but the dimension is `BTC`; `"BTCUSD"` matches nothing.
-   * `meta().assets` lists the real values.
+   * Base symbol: BTC, ETH, SOL, etc., rather than the trading pair.
+   * Files may be named BTCUSD-…, but BTCUSD matches no asset dimension.
+   * meta().assets lists valid symbols.
    */
   asset?: Filter;
   /** `"none"` selects the streams that have no period at all. */
@@ -87,7 +85,7 @@ export interface MetaResult {
   days: number;
   venues: string[];
   assets: string[];
-  /** Real durations only — the sentinel lives in `filterTokens`. */
+  /** Real durations only; the sentinel lives in `filterTokens`. */
   intervals: string[];
   /** dataset name -> human description. */
   datasets: Record<string, string>;
@@ -191,7 +189,7 @@ export declare class DataClient {
   download(file: FileRow, options?: DownloadOptions): Promise<DownloadResult>;
   download(date: string, name: string, options?: DownloadOptions): Promise<DownloadResult>;
 
-  /** Public — no key required. */
+  /** Public; no key required. */
   coverage(): Promise<unknown>;
   plans(): Promise<unknown>;
   health(): Promise<unknown>;
@@ -234,7 +232,7 @@ export declare class OrderBook {
   /** Token ids seen so far. */
   assets(): string[];
   ladder(assetId: string): BookLadder;
-  /** The best level of the rebuilt ladder — not the market's latest best bid/ask (read best_bid_ask rows for that). */
+  /** The best level of the rebuilt ladder; not the market's latest best bid/ask (read best_bid_ask rows for that). */
   best(assetId: string): { bid: BookLevel | null; ask: BookLevel | null };
 }
 

@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
-"""Static analysis of a submitted Python strategy.
+"""Static analysis of submitted Python strategies using the stdlib ast parser.
+Keep validation rules in sync with runner/analyze/javascript.mjs.
 
-The mirror of runner/analyze/javascript.mjs, and it must stay a mirror: the two
-languages are advertised as having identical semantics, so a construct rejected
-in one and accepted in the other is a broken promise, not a quirk.
-
-A real parse via the stdlib `ast`, never a regex. `Math.random` in a docstring
-is not a call and `# import os` is a comment; a regex cannot tell the
-difference, and the docs promise that a local `ot check` pass is not rejected on
-submit. A false positive here breaks that promise.
-
-Reads a JSON job on stdin and writes a JSON verdict on stdout:
+Read a JSON job on stdin and write a JSON verdict on stdout:
 
     {"files": [{"name": "strategy.py", "content": "..."}], "deps": ["numpy"]}
     -> {"ok": true, "imports": ["numpy"], "feeds": [{"kind": "ref", "name": "...", "file": "...", "line": 9}]}
-    -> {"ok": false, "code": "E_IMPORT", "detail": "...", "file": "...", "line": 3}
-"""
+    -> {"ok": false, "code": "E_IMPORT", "detail": "...", "file": "...", "line": 3}"""
 
 import ast
 import json
 import sys
 
-# Modules a strategy may import beyond its declared deps. `outcometick` is the
-# SDK itself; the rest are pure-computation stdlib with no clock, no I/O and no
-# entropy. `random` is NOT here — seeded randomness is ctx.random.
+# SDK and computation modules available without declared deps.
+# Use ctx.random for seeded randomness; random is excluded.
 ALWAYS_ALLOWED = {
     "outcometick",
     "math",
@@ -84,11 +74,8 @@ FORBIDDEN_IMPORTS = {
     "locale": "locale changes number formatting, which breaks byte-identical reports",
 }
 
-# Names that are a door around every other check in this file.
-#
-# `__builtins__.open(...)` and `__builtins__.eval(...)` reach exactly the
-# builtins FORBIDDEN_CALLS refuses, and neither is a bare call nor a dunder
-# ATTRIBUTE, so both slipped through. The name itself has to go.
+# Names that expose forbidden builtins or module loaders without a bare call
+# or dunder attribute access.
 FORBIDDEN_NAMES = {
     "__builtins__": "reaches every builtin the allowlist refuses",
     "builtins": "reaches every builtin the allowlist refuses",
@@ -145,17 +132,8 @@ def check_import(module, name, line, deps, relative_ok):
             else "E_FORBIDDEN"
         )
         raise Reject(code, f"{name}:{line}: import {root} — {FORBIDDEN_IMPORTS[root]}", name, line)
-    # `outcometick` is allowed as the SDK module and nothing else. In the
-    # sandbox it is a single flat module -- Strategy and Order -- so
-    # `outcometick.data` resolves to nothing there, even though pip installs it
-    # as a real submodule. Allowing it because the ROOT matches would mean
-    # `ot check` passing a strategy that dies on import after being queued,
-    # which is the exact failure the "if it passes locally it will not be
-    # rejected on submit" promise exists to prevent.
-    #
-    # The JavaScript analyser has always compared the whole specifier, so
-    # `outcometick/data` was already refused there. This is the Python half of
-    # the same rule.
+    # The sandbox provides only the flat outcometick SDK module, not installed
+    # submodules such as outcometick.data. Keep in sync with the JS import check.
     if root == "outcometick" and module != "outcometick":
         raise Reject(
             "E_IMPORT",
@@ -205,16 +183,11 @@ def binding_counts(root):
 
 
 def feed_calls(tree, name, entry, hook_methods):
-    """Every `ctx.ref(...)` / `ctx.ext(...)` whose argument is known here, and
-    every `ctx.p` read whose name is (kind "param", see param_reads_checkable).
+    """Collect known ctx.ref/ctx.ext calls and checkable ctx.p reads (kind 'param').
 
-    Only in the entry class's own declared hook methods -- the one place the
-    runner is known to pass the context -- on the hook's context parameter,
-    and only if that parameter is never rebound in the method: a helper with a
-    `.ref` method of its own must not be mistaken for the context. Known means a string literal, or a module-level constant bound to
-    one and bound nowhere else in the file. Anything less certain is skipped --
-    what this reports can reject a submission.
-    """
+    Only inspect the entry class's declared hooks with an unrebound context
+    parameter. Names must be string literals or uniquely bound module constants.
+    Skip uncertain reads to avoid false rejections; see param_reads_checkable."""
     binds = binding_counts(tree)
     consts = {}
     for stmt in tree.body:
@@ -227,14 +200,12 @@ def feed_calls(tree, name, entry, hook_methods):
             consts[target] = value.value
 
     found = []
-    # Over EVERY file, not just the entry: a helper module handed `ctx` can
-    # fill a param in too. main() combines them.
+    # Check all files: helper modules may add params. main() combines the results.
     checkable = param_reads_checkable(tree, consts)
     if not entry or name != entry.get("file"):
         return found, checkable
     class_name = entry.get("className")
-    # The runner takes the module's FINAL binding of the name: a second
-    # `class S` (or any rebinding) and the one read here may not be the one run.
+    # Require a unique class binding; the runner uses the module's final binding.
     if binds.get(class_name) != 1:
         return found, checkable
     # `self.on_tick = ...` anywhere replaces the method the runner would call.
@@ -301,19 +272,12 @@ def _const_str(node, consts):
 
 
 def param_reads_checkable(tree, consts):
-    """Whether `ctx.p.<name>` reads can be checked against the manifest at all,
-    and the names the file itself guards.
+    """Return whether param reads are checkable and which names the file guards.
 
-    ctx.p is exactly the manifest's params (a Rec: a missing name raises), so a
-    read of an undeclared name fails the run on the first market that reaches
-    it. Anything in the file that could put a name there, or that tests for
-    one first, makes that conclusion uncertain -- and what this reports can
-    reject a submission. So every `<anything>.p` must be used in one of the
-    shapes below; any other use (a write, any other dict method, an alias
-    `p = ctx.p`, passing it to a helper, iterating it, `**ctx.p`) and nothing
-    is checked. A name tested with a literal `in` / `.keys()` / `.get()` /
-    `hasattr` is skipped.
-    """
+    Missing Rec params raise at runtime. Writes, aliases, helper calls, iteration,
+    **ctx.p or unsupported dict methods can change or guard params, so disable
+    checks for those uses. Skip names guarded by literal in, .keys(), .get()
+    or hasattr checks."""
     guarded = set()
     parents = {}
     for node in ast.walk(tree):
@@ -340,7 +304,7 @@ def param_reads_checkable(tree, consts):
                     guarded.add(key)
                     continue
                 # `x in ctx.p.keys()` tests a name like `x in ctx.p` does. Any
-                # other dict method -- iterating items() included -- could
+                # other dict method, iterating items() included, could
                 # guard a name unseen, or put one there.
                 comp = parents.get(id(call))
                 if not (up.attr == "keys" and isinstance(comp, ast.Compare) and call in comp.comparators
@@ -417,14 +381,8 @@ def analyze_source(source, name, deps, entry=None, hook_methods=()):
         raise Reject("E_ENTRY", f"{name}:{err.lineno}: {err.msg}", name, err.lineno) from err
 
     imports = []
-    # Names bound anywhere in the file.
-    #
-    # Used ONLY to decide that a module-level global reference is really a
-    # local. It is deliberately NOT used to excuse a forbidden builtin any
-    # more: `def on_tick(self, ctx, tick, getattr=getattr)` binds the name
-    # `getattr` while the DEFAULT VALUE captures the real builtin, and the
-    # shadowing exemption then waved the whole thing through. A rule whose
-    # exemption is itself the attack is not a rule.
+    # Bound names distinguish locals from unknown module globals. Forbidden
+    # builtins remain rejected: default parameters can capture the builtin.
     bound = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -445,8 +403,7 @@ def analyze_source(source, name, deps, entry=None, hook_methods=()):
 
     for node in ast.walk(tree):
         if isinstance(node, ast.arg) and node.arg in FORBIDDEN_CALLS:
-            # `def f(open=open)` — the parameter NAME is an ast.arg and the
-            # default is an ast.Name, so both halves need refusing.
+            # Check parameter names and default expressions separately.
             code, why = FORBIDDEN_CALLS[node.arg]
             raise Reject(
                 code,
@@ -488,9 +445,7 @@ def analyze_source(source, name, deps, entry=None, hook_methods=()):
                 )
 
         elif isinstance(node, ast.Attribute):
-            # An attribute whose NAME is a forbidden builtin, however it was
-            # reached: obj.open(...), obj.eval(...). The receiver does not
-            # matter — if we cannot see what it is, we cannot allow the call.
+            # Reject attributes named after forbidden builtins, regardless of receiver.
             if node.attr in FORBIDDEN_CALLS:
                 code, why = FORBIDDEN_CALLS[node.attr]
                 raise Reject(
@@ -499,12 +454,8 @@ def analyze_source(source, name, deps, entry=None, hook_methods=()):
                     name,
                     node.lineno,
                 )
-            # A private attribute on anything that is not `self`.
-            #
-            # Not a blanket rule: `self._entered` is ordinary Python and
-            # refusing it would reject working strategies. But `ctx._pf`,
-            # `ctx.book()._b` and `obj._anything` are reaching into something
-            # that belongs to the engine.
+            # Allow private attributes on self for strategy state. Other receivers may
+            # expose engine internals, such as ctx._pf or ctx.book()._b.
             if (
                 node.attr.startswith("_")
                 and not node.attr.startswith("__")
@@ -559,8 +510,7 @@ def main():
             for spec in imports:
                 if not spec.startswith("."):
                     continue
-                # A relative import must resolve to a file that was submitted,
-                # or the run fails after the credits are held.
+                # Relative imports must resolve within the submitted files.
                 target = spec.lstrip(".")
                 if target and f"{target}.py" not in names:
                     raise Reject(

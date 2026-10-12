@@ -1,13 +1,6 @@
-// A run's pre-registration fingerprint: one sha256 over everything that decides
-// what a backtest computes — the strategy's code, its manifest (with defaults
-// spelled out), the params it ran with, the execution options, the data scope
-// and the seed. Compute it BEFORE looking at results (`ot fingerprint`,
-// `outcometick.backtest.fingerprint`), publish it, then show the report that
-// carries the same value: proof that what was tested is what was announced.
-//
-// Built from the strategy directory's own files (outcometick.json + code), so
-// the hosted queue, `ot run` and the Python runner get the same value for the
-// same directory and scope. MUST MATCH client/backtest/fingerprint.py.
+// Pre-registration digest of strategy files, defaults, parameters, execution
+// options, data scope and seed. Compute before inspecting results. Shared by
+// hosted and local runs; keep in sync with client/backtest/fingerprint.py.
 
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -17,10 +10,8 @@ import { SANDBOX_IMAGE_TAG, DECODE_SEMANTICS } from './backtest-contract.mjs';
 
 export const FINGERPRINT_VERSION = 1;
 const MANIFEST = 'outcometick.json';
-// Everything the strategy can read is part of what it is: every submitted file,
-// byte for byte — code, a config .json, a declared series, and outcometick.json
-// itself (its exact bytes: a parsed copy rounds integers past 2^53, which a
-// Python strategy would still read exactly).
+// Hash every submitted file, including config and series. Preserve raw
+// manifest bytes because JSON parsing rounds integers above 2^53.
 
 /** JSON with object keys sorted at every level; a non-finite number is null. */
 export function canonicalJson(v) {
@@ -47,11 +38,10 @@ export function codeDigest(files) {
 const sortedUnique = (xs) => [...new Set((xs ?? []).map(String))].sort();
 
 /**
- * The exact archive files a run read, as one sha256: sorted unique
- * "path:sha256(bytes)" lines. Reported next to the fingerprint (not inside it:
- * the files are only known once the run has read them). The hosted catalog's
- * paths and checksums and a local archive's relative paths and bytes give the
- * same value for the same files. MUST MATCH inputs_digest in fingerprint.py.
+ * Digest sorted, unique "path:sha256(bytes)" input lines, or null for no inputs.
+ * Report separately from pre-registration because files are known after decoding.
+ * Hosted and local inputs use the same relative paths and checksums.
+ * Keep in sync with inputs_digest in client/backtest/fingerprint.py.
  */
 export function inputsDigest(lines) {
   const list = [...new Set(lines ?? [])].sort();
@@ -79,9 +69,9 @@ export function expandDays(from, to) {
 }
 
 /**
- * Your own data's identity: sha256 over the markets file and every frame file
- * the generic decoder reads (runner/generic-data.mjs datasetFiles), each as
- * name\0sha256(bytes)\0, in name order. MUST MATCH dataset_digest in fingerprint.py.
+ * Generic-data digest: markets file first, then sorted frame files from
+ * runner/generic-data.mjs datasetFiles, each encoded as name\0sha256(bytes)\0.
+ * Keep in sync with dataset_digest in fingerprint.py.
  */
 export async function datasetDigest(root, { marketsFile, files }) {
   const h = createHash('sha256');
@@ -94,10 +84,8 @@ export async function datasetDigest(root, { marketsFile, files }) {
 }
 
 /**
- * The canonical description a fingerprint hashes, from a manifest document
- * (outcometick.json as written) and the run's scope. `params` overrides the
- * manifest's (a sweep cell); `code` is codeDigest of the files, or null for a
- * strategy that has none (an in-process Python class).
+ * Canonical input from manifest and scope. params overrides manifest defaults
+ * for a sweep cell; code is codeDigest or null for an in-process Python class.
  */
 export function fingerprintInput({
   manifest, code = null, scope = {}, seed = 1, data = 'archive', params = undefined, seriesSha = {},
@@ -129,7 +117,7 @@ export function fingerprintInput({
     implementation: { image: SANDBOX_IMAGE_TAG, decode: DECODE_SEMANTICS },
     params: params !== undefined ? params : (m.params ?? {}),
     reference: sortedUnique(m.reference),
-    // The series' bytes too: swapping the data under the same name is a different test.
+    // Include series checksums so changing data changes the fingerprint.
     series: [...(m.series ?? [])].map((s) => ({
       name: s?.name ?? null, file: s?.file ?? null, lag_ms: s?.lag_ms ?? 0, sha256: seriesSha[s?.file] ?? null,
     }))
@@ -145,14 +133,16 @@ export function fingerprintInput({
     scope: {
       venue: scope.venue ?? null,
       assets: sortedUnique((scope.assets ?? []).map((a) => String(a).toUpperCase())),
-      // The days actually run, in order — not just the first and the last.
+      // Actual replay days in order, including gaps.
       days: [...(scope.days ?? [])].map(String),
     },
     seed: seed ?? 1,
   };
 }
 
-/** The fingerprint of a run: { version, sha256, code_sha256 }. */
+/**
+ * Run fingerprint: version, sha256, code_sha256 and data_sha256.
+ */
 export function runFingerprint(args) {
   const input = fingerprintInput(args);
   return {
@@ -171,7 +161,7 @@ export function fingerprintOfFiles(files, {
   let manifest = null;
   try { manifest = doc ? JSON.parse(doc.content) : null; } catch { manifest = null; }
   if (!manifest || typeof manifest !== 'object') return null;
-  // Each DECLARED series file's bytes, whatever its extension.
+  // Hash declared series files regardless of extension.
   const byName = new Map((files ?? []).map((f) => [f.name, f]));
   const seriesSha = {};
   for (const s of Array.isArray(manifest.series) ? manifest.series : []) {

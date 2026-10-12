@@ -1,15 +1,5 @@
-// Reading a cloned sample archive off disk, for `ot run`.
-//
-// The counterpart to runner/fetch-data.mjs, which reads the same archive out of
-// R2. Both go through runner/events.mjs for the row -> event mapping, because
-// the docs make a promise about exactly this pair:
-//
-//     The identical files, byte for byte, with the same checksums. A backtest
-//     here and a backtest on your own machine after subscribing read the same
-//     bytes — that is the point of offering it.
-//
-// Two decoders would make that false the first time they disagreed, and the
-// disagreement would be silent.
+// Read a local archive for ot run. Share runner/events.mjs and spool-day.mjs
+// with the hosted reader to preserve event decoding and ordering.
 
 import { createReadStream } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
@@ -31,23 +21,12 @@ import { spoolDay } from '../runner/spool-day.mjs';
 import { spoolDayParallel } from './parallel-decode.mjs';
 
 /**
- * Every file under a directory, as archive-relative paths.
- *
- * Symlinks are skipped rather than followed, in both directions: a symlinked
- * directory is not descended into and a symlinked file is not read. `--data`
- * points at a directory the user cloned from the internet, and git happily
- * carries symlinks — so without this, a repo dressed up as sample data could
- * name `~/.ssh/id_rsa` as a prices file and have `ot run` read it. Very little
- * of an arbitrary file survives being parsed as archive rows, which makes this
- * a poor exfiltration channel rather than a safe one; there is no reason to
- * leave it open when the fix is to not follow the link.
- *
- * Regular files and real directories are all a genuine archive contains.
+ * Return archive-relative paths for regular files, skipping symlinked files
+ * and directories so the archive cannot reference files outside its root.
  */
 export async function walk(root, prefix = '', depth = 0) {
   const out = [];
-  // A real archive is nested about six deep. The bound is what stops a
-  // symlink-free cycle or a pathologically deep tree from spinning here.
+  // Archives are about six levels deep; bound traversal of unusually deep trees.
   if (depth > 12) return out;
   let entries;
   try {
@@ -68,13 +47,7 @@ export async function walk(root, prefix = '', depth = 0) {
 async function* readRows(root, rel) {
   const full = path.join(root, rel);
   const raw = createReadStream(full);
-  // `pipeline`, not `raw.pipe(...)`, for the same reason the queue's reader
-  // uses it: `.pipe()` does not forward errors, so a failure on `raw` — a
-  // truncated file, a disk that went away mid-read — emits 'error' on a stream
-  // nobody is listening to, which in Node is process death rather than an
-  // exception. That exact shape killed the worker in production; the risk is
-  // lower on a local file, but the wrong pattern is not worth keeping a second
-  // copy of.
+  // Use pipeline to propagate source errors to gunzip; pipe does not forward them.
   let stream = raw;
   if (rel.endsWith('.gz')) {
     const gunzip = createGunzip();
@@ -99,11 +72,7 @@ async function* readRows(root, rel) {
 }
 
 /**
- * Which UTC day a sample archive path belongs to.
- *
- * The sample repos name files with the day in them, the same as the archive.
- * A file we cannot date is skipped rather than guessed at — a mis-dated file
- * would put one day's events into another day's market.
+ * Extract the UTC day from an archive filename; return null if undated.
  */
 export function dayOfPath(rel) {
   const m = /(\d{4}-\d{2}-\d{2})/.exec(rel);
@@ -121,13 +90,9 @@ export async function loadLocalDay({
 }) {
   // `spot` is decoded from the `prices` tree into its own events (DATASETS.spot).
   const spot = (datasets ?? []).includes('spot');
-  // Day-scoped, and degrading datasets gated by their capture window — the
-  // same call the queue makes, because `ot run` and the worker have drifted
-  // apart nine times and every one of them was a rule computed twice.
+  // Select datasets using their capture windows, as the hosted reader does.
   const archiveDatasets = archiveDatasetsForDay({ datasets, venue, day, from: day, to: day });
-  // Same normalisation, same default, same two filters as the queue. `ot run`
-  // promises the identical files and checksums; an interval narrowing applied
-  // on one side only would break that on the very first 15m market.
+  // Share interval normalization and filtering with the hosted reader.
   const wantIntervals = normalizeIntervals(intervals ?? null);
   const all = await walk(root);
   const wanted = all.filter((rel) => dayOfPath(rel) === day
@@ -160,23 +125,13 @@ export async function loadLocalDay({
   }
   const bySlug = buildSlugIndex(markets);
 
-  // The settlement files these markets need, from the SAME function the queue
-  // uses. Selecting them here separately is how "it runs locally but not in the
-  // queue" happens — and it had already happened: without this, a strategy
-  // asking for `prices` read nothing at all locally while the queue produced a
-  // report, off the identical archive.
+  // Use the hosted settlement-file selector, including implicit price streams.
   const feed = orderedFeed([...wanted, ...settlementPathsFor(markets.values(),
     all.filter((rel) => dayOfPath(rel) === day), { venue, assets, already: wanted })]);
 
-  // THE SAME SPOOL THE QUEUE USES — see spoolDay. This used to collect every
-  // event of the day in memory before replaying any of it; one day of Predict
-  // BTC is ~480k full-ladder snapshots, ~12KB each once parsed, and `ot run`
-  // died of a 4GB heap on the public sample. Each market's events go to their
-  // own file under `eventsDir`; `ot run` reads them back one market at a time.
-  //
-  // On `workers` threads when asked (cli/parallel-decode.mjs): the same files
-  // and answer, or null -- and then this, the sequential spool, decides.
-  // (`stats.parallel` says which one did, for the tests.)
+  // Spool per-market events to disk to bound memory. Use parallel decoding when
+  // available; null falls back to the sequential spool. stats.parallel records
+  // which path ran.
   const threaded = await spoolDayParallel({
     day, markets, bySlug, throttle, eventsDir, feedPaths: feed, root, workers, chunkBytes, spot,
   });
@@ -187,14 +142,9 @@ export async function loadLocalDay({
   });
 
   return {
-    // THE SAME ORDER THE QUEUE FEEDS — see sortMarketsForReplay. A local replay
-    // that emitted its logs in a different order than the queue would break the
-    // one promise `ot run` makes: the identical files from the identical
-    // archive.
+    // Use the hosted market replay order.
     markets: sortMarketsForReplay(out),
-    // Every file this day was actually read from, the same field the queue
-    // records — coverage states which days really read the top-of-book stream,
-    // and it has to answer that the same way on both sides.
+    // Files read for this day, used for coverage and input fingerprints.
     inputs: feed,
     bboKeys: [...bboSeen].filter(Boolean).sort(),
     unusable,
@@ -226,13 +176,8 @@ export async function archiveVenues(root) {
 }
 
 /**
- * The venue `ot run` replays when `--venue` is not given.
- *
- * The public samples are one venue per archive, and a polymarket read of the
- * predict one sees no files at all — so the documented
- * `ot run . --data ./predict-fun-data-samples` failed with "no files for <day>"
- * and nothing pointed at the missing flag. Only an archive that holds predict
- * and nothing else changes the default; everything else keeps polymarket.
+ * Choose Predict for a Predict-only archive; otherwise default to Polymarket
+ * when --venue is omitted.
  */
 export function defaultVenue(venues) {
   return venues.size === 1 && venues.has('predict') ? 'predict' : 'polymarket';

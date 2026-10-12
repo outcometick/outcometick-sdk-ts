@@ -1,17 +1,5 @@
-// Where the dataset starts, for two different audiences.
-//
-// The archive genuinely holds 2026-06-06 onward, and the API says so: a
-// customer querying what exists must be told what exists. But collection began
-// PART-WAY THROUGH 06-06, so that day and 06-07 are partial — and a marketing
-// line that says "since 06-06" invites a buyer to check, find two thin days and
-// conclude the coverage claims cannot be trusted. The two dates answer
-// different questions, so both are published rather than one being bent:
-//
-//   firstDay          what the archive contains        (API contract)
-//   firstCompleteDay  the first full UTC day           (what we advertise)
-//
-// Same convention as the public sample repos, which have always started their
-// range at the first complete day.
+// firstDay includes partial collection days. firstCompleteDay marks the first
+// full UTC day used for complete-day counts.
 
 /** First complete UTC day per venue. Collection started mid-day before these. */
 export const FIRST_COMPLETE_DAY = Object.freeze({
@@ -19,63 +7,36 @@ export const FIRST_COMPLETE_DAY = Object.freeze({
   predict: '2026-06-13',    // 06-12 is ~66% of the day
 });
 
-/** The product as a whole starts when its earliest venue is complete. */
+/**
+ * Earliest complete day across venues.
+ */
 export const PRODUCT_FIRST_COMPLETE_DAY = FIRST_COMPLETE_DAY.polymarket;
 
 /**
- * First UTC day a BACKTEST can use. Different question from the one above.
- *
- * A replay has to know which price stream settled each market, and that answer
- * comes from the market's own `raw.cryptoMarketConfig.twapLookbackSeconds`.
- * MEASURED: polymarket markets carry it from 2026-08-08 and not before —
- * 0/98 on 08-05, 08-06 and 08-07, 98/98 on 08-08. Days before that decode
- * fine and then drop every market ("settlement stream could not be resolved"),
- * so a run over them burns twenty minutes and refunds in full.
- *
- * WHY NOT INFER THE OLD RULE. It was tried, with the archive as the judge:
- * every settled market records its strike and its actual outcome, so a
- * candidate rule can be scored against reality. "Raw chainlink price at close"
- * reproduces 97.9–100% of settled markets across three sampled days — close,
- * and therefore worse than useless: a table built on it would decide about
- * 1.5% of markets the wrong way, in reports that look completely ordinary.
- * The TWAP hypotheses could not even be tested, because a recomputed TWAP
- * failed its control against the archived one (differing by up to $57, enough
- * to settle a market the other way). Owner's call, 2026-08-25: offer only the
- * days the archive can answer for.
- *
- * This is DATA COVERAGE, not a limit — `/v1/backtest/capacity` reports it and
- * the page offers only what it can deliver.
+ * First usable backtest day. Polymarket requires twapLookbackSeconds for
+ * settlement resolution: archive samples had it on 0/98 markets per day
+ * on 08-05 through 08-07 and 98/98 on 08-08. Earlier markets decode but
+ * cannot resolve settlement. Do not infer old rules: raw-close hypotheses
+ * reproduced only 97.9–100% of sampled outcomes, and recomputed TWAPs
+ * failed the archived control by up to $57.
  */
 export const FIRST_BACKTEST_DAY = Object.freeze({
   polymarket: '2026-08-08',
-  // Predict settles off fields carried on the market row itself rather than a
-  // separate stream, so it is not affected by the polymarket cutover. Pinned
-  // to its first complete day until measured otherwise.
+  // Predict settlement fields are on market rows; use its first complete day.
   predict: FIRST_COMPLETE_DAY.predict,
 });
 
 /**
- * How many of the most recent archived days a backtest may use, per venue.
- *
- * A DISK DECISION, not a data one (owner 2026-09-28: no more spend on the
- * backtest box). Every sellable day has to sit in the worker's decoded cache —
- * a cold day is a fetch that runs out of budget and refunds — and the cache is
- * the only thing on that disk that grows. Measured 2026-09-28: ~1.37 GB/day
- * polymarket + ~0.34 GB/day predict, ~76 GB usable ⇒ ~44 days at the average,
- * ~38 at the peak. 35 leaves room for volume growth.
- *
- * Anchored on the last ARCHIVED day, like the subscription's rolling window.
- * The prewarm job deletes cached days that fell out of it, so raising this
- * means re-warming (and checking the disk) first.
+ * Hosted cache window anchored on the last archived day. Worker measurements:
+ * about 1.37 GB/day Polymarket and 0.34 GB/day Predict, with 76 GB usable disk
+ * (44 average days or 38 peak days). 35 leaves growth headroom.
+ * Check capacity and prewarm before increasing the window.
  */
 export const BACKTEST_WINDOW_DAYS = 35;
 
 /**
- * The days a backtest may actually be sold on a venue.
- *
- * Both floors apply: a day has to be complete AND has to be one the archive
- * can attribute a settlement stream to. Then only the most recent
- * BACKTEST_WINDOW_DAYS of those.
+ * Complete archived days after the settlement-metadata floor, restricted
+ * to the most recent BACKTEST_WINDOW_DAYS entries.
  */
 export function backtestDayList(days, venue) {
   const v = String(venue ?? '').toLowerCase();
@@ -87,22 +48,10 @@ export function backtestDayList(days, venue) {
 }
 
 /**
- * The advertised window over a sorted list of archived days.
- *
- * Counts from the first complete day, never from the first day held — quoting
- * "69 days since 06-06" and "since 06-08" in the same breath is the kind of
- * inconsistency a buyer notices before anything else.
- *
- * @param {string[]} days sorted ascending
+ * Complete-day counts use archive entries rather than elapsed calendar days.
  */
 /**
- * The days a run may actually be sold, out of everything the archive holds.
- *
- * One definition, used by both the advertised count and the billable window.
- * A partial day is real data and the API says it exists, but a full credit buys
- * a market-DAY — charging one for a day collection only caught part of is the
- * same gap-must-reduce-billing rule the quote already follows, pointed at the
- * front of the archive instead of the middle.
+ * Filter from the first complete UTC day, preserving gaps.
  *
  * @param {string[]} days sorted ascending
  */
@@ -114,8 +63,7 @@ export function completeWindow(days, firstComplete = PRODUCT_FIRST_COMPLETE_DAY)
   const full = completeDayList(days, firstComplete);
   return {
     firstCompleteDay: full[0] ?? null,
-    // Length of the list, not a date subtraction: a gap in the archive must
-    // reduce this, and calendar arithmetic would paper over it.
+    // Count entries so archive gaps reduce coverage.
     completeDays: full.length,
   };
 }

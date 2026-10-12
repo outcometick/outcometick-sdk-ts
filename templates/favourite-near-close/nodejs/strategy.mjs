@@ -1,13 +1,9 @@
 import { Strategy, Order } from "outcometick";
 
-// Buy the side that is winning on the settlement feed, late, and hold it.
+// Buy the side favoured by the settlement feed near close and hold it.
 //
-// An up/down market settles on its own Chainlink stream (twap60s for 5m and
-// 15m markets) against the price at the open -- the strike. That stream is
-// exactly what onTick delivers, so `tick.value - market.strike` is how far the
-// side in front is ahead RIGHT NOW, measured in the number that decides the
-// market. In the last seconds that lead rarely flips; the question is whether
-// the book still sells the winning side cheaply enough to be worth it.
+// Compare the market's Chainlink stream (twap60s for 5m and 15m) against its
+// opening strike. Enter only when the lead and ask meet the thresholds.
 export default class FavouriteNearClose extends Strategy {
   onMarketOpen(ctx, market) {
     this.strike = market.strike;

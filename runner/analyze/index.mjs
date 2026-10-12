@@ -1,35 +1,12 @@
-// Choosing the analyser for a submission's language.
-//
-// This exists as a shared function, in a file both sides can import, because
-// the docs make a promise that only holds if there is ONE of it:
-//
-//     ot check runs the exact validator the queue runs. If it passes locally
-//     it will not be rejected on submit.
-//
-// api/lib/backtest-routes.mjs and cli/ot.mjs both call this. They used to each
-// dispatch on languageId themselves, and the two dispatches were not the same:
-// the server threw for an unrecognised language while the CLI fell through to
-// the JavaScript analyser. With only nodejs and python that difference was
-// invisible, but it would have surfaced the day a third language was added —
-// as `ot check` cheerfully passing a Go strategy it had analysed as JavaScript,
-// followed by a rejection after queueing. Which is precisely the experience the
-// promise above exists to prevent.
+// Shared language dispatch for CLI and server submission checks.
 
 import { analyzeJavaScriptSubmission } from './javascript.mjs';
 import { analyzePythonSubmission } from './python.mjs';
 import { BacktestRejection, parseReferenceFeed, HOOK_NAMES } from '../../api/lib/backtest-contract.mjs';
 
 /**
- * Every `ctx.ref(name)` / `ctx.ext(name)` the analyser could read must name a
- * feed or series the manifest declares, and every `ctx.p` name it could read
- * (Python) a declared param.
- *
- * At run time an undeclared name is E_MANIFEST on the first market that asks —
- * after the run was queued and the credits held. On 2026-10-08 a customer hit
- * that three times in two minutes with the same source (a reference feed used
- * but not ticked in the editor), then gave the strategy up. Here it costs
- * nothing. The runtime lookup is exact, so this is too: the declared reference
- * names are the canonical (lower-case) spellings.
+ * Check known feed, series and Python param reads against the manifest.
+ * Reference names use canonical lower-case spellings, as at runtime.
  */
 export function assertFeedsDeclared(feeds, manifest) {
   const refs = new Set(manifest.reference ?? []);
@@ -37,11 +14,8 @@ export function assertFeedsDeclared(feeds, manifest) {
   const params = manifest.params ?? {};
   for (const f of feeds ?? []) {
     const at = f.line ? `${f.file}:${f.line}` : f.file;
-    // kind "param" (Python only): ctx.p is exactly the manifest's params, and a
-    // missing name raises on the first market that reads it. 2026-10-12: a
-    // customer's run failed on `ctx.p.slip`, never added to "params". JS is not
-    // checked: there a missing param reads as undefined, and `ctx.p.x ?? d` is
-    // a legitimate default this would refuse.
+    // Missing Python params raise. JavaScript returns undefined, so defaults
+    // such as ctx.p.x ?? d remain valid there.
     if (f.kind === 'param') {
       if (Object.hasOwn(params, f.name)) continue;
       const read = /^[A-Za-z_]\w*$/.test(f.name) ? `ctx.p.${f.name}` : `ctx.p[${JSON.stringify(f.name)}]`;
@@ -70,7 +44,7 @@ export function assertFeedsDeclared(feeds, manifest) {
 /**
  * Statically analyse a checked submission.
  *
- * @param checked  The result of checkSubmission — already validated, so the
+ * @param checked  The result of checkSubmission, already validated, so the
  *                 language is known to be one the contract lists.
  */
 export async function analyzeSource(checked) {
@@ -88,8 +62,7 @@ export async function analyzeSource(checked) {
     assertFeedsDeclared(result.feeds, checked.manifest);
     return result;
   }
-  // Fail closed. A language the contract accepts but no analyser covers is a
-  // gap on our side, and running it unanalysed is not the safe reading of it.
+  // Reject contract languages without an analyser.
   const err = new Error(`no analyser for ${languageId}`);
   err.status = 503;
   throw err;

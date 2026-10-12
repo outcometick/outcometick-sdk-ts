@@ -39,7 +39,7 @@ test('hooks fire in event-time order and only the declared ones', () => {
     market: MARKET,
     events: [snap(1000), tick(1001, 1), tick(1002, 2), { kind: 'trade', ts_ms: 1003 }],
     strategy,
-    // on_trade is NOT declared, so it must never be called.
+    // Do not dispatch the undeclared on_trade hook.
     hooks: { on_market_open: 'on_market_open', on_tick: 'on_tick', on_settle: 'on_settle' },
   });
   assert.deepEqual(seen, [
@@ -58,7 +58,7 @@ test('a strategy can only see ticks it has already been given', () => {
     strategy,
     hooks: { on_tick: 'on_tick' },
   });
-  // Look-ahead is impossible: the history grows one row at a time.
+  // History grows only as events are replayed.
   assert.deepEqual(depths, [1, 2, 3]);
 });
 
@@ -117,8 +117,7 @@ test('returning a list closes and reverses in one event', () => {
       return null;
     },
   };
-  // outcome null so nothing settles — the point here is the position the two
-  // orders left behind, not what it was eventually worth.
+  // Leave the outcome null to inspect positions before settlement.
   replayMarket({
     market: { ...MARKET, outcome: null },
     events: [snap(1000), tick(1001, 1), tick(1002, 1), tick(1003, 1)],
@@ -126,8 +125,7 @@ test('returning a list closes and reverses in one event', () => {
   });
   assert.equal(pf.sizeOf('0xm', 'UP'), 0, 'the UP leg is closed');
   assert.equal(pf.sizeOf('0xm', 'DOWN'), 100, 'and reversed into DOWN');
-  // The close priced against the bid, the reversal against the ask — both from
-  // the same book, neither reusing the other's depth.
+  // The close uses bids and the reversal uses asks from the same book.
   const [close, open] = pf.fills.slice(1);
   assert.equal(close.action, 'reduce');
   near(close.avg_px, 0.49);
@@ -165,7 +163,7 @@ test('a returned null or empty list places nothing', () => {
 });
 
 // ---------------------------------------------------------------------------
-// fill delay — the latency panel
+// fill delay
 // ---------------------------------------------------------------------------
 
 test('a delayed fill prices against the later book, not the decision book', () => {
@@ -196,7 +194,7 @@ test('a delayed fill prices against the later book, not the decision book', () =
 });
 
 test('replaying the same decoded events twice gives the same answer', () => {
-  // This is what makes a sweep cost one market-day and a report reproducible.
+  // Reusing decoded data must produce deterministic replay results.
   const events = [snap(1000), tick(1001, 1), tick(1002, 2), tick(1003, 3)];
   const run = () => {
     const pf = new Portfolio();
@@ -262,9 +260,7 @@ test('logs are capped by BYTES and the truncation is reported', () => {
   assert.equal(res.logTruncated, true);
 });
 
-// A long line cannot buy more of the budget than a short one — the "one line
-// per event" shape is exactly how a strategy would dump the archive it just
-// paid for into a file it then downloads.
+// Enforce the per-line limit independently of the run-wide log budget.
 test('a single line cannot exceed the line cap', () => {
   const budget = makeLogBudget({ bytes: 1_000_000, lineChars: 32 });
   const res = replayMarket({
@@ -278,10 +274,8 @@ test('a single line cannot exceed the line cap', () => {
   assert.ok(res.logs[0].length <= 32, `a ${res.logs[0].length}-character line got through a 32-character cap`);
 });
 
-// The budget is advertised as 2 MB and logs.txt is UTF-8, so it has to be
-// counted in UTF-8 bytes. Counting `.length` counts UTF-16 units, and a run
-// logging Chinese would spend one unit for every three bytes it actually
-// wrote — an archive up to three times the size the contract states.
+// Count logs in UTF-8 bytes, matching logs.txt. UTF-16 string length
+// undercounts multi-byte text.
 test('the log budget counts UTF-8 bytes, not string length', () => {
   const line = '数据数据数据数据数据';        // 10 chars, 30 UTF-8 bytes
   const budget = makeLogBudget({ bytes: 1_000_000, lineChars: 512 });
@@ -299,10 +293,7 @@ test('the log budget counts UTF-8 bytes, not string length', () => {
     `spent ${budget.spent} for a line that occupies ${written} bytes in logs.txt`);
 });
 
-// crosschecks ride the same authenticated result line as everything else, and
-// ctx.assert_outcome can be called on every event with any payload. Unbounded,
-// that is an output channel with no budget — the exact shape of the ctx.log
-// hole, under a different name.
+// Bound crosschecks on the authenticated result channel independently of logs.
 test('cross-checks are bounded in count and in payload size', () => {
   const res = replayMarket({
     market: MARKET,
@@ -319,15 +310,11 @@ test('cross-checks are bounded in count and in payload size', () => {
     assert.ok(c.claimed.length <= 32,
       `a ${c.claimed.length}-character claim got onto the result line`);
   }
-  // Truncating what is RECORDED must not change the verdict: the panel's value
-  // is that it reports the archive's answer against what the strategy said.
+  // Truncating recorded details must not change the crosscheck verdict.
   assert.equal(res.crosschecks[0].match, false);
 });
 
-// THE HOLE THIS REPLACED. The allowance used to be per MARKET, and polymarket
-// has ~386 markets a day — so a run's real allowance was the stated one
-// multiplied by the number of markets, which turned ctx.log into a bulk export
-// priced at nothing. One budget object, shared, is the whole fix.
+// Share one log budget across all markets in a run.
 test('the log allowance is spent across markets, not renewed per market', () => {
   const budget = makeLogBudget({ bytes: 300, lineChars: 512 });
   const run = () => replayMarket({
@@ -342,7 +329,7 @@ test('the log allowance is spent across markets, not renewed per market', () => 
   assert.ok(first.logs.length > 0, 'the first market logged nothing at all');
   const spentAfterFirst = budget.spent;
 
-  // A second market on the SAME run gets what is left, not a fresh allowance.
+  // The second market uses the remaining run budget.
   const second = run();
   assert.ok(budget.spent >= spentAfterFirst, 'the budget went backwards');
   assert.ok(budget.spent <= 300 + 512, 'the second market was given a fresh allowance');
@@ -376,16 +363,13 @@ test('assert_outcome records a cross-check rather than failing the run', () => {
     hooks: { on_settle: 'on_settle' },
   });
   assert.equal(res.crosschecks.length, 1);
-  // MARKET settled UP, the strategy claimed DOWN.
+  // The market settled UP; the strategy claimed DOWN.
   assert.equal(res.crosschecks[0].official, 'UP');
   assert.equal(res.crosschecks[0].match, false);
 });
 
 test('a strategy cannot book itself a cross-check match', () => {
-  // The panel's whole value is that it is the ARCHIVE's answer. The market
-  // argument used to supply both `official` and `market_id`, so a strategy
-  // could hand in an object of its own and record a recompute match that never
-  // happened — "412 of 412 reconcile" on a report where nothing did.
+  // Derive official outcome and market id from engine-owned metadata.
   const res = replayMarket({
     market: MARKET,                       // really settled UP
     events: [tick(1, 1)],
@@ -408,17 +392,14 @@ test('a strategy cannot book itself a cross-check match', () => {
 // ---------------------------------------------------------------------------
 
 test('a single slow event is not a breach', () => {
-  // AT THE REAL WINDOW SIZE, because this property depends on it: a spike of S
-  // microseconds moves a window of W events by S/W, so absorbing the 18ms worst
-  // case measured in production needs W > 45. At the shipped 2,000 a single
-  // event would have to cost 800ms to trip this on its own.
+  // At the 2,000-event window, one event needs 800 ms to exceed a 400 us
+  // mean budget. The measured hosted-runner spike was 18 ms (W > 45).
   const m = new BudgetMonitor({ limitMicros: 400 });
   for (let i = 0; i < 4000; i += 1) m.record(10);
   m.record(18_000);
   assert.equal(m.breached, false, 'one GC pause must not kill a shard');
 
-  // And the window is genuinely local: the same spike in a tiny window IS the
-  // whole window. This is why the size is not a free parameter.
+  // A tiny window makes the same spike dominate its mean.
   const narrow = new BudgetMonitor({ limitMicros: 400, sampleFloor: 10 });
   for (let i = 0; i < 100; i += 1) narrow.record(10);
   narrow.record(18_000);
@@ -439,13 +420,10 @@ test('a breach below the sample floor never trips', () => {
   assert.equal(m.breached, false);
 });
 
-// The rule this replaced looked reasonable and shipped twice. A run is judged
-// on a machine that takes the CPU away mid-hook, so a RATE of slow events
-// measures the machine; the MEAN measures the strategy.
+// Use mean hook time, since scheduling interruptions inflate slow-event counts.
 test('a fast strategy on a contended machine is not rejected', () => {
-  // The production numbers, verbatim: the page's own sample was rejected at
-  // avg 72us against a 400us budget because 1.1% of its events had been
-  // interrupted. Under the old rule this trips.
+  // Hosted-runner sample: 72 us mean with 1.1% interrupted events,
+  // below the 400 us mean budget.
   const m = new BudgetMonitor({ limitMicros: 400 });
   let killedAt = null;
   for (let i = 0; i < 10_000; i += 1) {
@@ -460,8 +438,7 @@ test('a fast strategy on a contended machine is not rejected', () => {
 });
 
 test('a strategy that is genuinely slow is still rejected', () => {
-  // No tail at all — every event is simply over budget. This is what the limit
-  // exists to catch, and the mean catches it the moment it may speak.
+  // Consistently expensive hooks must exceed the mean budget.
   const m = new BudgetMonitor({ limitMicros: 400 });
   let killedAt = null;
   for (let i = 0; i < 10_000; i += 1) {
@@ -471,9 +448,7 @@ test('a strategy that is genuinely slow is still rejected', () => {
   assert.equal(killedAt, 2000, 'a uniformly slow strategy must be caught at the sample floor');
 });
 
-// The failure the lifetime mean allowed, and the reason the statistic is
-// windowed. One monitor covers a whole run, so "average" over millions of
-// events is not a statement about now.
+// A rolling mean prevents a cheap prefix from masking an expensive phase.
 test('a cheap prefix cannot pay for a sustained slow phase', () => {
   const m = new BudgetMonitor({ limitMicros: 400 });
   let killedAt = null;
@@ -494,9 +469,7 @@ test('a cheap prefix cannot pay for a sustained slow phase', () => {
 });
 
 test('a rare but catastrophic event still raises the mean', () => {
-  // The one thing a tail rule was good for: 1% of events taking a full second
-  // is 10ms per event amortised, which would blow the wall clock. The mean sees
-  // it without a second knob.
+  // A 1% tail of one-second events contributes 10 ms to the mean.
   const m = new BudgetMonitor({ limitMicros: 400 });
   for (let i = 0; i < 10_000; i += 1) m.record(i % 100 === 0 ? 1_000_000 : 10);
   assert.equal(m.breached, true, 'a 1% tail of one-second events must not pass');
@@ -545,10 +518,7 @@ test('an unsettled market leaves the position open rather than inventing a price
 // ---------------------------------------------------------------------------
 
 test('engine internals are not reachable from ctx', () => {
-  // This is the whole basis of "the report is computed outside the strategy
-  // from engine-owned facts". The previous ctx held _pf/_book/_history as
-  // ordinary properties, and a strategy could push a fabricated settled trade
-  // straight into the report — a $990,000 profit that never happened.
+  // Contexts must not expose mutable portfolio, book or history internals.
   const seen = {};
   replayMarket({
     market: MARKET,
@@ -575,7 +545,7 @@ test('a strategy cannot fabricate trades into the report', () => {
     events: [snap(1000), tick(1001, 1)],
     strategy: {
       on_tick(ctx) {
-        // Every route the old shape allowed.
+        // Check each possible internal-state handle.
         try { ctx._pf.trades.push({ pnl: 1e9 }); } catch { /* expected */ }
         try { ctx.position().size = 1e9; } catch { /* a copy at worst */ }
         return null;
@@ -588,8 +558,7 @@ test('a strategy cannot fabricate trades into the report', () => {
 });
 
 test('the tick history handed out is a copy', () => {
-  // Mutating it would let a strategy rewrite the series its own zscore is
-  // computed from — and the report's per-trade prices with it.
+  // History mutations must not change indicators or reported prices.
   const zs = [];
   replayMarket({
     market: MARKET,
@@ -613,9 +582,7 @@ test('the tick history handed out is a copy', () => {
 // ---------------------------------------------------------------------------
 
 test('a delayed order that misses the close never fills', () => {
-  // drainUntil(Infinity) used to run it at its own future timestamp, producing
-  // a trade opened AFTER it closed and pricing a fill against a book that no
-  // longer existed.
+  // Pending orders after the close must not execute.
   const pf = new Portfolio();
   let sent = false;
   replayMarket({
@@ -651,9 +618,7 @@ test('no trade can close before it opened', () => {
 });
 
 test('the book handed to a strategy cannot be edited', () => {
-  // Verified before the fix: a strategy unshifted a level that never existed
-  // and filled at $0.01 in a market whose real best ask was $0.90 — and the
-  // fabricated fill went into the report as fact.
+  // Book views must not allow a strategy to insert fabricated liquidity.
   const pf = new Portfolio();
   let sent = false;
   replayMarket({
@@ -667,7 +632,7 @@ test('the book handed to a strategy cannot be edited', () => {
         if (sent) return null;
         sent = true;
         const b = ctx.book();
-        // Every handle the live object used to offer.
+        // Check each book-state handle.
         try { b.ladders.UP.asks.levels.unshift({ ticks: 100, size: 100000 }); } catch { /* expected */ }
         try { b.snapshot(1, { UP: { asks: [[0.01, 1e6]], bids: [] } }); } catch { /* expected */ }
         try { b.ladders = null; } catch { /* expected */ }
@@ -687,9 +652,7 @@ test('the book handed to a strategy cannot be edited', () => {
 });
 
 test('writing to the tick it is handed does not rewrite history', () => {
-  // ctx.history() returns copies, but the row STORED in history used to be the
-  // same object the hook was given — so `tick.value = x` rewrote the series
-  // zscore, sma and ema are computed from.
+  // Store a separate history row so hook mutations cannot rewrite indicators.
   const readings = [];
   replayMarket({
     market: { ...MARKET, outcome: null },
@@ -708,16 +671,11 @@ test('writing to the tick it is handed does not rewrite history', () => {
 });
 
 // ---------------------------------------------------------------------------
-// look-ahead — the one claim this product cannot lose
+// look-ahead
 // ---------------------------------------------------------------------------
 
 test('the settled outcome is not visible before settlement', () => {
-  // The worker's market metadata carries the settled result, and replayMarket
-  // used to hand the whole object to on_market_open. A strategy read
-  // market.outcome on the first hook, bought the winning side at $0.10, and
-  // made 900 — with every number in the report following it. This is not an
-  // output-forgery hole; it was the documented SDK input handing over the
-  // answer.
+  // Opening metadata must omit the terminal outcome.
   const seen = {};
   replayMarket({
     market: { ...MARKET, outcome: 'UP' },
@@ -730,7 +688,7 @@ test('the settled outcome is not visible before settlement', () => {
     hooks: { on_market_open: 'on_market_open', on_tick: 'on_tick', on_settle: 'on_settle' },
   });
   assert.equal(seen.open, false, 'on_market_open must not carry the outcome');
-  // The strike IS known when the market opens, and the docs say so.
+  // The strike is available at market open.
   assert.equal(seen.strike, 65000);
   assert.equal(seen.settle, 'UP', 'on_settle carries it — that is its whole job');
   assert.equal(seen.arg, 'UP');
@@ -755,11 +713,7 @@ test('settlement still uses the archive outcome after the view is stripped', () 
 });
 
 test('nothing after the close reaches a hook, the book, or the history', () => {
-  // The settlement feed is a per-DAY stream and fetch-data hands every row to
-  // every market that settles on it — so a market closing at 10:00 was still
-  // shown 14:00's ticks. A strategy could watch the price that decides its own
-  // settlement, hours after its market closed, and write it into the archived
-  // log. The pending-order cutoff fixed the ORDERS; this is the EVENTS.
+  // Day-wide settlement feeds must stop delivering events at the market close.
   const seen = [];
   const bookPrices = [];
   const res = replayMarket({
@@ -785,9 +739,7 @@ test('nothing after the close reaches a hook, the book, or the history', () => {
   });
   assert.deepEqual(seen, [900, 1000], 'the close itself is included; nothing past it is');
   assert.deepEqual(bookPrices, [0.50, 0.50], 'the post-close book must never be applied');
-  // `events` now counts what the engine PULLED, not what was supplied: with a
-  // stream there is no way to know the latter without draining it, and pulling
-  // more than it needs is exactly what this change stops.
+  // Count events pulled from the iterator without draining future rows.
   assert.equal(res.events, 4, 'stopped one past the close, having pulled no further');
   for (const line of res.logs) {
     assert.ok(!/saw=(1500|5000)/.test(line), `a post-close tick reached the log: ${line}`);
@@ -795,9 +747,7 @@ test('nothing after the close reaches a hook, the book, or the history', () => {
 });
 
 test('an unsupported time-in-force is refused, not silently downgraded', () => {
-  // gtc was once advertised and executed as a single IOC attempt — a wrong
-  // fill, slippage and PnL number for an order type we told customers we
-  // supported. Anything that is not ioc or gtc is still refused outright.
+  // Reject unsupported TIF values; ioc, gtc and declared fok are supported.
   assert.throws(() => replayMarket({
     market: MARKET,
     events: [snap(1000), tick(1001, 1)],
@@ -820,7 +770,7 @@ test('an unsupported time-in-force is refused, not silently downgraded', () => {
   }), (err) => err.code === 'E_MANIFEST' && /needs "fok": true/.test(err.detail));
 
   // gtc without a resting-order policy (no trades declared, or Predict) is
-  // refused with the policy's reason — never executed as an IOC.
+  // refused with the policy's reason, without an IOC fallback.
   assert.throws(() => replayMarket({
     market: MARKET,
     events: [snap(1000), tick(1001, 1)],
@@ -838,13 +788,9 @@ test('an unsupported time-in-force is refused, not silently downgraded', () => {
 });
 
 test('the budget floor outlasts a strategy warming up', async () => {
-  // Warm-up was the first diagnosis and it was WRONG — measured inside the real
-  // image the breaches are scattered (events 171, 2368, 3201), not front-loaded
-  // — but the floor still has to exist, so that neither a handful of events nor
-  // a warm-up is ever a verdict.
+  // Require enough events before judging the mean, including during warm-up.
   const { BudgetMonitor } = await import('./replay.mjs');
-  // CHECKED AFTER EVERY EVENT, the way the engine checks it. Reading `breached`
-  // only at the end hides this whole class of bug.
+  // Check the verdict after each event, as replay does.
   const m = new BudgetMonitor({ limitMicros: 400 });
   let killedAt = null;
   for (let i = 0; i < 3; i += 1) {
@@ -865,13 +811,8 @@ test('the budget floor outlasts a strategy warming up', async () => {
   assert.equal(tiny.breached, false, 'fifty events is not a verdict');
 });
 
-// ---------------------------------------------------------------------------
-// The unthrottled top-of-book bound refines the book WITHOUT waking anyone.
-//
-// Its own test rather than a conformance case: the cross-engine suite can only
-// prove the two engines agree, and both firing the hook is a way for them to
-// agree and both be wrong — which is exactly what the mutation that leaks it in
-// both engines does.
+// Top-of-book bounds refine depth without dispatching on_book.
+// Check this independently of cross-engine agreement.
 test('a bound refines the book but never reaches a hook', () => {
   const seen = [];
   const strategy = {
@@ -896,8 +837,7 @@ test('a bound refines the book but never reaches a hook', () => {
   const books = seen.filter((s) => !Array.isArray(s));
   assert.equal(books.length, 1, 'exactly the real snapshot should have woken on_book');
   assert.ok(books[0].levels, 'the event handed to on_book must be a real book event');
-  // And the refinement did happen — the strategy sees it through ctx.book(),
-  // which is live, on the next event it IS woken for.
+  // The next ordinary hook sees the pruned book through ctx.book().
   const t = seen.find((s) => Array.isArray(s));
   assert.deepEqual(t, ['tick', 2001, 0.45], 'the pruned ladder is what the next hook reads');
 });

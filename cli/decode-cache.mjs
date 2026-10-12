@@ -1,15 +1,6 @@
-// The decoded-day cache of `ot run`: a day of the archive is decoded once (the
-// slow half of a local replay) and kept, so the next run over the same day
-// starts replaying at once. The Python package keeps the same kind of cache
-// (client/backtest/local.py); this one holds the JavaScript decoder's output.
-//
-// An entry is exactly what loadLocalDay spools into its events directory, plus
-// day.json with the rest of its answer, so a cached day replays the same bytes
-// as a fresh decode. The key names everything that decides those bytes: the
-// decoder's own source (every module it imports), the request (venue, day,
-// assets, datasets, intervals), the cadence the day is thinned at, and every
-// archive file of that day by sha256 -- a re-downloaded or corrected day is a
-// different day.
+// Cache decoded days as event files plus day.json. Python has a separate cache
+// in client/backtest/local.py. Keys cover decoder sources, request dimensions,
+// per-asset cadence and archive file hashes, so changed inputs invalidate entries.
 
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -93,13 +84,7 @@ export async function cacheKey({ root, day, venue, assets, datasets, intervals, 
   return createHash('sha256').update(JSON.stringify(spec)).digest('hex').slice(0, 24);
 }
 
-/**
- * An entry's answer, `ABSENT`, or `DAMAGED`. day.json records every events
- * file's length and sha256; a file that is missing, shorter, longer or
- * different -- cleaned out from under us, a disk fault -- damages the whole
- * entry rather than replaying damaged events. An entry appears only by
- * rename() of a finished directory, so a good one never looks damaged.
- */
+/** Verify event lengths and hashes before replaying a cached answer. */
 const ABSENT = Symbol('absent');
 const DAMAGED = Symbol('damaged');
 
@@ -142,23 +127,13 @@ async function readEntry(dir) {
 const ATTEMPTS = 3;
 
 /**
- * loadLocalDay, served from the cache under `cacheRoot` when it can be: the
- * same answer, with each market's `eventsFile` an absolute path. `newThrottle`
- * makes a fresh makeBookThrottle for this day (null: unthinned) -- fresh for
- * every decode, because a gate remembers the rows it has kept.
- *
- * The key is taken again after decoding: a file replaced in between (a
- * download finishing, a corrected day) would otherwise file one set of bytes'
- * events under another's key. Then the decode is thrown away and done again.
- *
- * A damaged entry is never touched -- deleting or replacing it could race with
- * another run doing the same -- and this run decodes the day into its own
- * `eventsDir` instead, as `--cache off` would, and says how to clear it.
+ * Cache loadLocalDay with absolute eventsFile paths. newThrottle supplies a
+ * fresh stateful gate for each decode (null disables thinning).
+ * Recheck the key after decoding and retry if inputs changed.
+ * Leave damaged entries untouched to avoid races; decode into eventsDir instead.
  */
 export async function loadLocalDayCached({ cacheRoot, decoder, newThrottle = null, ...kw }) {
-  // Inside the archive, the cache's own files would count as the day's files:
-  // every decode would change the key it is stored under. Real paths, so a
-  // symlink cannot hide it.
+  // Resolve links and reject caches inside the archive, which would alter its key.
   await mkdir(cacheRoot, { recursive: true });
   const inside = path.relative(await realpath(kw.root), await realpath(cacheRoot));
   if (inside === '' || !(inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside))) {

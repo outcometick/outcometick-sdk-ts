@@ -2,18 +2,12 @@ from outcometick import Strategy, Order
 
 
 class BinanceLead(Strategy):
-    """Take the side Binance spot is pointing at before the book catches up.
+    """Trade Binance spot moves before the settlement feed and book catch up.
 
-    The market settles on a Chainlink TWAP, which follows spot with a lag. So
-    when Binance has already moved decisively since the open, the settlement
-    feed and the book may not have priced it yet. The move is measured
-    RELATIVE to Binance's own price at the start of the market, which cancels
-    the gap between e.g. BTCUSDT on Binance and BTC/USD on Chainlink.
-
-    Each market reads the spot feed of its own coin, so the manifest must
-    declare one per coin you run ("reference"; the web editor adds them as you
-    pick coins). An undeclared feed stops the run with E_MANIFEST rather than
-    trading one coin on another's move. Binance has no HYPE spot pair.
+    Measure the move relative to Binance's price at market open to cancel the
+    basis between the Binance pair and Chainlink feed. Each asset needs its own
+    reference feed in the manifest; missing feeds raise E_MANIFEST. Binance has
+    no HYPE spot pair.
     """
 
     def on_market_open(self, ctx, market):
@@ -28,9 +22,8 @@ class BinanceLead(Strategy):
             return None
         spot = ctx.ref(self.feed)
         if self.spot_open is None:
-            # The baseline: the first 1s bar visible in this market. Bars are
-            # stamped at their CLOSE and only bars from the open on are sent,
-            # so this is the bar that closed in the market's first second.
+            # Use the first visible 1s bar as baseline. Bars carry close timestamps
+            # and only bars at or after market open are supplied.
             first = spot.last
             if first is None:
                 return None
@@ -48,7 +41,7 @@ class BinanceLead(Strategy):
             return None
         side = "UP" if move_bps > 0 else "DOWN"
 
-        # Only worth it while the book has NOT priced the move in yet.
+        # Enter only before the book prices in the move.
         ask = ctx.book(tick.market_id).best(side)
         if ask is None or ask > ctx.p.max_px:
             return None

@@ -1,10 +1,5 @@
-// Tests for the data-subscription client.
-//
-// Driven against a stub whose behaviour was copied from
-// api/subscription-api.mjs — the 302-with-checksum on /v1/dl, the
-// date-XOR-from/to rejection, the 403 that carries floor and ceiling. The point
-// is not that the client works against a friendly server; it is that it handles
-// what the real routes actually do.
+// Exercise the data client against a subscription API stub: download redirects
+// with checksums, exclusive date/range parameters and 403 window bounds.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -74,8 +69,7 @@ async function stubApi(overrides = {}) {
       });
     }
     if (u.pathname.startsWith('/v1/dl/')) {
-      // Exactly what the real route does: 302 to R2 with the checksum in a
-      // header, because the bytes never pass through the API.
+      // The API redirects to R2 and supplies the checksum in a header.
       res.writeHead(302, {
         location: `http://127.0.0.1:${server.address().port}/signed-bytes`,
         'x-outcometick-sha256': SHA,
@@ -191,7 +185,7 @@ test('an API error keeps the status and the extra fields', async () => {
     const err = await ot.files({ from: '2020-01-01', to: '2020-01-02' }).then(() => null, (e) => e);
     assert.ok(err instanceof OutcometickError);
     assert.equal(err.status, 403);
-    // The useful half: not just "no", but what the window actually is.
+    // Preserve the allowed window in the error.
     assert.equal(err.body.floor, '2026-07-14');
     assert.equal(err.body.ceiling, '2026-08-12');
     assert.match(err.message, /403/);
@@ -208,7 +202,7 @@ test('download follows the redirect manually and verifies the checksum', async (
     const got = await ot.download(files[0]);
     assert.deepEqual(Buffer.from(got.bytes), PAYLOAD);
     assert.equal(got.sha256, SHA);
-    // The redirect target was fetched WITHOUT our key: R2 has no use for it.
+    // Do not forward the API key to the redirect target.
     const signed = api.seen.find((s) => s.path === '/signed-bytes');
     assert.equal(signed?.auth, undefined);
   });

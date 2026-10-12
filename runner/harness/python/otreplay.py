@@ -1,16 +1,8 @@
-"""The event loop and the ctx object, ported from runner/engine/replay.mjs.
+"""Event loop and strategy context. Keep in sync with runner/engine/replay.mjs.
 
-Same rules as the JavaScript version and the same order of operations, because
-the conformance vectors compare them row for row. In particular:
-
-  - pending orders are drained against the book as it stood BEFORE the current
-    event is applied, then again after, so a delayed order cannot fill against
-    depth that arrived after it;
-  - hold_s is measured from the FILL, not from the decision, because a fill that
-    landed late has not been held as long;
-  - instance state resets per market unless the run is in session mode, which is
-    the property that lets a run be sharded at all.
-"""
+Pending orders run against the book before the current event, then again
+after it. hold_s starts at the fill, not the decision. Strategy state resets
+per market unless session mode is enabled, allowing market-mode sharding."""
 
 from __future__ import annotations
 
@@ -26,36 +18,22 @@ from otmaker import MAX_RESTING, MakerBook
 
 
 def write_all(fd, data, write=os.write):
-    """Write every byte, or raise.
+    """Write all of data to fd, looping over short writes.
 
-    A bare `os.write` is a SHORT write waiting to happen, and the loss is
-    silent: it returns how many bytes it took and the caller that ignores the
-    number simply drops the rest. Under gVisor -- which is what runs in
-    production -- a write past the 64KB pipe buffer returns exactly 65536 and
-    the container exits 0, so nothing anywhere reports a problem.
-
-    That is not hypothetical. The result line carries one summary per market,
-    so it passes 64KB at roughly 500 markets; a market-day of polymarket is
-    ~386. Every Python run large enough to matter lost the tail of its result
-    line, the worker never saw a terminating newline, and `collect()` fell back
-    to a default whose markets_run is 0 -- reported to the customer as
-    "no market-days were replayed". Seventeen runs, no report, every one
-    refunded. Node was unaffected only because fs.writeSync loops internally.
-    """
+    os.write may write less than requested. Under gVisor, pipe writes over
+    64 KB return 65536; an unchecked write can truncate a large result line."""
     view = memoryview(data)
     while view:
         try:
             n = write(fd, view)
         except BlockingIOError:
-            # Imported here, not at the top: `select` cannot wait on a pipe on
-            # Windows, and this module is also imported by the pure-Python
-            # local backtest, which never writes to a descriptor at all.
+            # Import here because select cannot wait on Windows pipes. Local Python
+            # backtests import this module but do not write to file descriptors.
             import select
             select.select([], [fd], [])
             continue
         if n <= 0:
-            # Not survivable and not silent: a result channel that accepts
-            # nothing means this run has no way to report anything at all.
+            # A zero-byte write leaves no usable result channel.
             raise OSError("short write to the result channel")
         view = view[n:]
 
@@ -63,21 +41,13 @@ def write_all(fd, data, write=os.write):
 HOOK_FOR = {"tick": "on_tick", "book": "on_book", "trade": "on_trade"}
 
 
-# Live books, keyed by the view that fronts them.
-#
-# The first version stored the Book on the view as `_b`. Python has no privacy
-# and the analyser cannot blanket-refuse single-underscore attributes (a
-# strategy's own `self._entered` is normal), so `ctx.book()._b.ladders[...]`
-# reached the engine-owned ladder — verified: a strategy inserted a level that
-# never existed and filled 1000 contracts at $0.01 in a market whose real book
-# held 10 at $0.90.
-#
-# With the reference in a side table there is no attribute to find.
+# Store live books in a side table, not view attributes, to avoid exposing
+# mutable engine ladders to strategies.
 _BOOKS: dict[int, Book] = {}
 
 
 class BookView:
-    """A read-only view of a book — the mirror of bookView() in replay.mjs."""
+    """A read-only view of a book, the mirror of bookView() in replay.mjs."""
 
     __slots__ = ("__weakref__",)
 
@@ -124,31 +94,20 @@ class BookView:
         return Rec(_BOOKS[id(self)].quote_ts(side))
 
 
-# Engine internals, keyed by the Ctx that fronts them.
-#
-# Deliberately NOT attributes on Ctx. The earlier version held `_pf`, `_book`
-# and `_history` as ordinary underscore-prefixed fields, so a strategy could
-# reach `ctx._pf.trades` and push a fabricated settled trade into the report —
-# invent a profit, or delete a real loss, and the worker archived it as fact.
-#
-# Python has no true privacy, so this is defence in depth rather than a wall:
-# the side table means there is no attribute to find, `__getattr__` below
-# refuses the old names outright, and the static analyser already refuses
-# `getattr`, `vars` and dunder attribute access, which are the ways back in.
+# Keep engine state in a side table rather than on Ctx attributes.
+# This is defence in depth, not a Python isolation boundary. The analyser
+# also rejects reflection and dunder access; __getattr__ rejects private names.
 _INTERNALS: dict[int, dict] = {}
 
 
-# Mirrors LIMITS.logLineChars / LIMITS.logBytesPerRun in
-# api/lib/backtest-contract.mjs. Two engines disagreeing about how much a
-# strategy may log is the same strategy behaving differently in two languages,
-# which is the thing the conformance suite exists to prevent.
+# Keep in sync with LIMITS.logLineChars and LIMITS.logBytesPerRun in
+# api/lib/backtest-contract.mjs.
 LOG_LINE_CHARS = 512
 LOG_BYTES_PER_RUN = 2 * 1024 * 1024
 
 
-# A settlement recompute is a once-per-market claim, so these are generous.
-# `crosschecks` rides the same result line as everything else: unbounded, it is
-# an output channel with no budget. Mirrors replay.mjs.
+# Bound cross-check output on the shared result line. Settlement claims are
+# expected once per market. Keep in sync with replay.mjs.
 MAX_CROSSCHECKS_PER_MARKET = 16
 CROSSCHECK_CLAIMED_CHARS = 32
 
@@ -159,20 +118,20 @@ def make_log_budget(bytes_: int = LOG_BYTES_PER_RUN, line_chars: int = LOG_LINE_
 
 
 # The settlement window ctx.twap_locked() reads, and when its projection is
-# withheld. MUST MATCH replay.mjs.
+# withheld. Keep in sync with replay.mjs.
 TWAP_LOOKBACK_MS = {"twap30s": 30_000, "twap60s": 60_000}
 SPOT_MIN_COVERAGE = 0.8
 SPOT_MAX_AGE_MS = 5000
 
 
 def _need_spot(ctx, what) -> None:
-    """Refused unless the spot dataset was declared -- needSpot in replay.mjs."""
+    """Refused unless the spot dataset was declared, needSpot in replay.mjs."""
     if not _INTERNALS[id(ctx)]["spot"]["declared"]:
         raise RunAbort("E_MANIFEST", f'{what} needs the "spot" dataset declared in the manifest')
 
 
 def _push_spot(state, ev, arrived_at) -> None:
-    """A spot event reaches the strategy at `arrived_at` -- control.pushSpot in replay.mjs."""
+    """A spot event reaches the strategy at `arrived_at`, control.pushSpot in replay.mjs."""
     sp = state["spot"]
     sp["seen"] += 1
     sp["ts"].append(ev["ts_ms"])
@@ -181,22 +140,15 @@ def _push_spot(state, ev, arrived_at) -> None:
 
 
 class Ctx:
-    """The strategy's whole world.
+    """Strategy context with point-in-time accessors.
 
-    Everything the runner will let a strategy touch is on this object; anything
-    not here does not exist in the process.
-    """
+    Keep in sync with the JavaScript context in replay.mjs."""
 
     __slots__ = ("p", "market_id", "__weakref__")
 
     def __init__(self, params, portfolio, market_id, log_budget, references,
                  series, rng):
-        # Rec, not the bare dict the job JSON carries: the SDK documents
-        # `ctx.p.entry_z` and every Python example in the docs is written
-        # that way, so a plain dict makes all of them fail on the first
-        # hook with "'dict' object has no attribute ...", while the
-        # identical JavaScript runs. Same parity break Rec exists to stop;
-        # `p` was simply missed. Subscript access keeps working.
+        # Rec supports both ctx.p.entry_z and subscript access, matching JS params.
         object.__setattr__(self, "p", Rec(params or {}))
         object.__setattr__(self, "market_id", market_id)
         _INTERNALS[id(self)] = {
@@ -216,7 +168,7 @@ class Ctx:
             "resting": None,
             # Set by MarketReplay in global mode with on_timer: {schedule, unschedule}.
             "timers": None,
-            # The spot dataset -- see createCtx in replay.mjs. MarketReplay sets
+            # The spot dataset, see createCtx in replay.mjs. MarketReplay sets
             # the window; _push_spot updates the rest as spot events arrive.
             "spot": {"ts": [], "val": [], "arrived": [], "seen": 0,
                      "start": None, "close": None, "lookback": None, "declared": False},
@@ -229,10 +181,7 @@ class Ctx:
         return _INTERNALS[id(self)]["now"]
 
     def __getattr__(self, name):
-        # Every name, including `_s` — which used to be a convenience property
-        # and was therefore a documented route to the live Portfolio and Book.
-        # The internals live in a module-level table keyed by id(self); there is
-        # no attribute on this object that leads to them.
+        # Engine internals live in the side table; no private attribute exposes them.
         raise AttributeError(
             f"{name!r} does not exist on ctx; a strategy reaches the engine "
             "only through the documented methods"
@@ -256,8 +205,7 @@ class Ctx:
     def history(self, n: int = 1) -> list[dict]:
         hist = _INTERNALS[id(self)]["history"]
         k = max(0, min(int(n or 0), len(hist)))
-        # COPIES: handing back the live rows would let a strategy rewrite the
-        # series its own indicators are computed from.
+        # Return copies so strategies cannot rewrite indicator history.
         return [Rec(row) for row in hist[len(hist) - k:]]
 
     def position(self) -> dict:
@@ -265,21 +213,15 @@ class Ctx:
         return s["pf"].position(self.market_id, s["book"])
 
     def log(self, msg: Any) -> None:
-        # Bytes for the WHOLE RUN, not lines per market -- the mirror of
-        # ctx.log in engine/replay.mjs. The old shape gave every market its own
-        # allowance of 10,000 unbounded lines, and polymarket has ~386 markets
-        # a day, so a run could pour the archive it had just paid for into a
-        # file the customer downloads.
+        # Share the byte allowance across the run. Keep in sync with ctx.log in replay.mjs.
         s = _INTERNALS[id(self)]
         budget = s["log_budget"]
         if budget["spent"] >= budget["bytes"]:
             s["log_truncated"] = True
             return
         line = f'{s["now"]} {msg}'[: budget["line_chars"]]
-        # BYTES, not characters -- logs.txt is UTF-8. The JS side counts the
-        # same way; a run logging Chinese would otherwise spend a third of what
-        # it actually writes. The line cap stays in characters (readability);
-        # the run cap is about how much data leaves with the customer.
+        # Count UTF-8 bytes for the run budget and characters for the line cap.
+        # Keep in sync with the JS logger.
         budget["spent"] += len(line.encode("utf-8")) + 1
         s["logs"].append(line)
 
@@ -293,7 +235,7 @@ class Ctx:
         return [Rec(v) for v in r["orders"]()] if r else []
 
     def schedule(self, at_ms, tag=None):
-        """Wake on_timer at `at_ms`; returns the timer id. MUST MATCH ctx.schedule in replay.mjs."""
+        """Wake on_timer at `at_ms`; returns the timer id. Keep in sync with ctx.schedule in replay.mjs."""
         t = _INTERNALS[id(self)]["timers"]
         if t is None:
             raise RunAbort("E_MANIFEST", "ctx.schedule needs the on_timer hook declared in the manifest")
@@ -334,7 +276,7 @@ class Ctx:
 
     def twap_locked(self):
         """The elapsed part of the settlement TWAP window, from the spot values
-        seen in it -- an APPROXIMATION; field by field in replay.mjs."""
+        seen in it, an approximation; field by field in replay.mjs."""
         _need_spot(self, "ctx.twap_locked()")
         st = _INTERNALS[id(self)]
         sp = st["spot"]
@@ -409,21 +351,14 @@ class Ctx:
         return acc
 
     def assert_outcome(self, _market: Any, outcome: Any) -> None:
-        """Record a cross-check. Never fails the run — it is information.
+        """Record an outcome cross-check without failing the run on a mismatch.
 
-        The first argument is IGNORED for everything that matters: it used to
-        supply both `official` and `market_id`, so a strategy could book itself
-        a recompute match that never happened. The panel's whole value is that
-        it is the ARCHIVE's answer. Mirrors replay.mjs.
-        """
+        The market argument is ignored; use the engine's market id and official
+        outcome. Keep in sync with replay.mjs."""
         s = _INTERNALS[id(self)]
         official = (s["market"] or {}).get("outcome")
-        # BOUNDED, for the same reason ctx.log is, and mirrored in replay.mjs.
-        # `outcome` is whatever the strategy passed and this can be called on
-        # every event; the whole list is serialised onto the result line, sent
-        # and parsed before anything downstream can ignore it. The panel only
-        # shows an aggregate, and a settlement recompute is a once-per-market
-        # claim, so a cap costs nothing real.
+        # Bound claims and their values before serialising the shared result line.
+        # Keep in sync with replay.mjs.
         if len(s["crosschecks"]) >= MAX_CROSSCHECKS_PER_MARKET:
             return
         claimed = outcome if isinstance(outcome, str) else str(outcome)
@@ -436,15 +371,11 @@ class Ctx:
 
 
 class MarketReplay:
-    """One market's replay, as a state machine: open, step per event, close.
+    """Market replay state machine: open, step per event, close.
 
-    market mode drives one of these at a time; session mode drives every market
-    that is open at once from a single time-ordered stream, so a strategy sharing
-    one instance across markets never sees a later moment of market A before an
-    earlier moment of market B. The rules and their order are exactly the ones
-    replay_market has always applied -- MUST MATCH MarketReplay in
-    runner/engine/replay.mjs.
-    """
+    Market mode drives one instance at a time; session mode interleaves open
+    markets in event-time order with shared strategy state.
+    Keep in sync with MarketReplay in runner/engine/replay.mjs."""
 
     def __init__(self, *, market: dict, strategy, hooks: dict,
                  portfolio: Portfolio | None = None, fill_delay_ms: int = 0,
@@ -458,12 +389,8 @@ class MarketReplay:
         # generic-data.mjs; see the matching comment in replay.mjs.
         self.generic = market.get("kind") == "generic"
         self.terminal = terminal if self.generic else None
-        # Attribute access for everything a hook is handed: the docs say
-        # `market.strike` and `tick.value`, and they have to be true here.
-        # Pre-settle view: `outcome` is a future fact and is stripped. See the
-        # matching comment in replay.mjs -- a strategy that read it in
-        # on_market_open could buy the winning side and the report became
-        # meaningless. Only on_settle sees it.
+        # Use attribute-access records for hooks. Strip outcome before settlement
+        # to prevent look-ahead; only on_settle receives it.
         if self.generic:
             self._market_rec = Rec(generic_view(market))
             settle = generic_view(market)
@@ -500,7 +427,7 @@ class MarketReplay:
         close = market.get("close_ts_ms")
         if lookback is not None and close is not None:
             self.state["spot"].update(start=close - lookback, close=close, lookback=lookback)
-        # Phase 2b global scheduler -- see replay.mjs.
+        # Phase 2b global scheduler, see replay.mjs.
         self.global_ = isinstance(engine, dict) and engine.get("scheduler") == "global"
         self.job_seq = 0
         self.local_book = self.book
@@ -512,7 +439,7 @@ class MarketReplay:
                 self.state["book"] = self.local_book
             self.timer_stats = {"created": 0, "fired": 0, "dropped": 0}
             self.timer_ids = 0
-            # The run's clock {"t"}, advanced only by the harness -- see replay.mjs.
+            # The run's clock {"t"}, advanced only by the harness, see replay.mjs.
             self.clock = clock if clock is not None else {"t": float("-inf")}
             if engine.get("timers") is True:
                 self.state["timers"] = {"schedule": self._schedule_timer, "unschedule": self._unschedule_timer}
@@ -533,11 +460,11 @@ class MarketReplay:
         self.seen = 0
         self.last_ts = 0
         self.ended = False
-        # Phase 3b recorder -- see replay.mjs.
+        # Phase 3b recorder, see replay.mjs.
         rm = (engine or {}).get("record_ms")
         self.record_ms = rm if isinstance(rm, int) and not isinstance(rm, bool) and rm > 0 else None
         self.record_rows = [] if self.record_ms else None
-        # The run's row budget, shared by every market -- see replay.mjs.
+        # The run's row budget, shared by every market, see replay.mjs.
         self.record_budget = ((record_budget if record_budget is not None
                                else {"rows": 0, "limit": math.inf, "truncated": False})
                               if self.record_ms else None)
@@ -555,7 +482,7 @@ class MarketReplay:
     def _schedule(self, at: int, kind: str, payload) -> None:
         i = len(self.pending)
         if self.global_:
-            # Nothing lands before what the run has processed -- see replay.mjs.
+            # Nothing lands before what the run has processed, see replay.mjs.
             if at < self.clock["t"]:
                 at = self.clock["t"]
             rank = _JOB_RANK.get(kind, 0)
@@ -570,14 +497,14 @@ class MarketReplay:
         self.pending.insert(i, {"at": at, "kind": kind, "payload": payload})
 
     def next_due(self):
-        """MUST MATCH nextDue in replay.mjs."""
+        """Keep in sync with nextDue in replay.mjs."""
         if not self.pending:
             return None
         j = self.pending[0]
         return {"at": j["at"], "rank": j["rank"], "seq": j["seq"]}
 
     def run_one(self) -> None:
-        """MUST MATCH runOne in replay.mjs."""
+        """Keep in sync with runOne in replay.mjs."""
         if not self.pending:
             return
         job = self.pending.pop(0)
@@ -587,7 +514,7 @@ class MarketReplay:
             return
         if job["at"] < self.clock["t"]:
             raise RunAbort("E_RUNTIME", f"engine invariant: a {job['kind']} at {job['at']} after the run reached {self.clock['t']}")
-        # A spot value arriving is quiet here too -- see runOne in replay.mjs.
+        # A spot value arriving is quiet here too, see runOne in replay.mjs.
         if job["kind"] == "arrival" and job["payload"].get("kind") == "spot":
             _push_spot(self.state, job["payload"], job["at"])
             return
@@ -608,7 +535,7 @@ class MarketReplay:
         self._run_exchange_job(job)
 
     def _schedule_timer(self, at_ms, tag):
-        # After the later of this market's now and the run's -- see replay.mjs.
+        # After the later of this market's now and the run's, see replay.mjs.
         now = max(self.state["now"], self.clock["t"])
         ok = isinstance(at_ms, int) and not isinstance(at_ms, bool) and abs(at_ms) <= 9007199254740991
         if isinstance(at_ms, float) and at_ms.is_integer() and abs(at_ms) <= 9007199254740991:
@@ -638,7 +565,7 @@ class MarketReplay:
         return False
 
     def _arrive(self, ev) -> None:
-        """A lagged event reaches the strategy. MUST MATCH #arrive in replay.mjs."""
+        """A lagged event reaches the strategy. Keep in sync with #arrive in replay.mjs."""
         kind = ev.get("kind")
         if kind == "spot":
             _push_spot(self.state, ev, self.state["now"])
@@ -690,9 +617,9 @@ class MarketReplay:
     def _request_cancel(self, order_id) -> bool:
         if self.maker is None:
             return False
-        # Resolved NOW, to the record -- see replay.mjs.
+        # Resolved now, to the record, see replay.mjs.
         rec = self.maker.find(order_id)
-        # Asked now in the run's time -- see replay.mjs.
+        # Asked now in the run's time, see replay.mjs.
         asked = max(self.state["now"], self.clock["t"]) if self.global_ else self.state["now"]
         if rec is None:
             self.maker.cancel(None, asked)
@@ -722,7 +649,7 @@ class MarketReplay:
         for order in orders:
             if order is None:
                 continue
-            # A COPY taken at decision time -- see replay.mjs.
+            # A copy taken at decision time, see replay.mjs.
             row = dict(_as_order(order))
             side = row.get("side")
             if isinstance(side, str) and self.pf.side_of(side, self.market_id) is None:
@@ -816,7 +743,7 @@ class MarketReplay:
         past the close reaches a hook, the book, or the history."""
         if self.ended:
             return False
-        # QUIET (the spot dataset) -- see step in replay.mjs.
+        # quiet (the spot dataset), see step in replay.mjs.
         if ev.get("kind") == "spot":
             if ev["ts_ms"] > self.close_ts:
                 return False
@@ -848,11 +775,8 @@ class MarketReplay:
         kind = ev.get("kind")
         bbo = ev.get("bbo")
         if kind == "book":
-            # BEFORE the snapshot test, because a bound carries snapshot:false
-            # and would otherwise be applied as a delta with no ladder, no price
-            # and no size -- which Book.delta rejects by raising, taking the
-            # whole run with it. MUST MATCH the same ordering in
-            # runner/engine/replay.mjs.
+            # Handle bounds before snapshots: snapshot:false bounds have no delta
+            # ladder, price or size. Keep in sync with runner/engine/replay.mjs.
             def apply():
                 apply_event(self.book, ev, self.generic)
             if maker is not None:
@@ -869,14 +793,12 @@ class MarketReplay:
 
         ev_rec = Rec(ev)
         if kind == "tick":
-            # A separate copy from the one the hook is handed -- see the
+            # A separate copy from the one the hook is handed, see the
             # matching comment in replay.mjs.
             state["history"].append(Rec(ev))
 
-        # A bound refines the book silently and never reaches a hook -- the
-        # event has no levels/ladder/px/size, the stream is unthrottled, and
-        # ctx.book() is live so the next real event already sees the refined
-        # ladder. Full reasoning in replay.mjs; both engines or neither.
+        # Bounds refine the book without invoking hooks. They carry no depth;
+        # the next hook sees the refined book. Keep in sync with replay.mjs.
         hook = None if bbo else HOOK_FOR.get(kind)
         if hook and self.hooks.get(hook):
             self._emit(self._call(hook, ev_rec), ts)
@@ -884,7 +806,7 @@ class MarketReplay:
         return True
 
     def end_trading(self) -> None:
-        """Generic markets: trading ends. MUST MATCH endTrading in replay.mjs."""
+        """Generic markets: trading ends. Keep in sync with endTrading in replay.mjs."""
         if not self.generic or self.trading_ended:
             return
         self.trading_ended = True
@@ -942,8 +864,7 @@ class MarketReplay:
         if self.generic:
             return self._close_generic()
         state = self.state
-        # Queued work lands AT THE CLOSE, never at its own future timestamp --
-        # see the matching comment in replay.mjs. Both engines or neither.
+        # Clamp queued work to the close. Keep in sync with replay.mjs.
         settle_ts = self.declared_close if self.declared_close else self.last_ts
         state["now"] = settle_ts
         self.drain_until(settle_ts)
@@ -970,7 +891,7 @@ class MarketReplay:
         return {
             "market_id": self.market_id,
             "asset": market.get("asset"),
-            # What the engine PULLED, not what the caller had -- see replay.mjs.
+            # Count events consumed by replay. Keep in sync with replay.mjs.
             "events": self.seen,
             "spot_seen": self.state["spot"]["seen"],
             "settled": settled,
@@ -984,7 +905,7 @@ class MarketReplay:
         }
 
 
-# Same-millisecond order of a market's jobs in global mode. MUST MATCH replay.mjs.
+# Same-millisecond order of a market's jobs in global mode. Keep in sync with replay.mjs.
 _JOB_RANK = {"order": 0, "activate": 0, "cancel": 0, "flatten": 0, "arrival": 1, "timer": 2}
 MAX_PENDING_TIMERS = 64
 MAX_TIMERS_CREATED = 10_000
@@ -992,7 +913,7 @@ MAX_TIMERS_FIRED = 100_000
 
 
 def apply_event(book, ev, generic) -> None:
-    """MUST MATCH applyEvent in replay.mjs."""
+    """Keep in sync with applyEvent in replay.mjs."""
     ts = ev["ts_ms"]
     if ev.get("bbo"):
         book.bbo(ts, ev.get("side"), ev.get("bid"), ev.get("ask"), generic)
@@ -1005,7 +926,7 @@ def apply_event(book, ev, generic) -> None:
 
 
 def market_rules(rules: dict, market: dict) -> dict:
-    """MUST MATCH marketRules in replay.mjs."""
+    """Keep in sync with marketRules in replay.mjs."""
     venue = rules.get("mode") == "venue"
     tick = market.get("tick_size") if venue else rules.get("tick")
     min_size = market.get("min_size") if venue else rules.get("min_size")
@@ -1025,7 +946,7 @@ _GENERIC_VIEW = (
 
 
 def generic_view(market: dict) -> dict:
-    """A deep copy of a generic market's whitelist. MUST MATCH genericView in replay.mjs."""
+    """A deep copy of a generic market's whitelist. Keep in sync with genericView in replay.mjs."""
     out = {}
     for k in _GENERIC_VIEW:
         v = market.get(k)
@@ -1041,9 +962,8 @@ def replay_market(*, market: dict, events, strategy, hooks: dict,
                   fee_bps: float = 0, resting: dict | None = None) -> dict:
     """Replay one market start to finish.
 
-    `events` is any ITERABLE, not necessarily a list -- the harness passes a
-    generator that pulls one line off stdin per step, so the future is not in
-    the process at all. Nothing here may index it or take its length.
+    events is any iterable, including a generator reading stdin per step.
+    Do not index it or request its length; replay consumes it incrementally.
     """
     r = MarketReplay(market=market, strategy=strategy, hooks=hooks, portfolio=portfolio,
                      fill_delay_ms=fill_delay_ms, log_budget=log_budget, budget=budget,

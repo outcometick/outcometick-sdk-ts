@@ -1,14 +1,5 @@
-// `ot submit` — send a validated submission to the queue.
-//
-// Validates locally FIRST, with the same validator the queue runs, so the
-// common failures cost a round trip rather than a queued run. The server
-// validates again regardless: a client that decided its own submission was fine
-// is not a security model, and the CLI is a convenience, not an authority.
-//
-// The same goes for the price. `ot submit` prints what the server quoted; it
-// never computes one. A number this file derived would be a second pricing
-// implementation, and the first time it disagreed the customer would be told
-// one thing and charged another.
+// Validate locally, then submit to the hosted queue. The server validates
+// independently and supplies the quote.
 
 import { readSubmission, validate } from '../ot.mjs';
 import { readKey, get, post, DEFAULT_API } from '../api-client.mjs';
@@ -39,15 +30,11 @@ export async function cmdSubmit({ dir, flags }) {
       : flags.range ? { range: flags.range } : { from: flags.from, to: flags.to }),
   };
 
-  // Locally first. The rejection codes are identical either way, so a customer
-  // who fixes what `ot check` said will not be told something different here.
+  // Use the same validator and rejection codes as the server.
   const checked = await validate(files);
 
-  // THE DATE WINDOW, before anything is uploaded. Only the most recent archived
-  // days can be backtested, and the window moves every day — so it is asked
-  // for rather than written down here. Advisory only: the server refuses the
-  // same thing, and a capacity endpoint that cannot be reached is not a reason
-  // to stop a submission it would have accepted.
+  // Check the current archive window before uploading. This is advisory;
+  // an unavailable capacity endpoint does not block submission.
   if (scope.from || scope.days != null) {
     const cap = await get(api, `/v1/backtest/capacity?venue=${encodeURIComponent(scope.venue)}`)
       .catch(() => null);
@@ -69,12 +56,7 @@ export async function cmdSubmit({ dir, flags }) {
     }
   }
 
-  // Series go straight to R2, the same way the web editor sends them.
-  //
-  // Not an optimisation for the CLI's sake — it is what makes "a series never
-  // passes through the API box" true rather than true-for-browsers. Inlining a
-  // 4MB CSV cost 69MB resident there for one submission, and leaving one client
-  // doing it would have kept the whole cost while claiming it was gone.
+  // Upload series directly to R2 to avoid buffering CSV files in the API.
   const seriesNames = new Set((checked.manifest.series ?? []).map((x) => x.file));
   const uploads = {};
   for (const f of files.filter((x) => seriesNames.has(x.name))) {
@@ -83,8 +65,7 @@ export async function cmdSubmit({ dir, flags }) {
     if (sign.status !== 200 || !sign.json?.url) {
       throw new Error(`could not stage ${f.name}: ${sign.json?.error ?? sign.text}`);
     }
-    // Exactly the headers the server signed. `if-none-match: *` is among them
-    // and makes the url write-once; omitting any of them is a 403.
+    // Send all signed headers, including if-none-match: * for write-once uploads.
     const put = await fetch(sign.json.url, {
       method: 'PUT', headers: sign.json.headers, body: f.content,
     });
@@ -110,18 +91,12 @@ export async function cmdSubmit({ dir, flags }) {
     process.stdout.write(`  scope       ${q.venue} · ${(q.assets ?? []).join(' ')} · ${q.from}..${q.to}\n`);
     process.stdout.write(`  market-days ${q.marketDays}\n`);
     if (q.missingDays > 0) {
-      // Said out loud: a smaller number than the range asked for, unexplained,
-      // reads as a bug in our favour.
+      // Explain when the accepted range is smaller than requested.
       process.stdout.write(`  not in the archive: ${q.missingDays} day(s) — not billed\n`);
     }
     process.stdout.write(`  cost        ${json.credits_held} cr\n`);
     process.stdout.write(`  source      sha256 ${String(json.source_sha256).slice(0, 16)}…\n\n`);
-    // DO NOT PROMISE THE EMAIL WHEN NONE WAS ASKED FOR. `--email` is what
-    // fills deliver_to, and without it the delivery poller correctly skips the
-    // run — so the old unconditional "(or wait for the email)" told every CLI
-    // submitter to wait for something that was never going to arrive. The flag
-    // was implemented and undocumented, which is the same failure from the
-    // other side: nobody could use the thing this line advertised.
+    // Email delivery is available only when --email set deliver_to.
     process.stdout.write(flags.email
       ? `  ot status ${json.run_id}   (or wait for the email)\n\n`
       : `  ot status ${json.run_id}\n`
@@ -138,16 +113,12 @@ export async function cmdSubmit({ dir, flags }) {
     return 1;
   }
   if (status === 422 && json?.code === 'E_SCOPE') {
-    // The range, not the code: `ot check` never sees a range, so this is not
-    // the "passed locally" contradiction below. Most often it is the moving
-    // date window — the server's message names it and says what to change.
+    // Range validation is separate from ot check; show the server explanation.
     process.stderr.write(`\n  ${json.code} — the requested scope cannot be run.\n  ${json.detail}\n\n`);
     return 1;
   }
   if (status === 422 && json?.code) {
-    // The server rejected something the local validator passed. That should not
-    // happen — the promise is that they are the same validator — so say so
-    // rather than printing it as an ordinary error.
+    // Flag disagreement between the local and server validators.
     process.stderr.write(`\n  ${json.code}\n  ${json.detail}\n\n`
       + '  This passed `ot check` locally. That is a bug on our side —\n'
       + '  please report it with the manifest.\n\n');

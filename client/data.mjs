@@ -1,22 +1,6 @@
-// The data-subscription client: `outcometick/data`.
-//
-//   import { DataClient } from "outcometick/data";
-//   const ot = new DataClient();                       // key from OT_KEY
-//   const { files } = await ot.files({ asset: ["btc", "eth"], dataset: "prices" });
-//   await ot.download(files[0], "./btc.csv.gz");       // verifies the checksum
-//
-// Deliberately a SUBPATH, not part of the package root. The root exports the
-// strategy SDK — `Strategy` and `Order` — which is what a backtest imports, and
-// that code runs in a container with no network at all. Putting an HTTP client
-// on the same import would invite a strategy to reach for it, type-check
-// locally, and then fail inside the sandbox. Here it cannot be reached by
-// accident, and the submission analyser rejects the import outright.
-//
-// Everything this file knows about the API's shape came from reading
-// api/subscription-api.mjs, not from the docs page. The two had drifted: the
-// published curl example shows only `asset` and `dataset`, while /v1/files also
-// takes a date RANGE and a venue and an interval, and every filter accepts
-// comma-separated alternatives plus a `none` sentinel.
+// Data API client, exported as outcometick/data. Keep it separate from the
+// strategy SDK: the sandbox has no network and rejects this import.
+// The API contract is defined in api/subscription-api.mjs.
 
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
@@ -27,12 +11,8 @@ export const DEFAULT_BASE_URL = 'https://outcometick.com';
 export const NO_VALUE = 'none';
 
 /**
- * An API error, carrying whatever the server said alongside the status.
- *
- * The subscription API answers 403 on a date outside coverage with the actual
- * `floor` and `ceiling`, which is the difference between "you cannot have this"
- * and "you cannot have this, here is what you can have". Flattening that into a
- * message string would throw the useful half away.
+ * API error with status, response body and URL. Out-of-coverage 403 responses
+ * include floor and ceiling in the body.
  */
 export class OutcometickError extends Error {
   constructor(status, body, url) {
@@ -47,11 +27,7 @@ export class OutcometickError extends Error {
 }
 
 /**
- * Render one filter value.
- *
- * Arrays join with commas because that is exactly what the API means by
- * `asset=btc,eth` — alternatives, not a nested structure. Passing an array is
- * the friendlier spelling of the same request, so both work.
+ * Render a string or array as comma-separated filter alternatives.
  */
 function filterValue(v) {
   if (v == null) return null;
@@ -68,9 +44,7 @@ export class DataClient {
    * @param opts.fetch    Injectable for tests.
    */
   constructor({ key = null, baseUrl = DEFAULT_BASE_URL, fetch: fetchImpl = null } = {}) {
-    // Read at construction so the failure is "you have not set a key", raised
-    // once and early, rather than a 401 from whichever call happened to be
-    // first.
+    // Capture the key at construction; _requireKey checks it before a request.
     this.key = key ?? process.env.OT_KEY ?? null;
     this.baseUrl = String(baseUrl).replace(/\/+$/, '');
     this._fetch = fetchImpl ?? globalThis.fetch;
@@ -115,12 +89,9 @@ export class DataClient {
   // ---------- discovery -------------------------------------------------
 
   /**
-   * What this key can see: the date window, and every dimension value in it.
-   *
-   * `assets` and `intervals` hold real symbols and real durations only. The
-   * `none` sentinel is reported separately under `filterTokens`, because a
-   * client that builds an enum from `intervals` or parses them as durations
-   * must not meet a token.
+   * Return the accessible date window and its dimension values.
+   * assets contains symbols and intervals contains durations; the none sentinel
+   * is separate, under filterTokens.
    */
   async meta() {
     return this._json('/v1/meta');
@@ -134,28 +105,27 @@ export class DataClient {
   /**
    * Search for files across a date range.
    *
-   * @param q.date      one day — sugar for from === to. Cannot be combined
+   * @param q.date      one day; sugar for from === to. Cannot be combined
    *                    with from/to.
    * @param q.from      inclusive start; defaults to the newest day in scope.
    * @param q.to        inclusive end; defaults to `from`.
    * @param q.venue     polymarket | predict-fun
    * @param q.dataset   prices | twap60s | book | klines | …  (see meta())
-   * @param q.asset     the BASE symbol — BTC, ETH, SOL, … NOT the pair.
+   * @param q.asset     the base symbol; BTC, ETH, SOL, … not the pair.
    *                    Files are named BTCUSD-…, but the asset dimension is
    *                    BTC; asking for "BTCUSD" matches nothing.
    * @param q.interval  5m, 1h, … or "none" for the streams that have no period
    *
    * Every filter accepts a string or an array; an array is joined with commas
    * and means "any of these". `interval: ["5m", NO_VALUE]` is how you ask for
-   * 5-minute files AND the period-less settlement streams — asking for "5m"
-   * alone deliberately excludes them.
+   * 5-minute files and the period-less settlement streams; asking for "5m"
+   * alone excludes them.
    *
    * The server caps the range (92 days by default) and answers 400 past it.
    */
   async files(q = {}) {
     if (q.date && (q.from || q.to)) {
-      // The server rejects this too; catching it here saves a round trip and
-      // says the same thing, so the two cannot describe it differently.
+      // Reject conflicting date filters before sending the request.
       throw new Error('use either date, or from/to — not both');
     }
     return this._json('/v1/files', {
@@ -173,9 +143,8 @@ export class DataClient {
   /**
    * A presigned URL for one file, without fetching it.
    *
-   * Useful when something else does the fetching — a data frame library, a job
-   * runner, a browser. The URL is short-lived; hold the `{date, name}` pair and
-   * ask again rather than storing it.
+   * For fetching through a data frame library, job runner or browser. URLs are
+   * short-lived; retain the `{date, name}` pair and request a new URL as needed.
    */
   async signUrl(date, name, { expiresIn = null } = {}) {
     return this._json('/v1/mirror/download', {
@@ -184,15 +153,11 @@ export class DataClient {
   }
 
   /**
-   * Download one file.
+   * Download one file, given a files() row or explicit (date, name).
    *
-   * Accepts either a row from files() or an explicit (date, name).
-   *
-   * The checksum is verified by default. /v1/dl answers 302 with the sha256 in
-   * a header and the bytes come from R2 behind the redirect, so the redirect is
-   * followed MANUALLY: letting fetch follow it would discard the header and
-   * with it the only checksum available without a second API call. A row from
-   * files() carries its own sha256, which is used when present.
+   * Verify the checksum by default. Follow the /v1/dl redirect manually to retain
+   * its sha256 header before fetching bytes from R2. Prefer the files() row
+   * checksum when present.
    *
    * @returns {Promise<{bytes: Uint8Array, sha256: string|null, name: string, date: string}>}
    */
@@ -255,10 +220,9 @@ export class DataClient {
 
   // ---------- smart money -----------------------------------------------
   //
-  // A separate subscription with its OWN key (a data key gets 403 here, and a
-  // smart-money key gets 403 on everything above). Daily files of the trades
-  // made by the top-ranked Polymarket traders: list top100, or top1000 on the
-  // Top 1000 plan. While it is not on sale these answer 503.
+  // Smart-money endpoints require a separate key: data keys receive 403 here
+  // and smart-money keys receive 403 on data endpoints. Daily lists are top100
+  // or top1000 (Top 1000 access). Endpoints return 503 when unavailable for sale.
 
   /** The days this smart-money key may download, newest first, each list's status. */
   async smartDays() {
@@ -269,7 +233,7 @@ export class DataClient {
    * Download one day's smart-money file (a zstd-compressed CSV), verified
    * against the sha256 the server sends with the redirect.
    *
-   * @param day   'YYYY-MM-DD' — take it from smartDays(), not from the calendar
+   * @param day   'YYYY-MM-DD'; take it from smartDays(), not from the calendar
    * @param list  'top100' | 'top1000'
    * @returns {Promise<{bytes: Uint8Array, sha256: string|null, day: string, list: string}>}
    */
@@ -284,7 +248,7 @@ export class DataClient {
 
   // ---------- public, no key needed -------------------------------------
 
-  /** Coverage across all venues. Public — works without a key. */
+  /** Coverage across all venues. Public; works without a key. */
   async coverage() {
     return this._json('/v1/public/coverage', { auth: false });
   }
@@ -347,14 +311,11 @@ const pruneBound = (x) => { const n = num(x); return Number.isFinite(n) && n >= 
  *   the best prices come from `best_bid_ask` and from the `best_bid`/`best_ask`
  *   each `price_change` item carries.
  *
- * Why the last step: book and price_change are captured at a cadence, so a
- * removal can fall between two stored frames and leave its level behind until
- * the next snapshot. Pruning against the newest best prices removes every
- * level they have moved past. It cannot restore what dropped frames added or
- * resized: until the next snapshot a level — at the top too — can be missing
- * or carry an old size, because best_bid_ask carries prices only. best() is the
- * best level of the rebuilt ladder, not the market's latest best bid and ask;
- * read best_bid_ask rows for those.
+ * Captured book and price_change rows may omit removals between frames.
+ * Pruning removes levels crossed by newer best prices, but cannot recover
+ * missing additions or size changes. Until the next snapshot, any level,
+ * including the top, may be missing or stale. best() returns the rebuilt
+ * ladder's best levels; read best_bid_ask for the latest market best prices.
  *
  * Prices and sizes are returned as the archive wrote them (strings). Rows of
  * other types are ignored. Predict.fun order-book rows are full snapshots on

@@ -1,13 +1,10 @@
-// What a report says about a GENERIC-data run (runner/generic-data.mjs) on top
-// of buildReport: which data, how much of the result is a valuation rather than
-// money, and the strategy measured on the same resolved markets as the
-// baselines. An archive report never goes through here.
-//
-// MUST MATCH client/backtest/generic_report.py.
+// Extend buildReport for generic data: dataset identity, marked valuations,
+// and strategy results on the resolved markets used by baselines.
+// Keep in sync with client/backtest/generic_report.py.
 
 const r2 = (x) => (Number.isFinite(x) ? Number(x.toFixed(2)) : null);
 
-/** Rows of `zero_legs` / `unusable` listed in full; the rest are counted. */
+/** Maximum rows listed for zero_legs and unusable; counts include all rows. */
 export const LISTED = 50;
 
 /**
@@ -39,8 +36,7 @@ export function genericReportExtras({ trades, markets, unusable, counts }) {
       to_ms: closes.length ? Math.max(...closes) : null,
     },
     valuation: {
-      // net_pnl is the sum of trade rows; when any row was closed at a mark,
-      // that sum includes a valuation, not only money.
+      // net_pnl includes valuations when trade rows close at a mark.
       net_pnl_includes_marks: marked.length > 0,
       realised_pnl: r2(total - markedPnl),
       marked_pnl: r2(markedPnl),
@@ -51,13 +47,11 @@ export function genericReportExtras({ trades, markets, unusable, counts }) {
         market_id: t.market_id, side: t.side, label: t.label ?? null, size: t.marked_size, reason: t.mark_missing,
       })),
       max_age_ms: ages.length ? Math.max(...ages) : null,
-      // Every open leg had a mark. NOT a statement that the marks were fresh:
-      // their ages are reported per row and as max_age_ms.
+      // All open legs had marks; freshness is reported per row and in max_age_ms.
       complete: zero.length === 0,
       note: 'marked legs are valued at the external mid (or last public trade) when trading ended — not an executable exit',
     },
-    // The baselines are computed on resolved markets only; this is the strategy
-    // on the same markets, so the two compare like for like.
+    // Restrict strategy comparisons to the resolved markets used by baselines.
     strategy_on_resolved: {
       markets: resolved.size,
       net_pnl: r2(onResolved.reduce((a, t) => a + (Number.isFinite(t.pnl) ? t.pnl : 0), 0)),

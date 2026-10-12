@@ -1,8 +1,4 @@
-// The Node harness, run as a real subprocess against a real job directory.
-//
-// Called out of process on purpose: the harness's contract is "given this
-// directory, write these files and exit with this code", and a test that
-// imported it would prove none of that.
+// Exercise the Node harness as a subprocess: job input, output files and exit codes.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,9 +14,7 @@ const HARNESS = path.join(path.dirname(fileURLToPath(import.meta.url)), 'harness
 
 const MARKET = {
   market_id: '0xm1', asset: 'BTCUSD', interval: '1h',
-  // The opening time was missing from this fixture entirely, so nothing here
-  // exercised the shape a real market has — and the log prefix that navigates
-  // by it went untested.
+  // Include opening time to exercise real market metadata and log prefixes.
   strike: 65000, outcome: 'UP', open_ts_ms: 1_000, close_ts_ms: 10_000,
 };
 
@@ -42,8 +36,7 @@ async function runHarness({ strategy, job = {}, events = EVENTS, markets = null 
   const out = path.join(dir, 'out');
   await mkdir(src, { recursive: true });
   await mkdir(out, { recursive: true });
-  // Mirrors the image layout: the SDK is a resolvable package ABOVE the
-  // strategy, because Node walks node_modules upward from the importing file.
+  // Match the image layout: Node resolves the SDK from an ancestor node_modules.
   const sdkDir = path.join(dir, 'node_modules', 'outcometick');
   await mkdir(sdkDir, { recursive: true });
   const realSdk = path.join(path.dirname(fileURLToPath(import.meta.url)), 'sdk');
@@ -205,8 +198,7 @@ test('a declared hook that is not defined is E_HOOK_SIG', async () => {
 });
 
 test('an undeclared hook is never called', async () => {
-  // onTrade exists on the class but is not in the manifest, so it must not
-  // fire — and the run must still succeed.
+  // Ignore onTrade when it is absent from the manifest, even if implemented.
   const r = await runHarness({
     strategy: `export class S {
       onMarketOpen() {}
@@ -249,39 +241,22 @@ test('logs are captured, prefixed by market, and capped by bytes', async () => {
     }`,
   });
   assert.equal(r.code, EXIT.ok, r.stderr);
-  // OPENING TIME, then a short id. The full condition hash identifies the
-  // market to the venue and to nobody reading the log — you cannot tell from
-  // it which market this was or when. The time is what a person navigates by.
-  // READABLE UTC, then a short id. Not epoch millis: ctx.log already puts the
-  // event time on every line as a bare 13-digit number, and two of those side
-  // by side are two numbers nobody can tell apart.
+  // Prefix logs with readable UTC opening time and a short market id.
   assert.match(r.logs, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2} 0xm1 /m,
     'the log prefix is not the market\'s opening time in readable UTC');
   assert.doesNotMatch(r.logs, /^\d{13} /m,
     'the prefix is raw epoch millis, indistinguishable from the event time beside it');
   const lines = r.logs.trim().split('\n');
-  // 3 ticks x 5 lines = 15 lines of ~12 bytes each = ~180 bytes, cut short by
-  // the job's 60-byte budget. The first fixture used 220 and every line fitted
-  // — a cap that is not reached proves nothing about a cap.
+  // Fifteen lines total about 180 bytes, exceeding the 60-byte budget.
   assert.ok(lines.length < 15, `${lines.length} lines got through a 60-byte budget`);
   assert.equal(r.result.logTruncated, true);
-  // AND THE READER IS TOLD, in the log itself. A log that simply stops reads as
-  // a strategy that stopped calling ctx.log, and sends someone hunting for a
-  // bug in their own code.
+  // Include a truncation notice in the log.
   assert.match(r.logs, /log budget spent/,
     'the log was truncated without saying so — the reader is left to guess');
 });
 
 test('the log budget is spent across the whole run, not per market', async () => {
-  // The hole this replaced: the budget was created inside replayMarket, so
-  // every market got a fresh one. polymarket runs ~386 markets a day, so the
-  // documented cap was really 386x itself, and ctx.log became a bulk export
-  // channel for the data we sell.
-  //
-  // Three markets, one 60-byte budget. If the budget is shared, market 1 spends
-  // it and the later markets log NOTHING. If it is per-market, each one gets a
-  // fresh 60 bytes and market 3 logs just as freely as market 1 — which is the
-  // bug, and is what makes this assertion discriminating.
+  // Three markets share one 60-byte budget; later markets get no fresh allowance.
   const r = await runHarness({
     strategy: `export class S {
       onMarketOpen() {}
@@ -300,8 +275,7 @@ test('the log budget is spent across the whole run, not per market', async () =>
   assert.equal(later.length, 0,
     `markets after the first still logged ${later.length} lines — the budget reset per market`);
 
-  // And the total really is bounded by the job's budget, which is the property
-  // the archive's logs.txt depends on.
+  // Bound the total log output by the job budget.
   const bytes = strategyLines.reduce((n, l) => n + l.length + 1, 0);
   assert.ok(bytes <= 60 + 40,
     `${bytes} bytes of strategy log got through a 60-byte budget`);
@@ -327,8 +301,7 @@ test('market mode resets instance state between markets', async () => {
   void events2;
   assert.equal(r.code, EXIT.ok, r.stderr);
   assert.equal(r.result.marketsRun, 2);
-  // A fresh instance per market means the counter never reaches 2 — which is
-  // exactly what lets the run be sharded across workers.
+  // A fresh instance per market keeps the counter below two.
   assert.ok(!/seen=2/.test(r.logs), 'state must not survive a market boundary');
 });
 
@@ -349,9 +322,7 @@ test('session mode carries one instance and one portfolio across markets', async
 });
 
 test('session mode writes each market\'s rows when it settles, not all at the end', async () => {
-  // Memory, not cosmetics: a session holds one portfolio for the whole range,
-  // and keeping every trade and fill until the run ends lets a long session run
-  // the sandbox out of memory before anything is written.
+  // Session mode must stream trades and fills to bound memory use.
   const second = { ...MARKET, market_id: '0xm2', open_ts_ms: 20_000, close_ts_ms: 30_000 };
   const r = await runHarness({
     strategy: BUY_ONCE,
@@ -396,9 +367,7 @@ test('a fill delay prices against the later book', async () => {
 });
 
 test('a limit still protects a delayed fill', async () => {
-  // The other half, and the one that matters more: if the price runs past the
-  // limit while the order is in flight, it does NOT fill. An engine that filled
-  // it anyway would be inventing a price the strategy refused to pay.
+  // An in-flight order must not fill after the price moves beyond its limit.
   const events = [
     book(1000, 0.50, 0.49),
     tick(1000, 65100),
@@ -418,10 +387,7 @@ test('a limit still protects a delayed fill', async () => {
 // ---------------------------------------------------------------------------
 
 test('a market with no events still runs and is counted', async () => {
-  // The old version of this test covered "the harness could not open the event
-  // file". There is no file any more — the worker streams events in, and a
-  // market it could not read is simply never sent. A market that arrives with
-  // zero events is a real (if empty) market-day.
+  // An empty streamed market-day is valid. Unreadable markets are not sent.
   const r = await runHarness({
     strategy: BUY_ONCE,
     markets: [
@@ -439,8 +405,7 @@ test('a market with no events still runs and is counted', async () => {
 // ---------------------------------------------------------------------------
 
 test('a strategy in a subdirectory loads', async () => {
-  // SAFE_NAME permits `helpers/z.mjs`, so the harness has to be able to import
-  // one — and the worker has to have created the parent directory.
+  // SAFE_NAME permits nested modules; create their parent directories and resolve imports.
   const dir = await mkdtemp(path.join(tmpdir(), 'ot-harness-sub-'));
   const src = path.join(dir, 'src');
   const out = path.join(dir, 'out');
@@ -485,9 +450,7 @@ export class S {
 });
 
 test('params do not leak between markets', async () => {
-  // One shared params object across per-market instances let a strategy that
-  // wrote to ctx.p in market 1 change its own behaviour in market 2 — the exact
-  // cross-market state that the per-market reset exists to prevent.
+  // Copy params per market so mutations cannot leak between instances.
   const r = await runHarness({
     strategy: `export class S {
       onMarketOpen() {}
@@ -499,12 +462,8 @@ test('params do not leak between markets', async () => {
     ],
   });
   assert.equal(r.code, EXIT.ok, r.stderr);
-  // 9999 legitimately appears within market 1 — the strategy wrote it on its
-  // own first tick and reads it back on the next two. What must NOT happen is
-  // market 2 starting from it.
-  // Found by the id ANYWHERE in the prefix, not by position: the prefix now
-  // leads with the market's opening time, and this test is about parameters
-  // not leaking — it should not break when the log gains a field.
+  // 9999 is valid after market 1 mutates its params, but must not appear
+  // in market 2. Find the id anywhere in the prefix, independent of layout.
   const firstOfMarket2 = r.logs.split('\n').find((l) => l.includes('0xm2 '));
   assert.match(firstOfMarket2, /size=100$/,
     `market 2 started from a value market 1 wrote: ${firstOfMarket2}`);
@@ -515,9 +474,7 @@ test('params do not leak between markets', async () => {
 // ---------------------------------------------------------------------------
 
 test('a strategy cannot tamper with the output serializer', async () => {
-  // The harness shares a process with the strategy, so JSON.stringify and
-  // Object.prototype.toJSON are both in reach and both pass the analyser.
-  // Either would have let a strategy rewrite its rows on the way out.
+  // Strategies can replace JSON.stringify; output serialization must stay trusted.
   const r = await runHarness({
     strategy: `export class S {
       onMarketOpen() {
@@ -540,8 +497,7 @@ test('a strategy cannot tamper with the output serializer', async () => {
 });
 
 test('only known fields reach the output', async () => {
-  // Rows are projected onto a null-prototype object field by field, so a getter
-  // or an extra key cannot ride along.
+  // Project rows field by field onto null-prototype objects.
   const r = await runHarness({ strategy: BUY_ONCE });
   const extras = Object.keys(r.trades[0]).filter((k) => !(
     ['market_id', 'side', 'size', 'entry_px', 'exit_px', 'pnl', 'fees',
@@ -555,11 +511,7 @@ test('only known fields reach the output', async () => {
 // ---------------------------------------------------------------------------
 
 test('the SDK import the docs show actually resolves', async () => {
-  // Every sample — the docs page, the editor, the analyser's happy path — says
-  // `import { Strategy, Order } from "outcometick"`. Nothing tested that it
-  // RESOLVES, and it did not: the Node image had no such package, so a valid
-  // customer submission passed free validation and then failed at load inside
-  // the sandbox, after the run was queued.
+  // Check that the documented SDK package import resolves inside the harness.
   const r = await runHarness({
     strategy: `import { Strategy, Order } from "outcometick";
 
@@ -579,8 +531,7 @@ export class S extends Strategy {
 });
 
 test('the SDK Order refuses an impossible order at construction', async () => {
-  // Better a clear rejection naming the field than a silently clamped order
-  // the strategy never asked for.
+  // Reject invalid fields rather than silently clamp them.
   const r = await runHarness({
     strategy: `import { Strategy, Order } from "outcometick";
 export class S extends Strategy {
@@ -615,10 +566,7 @@ export class S extends Strategy {
 });
 
 test('result.json cannot be forged through prototype pollution', async () => {
-  // The rows were projected but `result` was still an ordinary object written
-  // after untrusted code had run, and Object.prototype.toJSON reaches every
-  // ordinary object — so markets_run, fees_paid, crosschecks and the budget
-  // summary were all still rewritable at the root.
+  // Protect result metadata as well as rows from inherited toJSON hooks.
   const r = await runHarness({
     strategy: `export class S {
       onMarketOpen() {
@@ -629,8 +577,7 @@ test('result.json cannot be forged through prototype pollution', async () => {
       onTick() { return null; }
     }`,
   });
-  // Object.prototype is now frozen before the strategy loads, so the attempt
-  // itself is refused — the run stops with the error, nothing is forged.
+  // Freeze Object.prototype before loading the strategy; reject the mutation.
   assert.equal(r.code, EXIT.rejected, r.stderr);
   assert.equal(r.result.rejection.code, 'E_RUNTIME');
   assert.match(r.result.rejection.detail, /not extensible|read.only|Cannot (add|assign)/i);
@@ -638,10 +585,8 @@ test('result.json cannot be forged through prototype pollution', async () => {
 });
 
 test('an inherited setter on Object.prototype cannot capture engine objects', async () => {
-  // `this.x = …` in an engine constructor would run a setter inherited from
-  // Object.prototype and hand over the instance (MakerBook, Portfolio,
-  // MarketReplay). The analyser only checks direct Object.xxx calls, so an alias
-  // gets defineProperty — the lock is what stops it.
+  // Inherited setters can capture engine instances during construction.
+  // Prototype freezing must also block mutations through aliases.
   for (const where of ['top', 'hook']) {
     const attack = `const O = Object; O.defineProperty(O.prototype, "pf", { configurable: true, set(v) { globalThis.stolen = this; } });`;
     const r = await runHarness({
@@ -653,8 +598,7 @@ export class S { onMarketOpen() { ${where === 'hook' ? attack : ''} } onTick() {
 });
 
 test('ordinary code that sets its own toString still works under the lock', async () => {
-  // decimal.js does exactly this on a plain object; freezing Object.prototype
-  // naively would make it throw (the override mistake).
+  // decimal.js overrides inherited names on plain objects; keep that working.
   const r = await runHarness({
     strategy: `const P = {}; P.toString = function () { return "p"; }; P.valueOf = () => 7;
 function F() {} F.prototype.toString = function () { return "f"; };
@@ -673,17 +617,7 @@ export class S {
 // ---------------------------------------------------------------------------
 
 test('a strategy cannot steal the market before its first hook', async () => {
-  // The harness used to buffer a whole market's events into an array before
-  // replay began — so the future WAS in the process, and a strategy imported
-  // before that buffering only had to intercept something the harness used to
-  // fill it. `JSON.parse = …` and `Array.prototype.push = …` both pass static
-  // analysis, and either one hands over every tick of the market. It could then
-  // trade on data it should not have, and the engine would execute those orders
-  // for real: not a forged report, a genuinely computed one that means nothing.
-  //
-  // Events are now pulled one at a time by the replay loop, so there is nothing
-  // to steal. Whatever an intercepted parser sees is the event the strategy is
-  // about to be handed anyway.
+  // Pull one event at a time so parser interception cannot reveal future rows.
   const events = Array.from({ length: 50 }, (_, i) => tick(1000 + i, 100 + i));
   const r = await runHarness({
     events,
@@ -702,15 +636,12 @@ export class S {
   });
   assert.equal(r.code, EXIT.ok, r.stderr);
   const stolen = Number(/stolen=(\d+)/.exec(r.logs)?.[1]);
-  // At most the current row. Before the fix this was all 50.
+  // Only the current row may have been parsed.
   assert.ok(stolen <= 1, `a strategy saw ${stolen} ticks before its first hook fired`);
 });
 
 test('a strategy cannot patch the built-ins the engine keeps its state in', async () => {
-  // Array.prototype.push = … passes static analysis. With it, every engine
-  // method that pushed, filtered or iterated handed over an internal array —
-  // fill rows, book levels, resting-order records — to be rewritten. The
-  // harness freezes those prototypes before the strategy loads.
+  // Freeze collection prototypes before strategy loading to protect internal arrays.
   const events = Array.from({ length: 5 }, (_, i) => tick(1000 + i, 100 + i));
   const atLoad = await runHarness({
     events,
@@ -726,8 +657,7 @@ export class S { onMarketOpen() {} onTick() { return null; } }`,
     'WeakSet.prototype.add = function () { return this; }',
     'Object.getPrototypeOf(function* () {}).prototype.next = () => ({ done: true })',
     'Function.prototype.call = () => null',
-    // The stdin reader splits 64 KiB chunks: a replaced split saw rows not yet
-    // replayed, and could rewrite them.
+    // Replacing split must not expose unread rows from 64 KiB stdin chunks.
     'String.prototype.split = function () { return []; }',
     'Buffer.prototype.toString = function () { return ""; }',
     // Engine code resolves these globals by name at call time.
@@ -747,8 +677,7 @@ export class S { onMarketOpen() {} onTick() { return null; } }`,
 
 
 test('a market with no opening time keeps the id, without a leading space', async () => {
-  // Every consumer of logs.txt splits on whitespace. A blank first field
-  // shifts all of them by one, which is worse than the missing time itself.
+  // A blank timestamp would shift whitespace-separated log fields.
   const noOpen = { ...MARKET };
   delete noOpen.open_ts_ms;
   const r = await runHarness({
@@ -763,8 +692,7 @@ test('a market with no opening time keeps the id, without a leading space', asyn
   assert.doesNotMatch(r.logs, /^ /m);
 });
 
-// A 50:50 settlement is a real outcome. Narrowing it to undefined here would
-// silently strip it from every trade row and market summary the worker reads.
+// Preserve a tie as an outcome in trade rows and market summaries.
 test('a TIE outcome survives the protocol parse, and nonsense does not', () => {
   const row = { market_id: '0xm1', side: 'UP', size: 1, pnl: 0, entry_px: 0.5, exit_px: 0.5, how: 'settled' };
   assert.equal(parseTrade({ ...row, outcome: 'TIE' }).outcome, 'TIE');

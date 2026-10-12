@@ -1,14 +1,7 @@
 #!/usr/bin/env node
-// The Node.js harness. Runs INSIDE the sandbox, in the same process as the
-// submitted strategy.
-//
-// It is the strategy's whole world: the SDK surface it imports, the loop that
-// calls it, and the only two things it can write. There is no network stack in
-// the image and the filesystem is read-only apart from one scratch directory,
-// so this file does not try to be a security boundary — the container is. What
-// it does enforce is the CONTRACT: hooks are called with the right shapes, the
-// per-event budget is measured, and nothing but trades, fills and logs comes
-// back out.
+// Node.js sandbox entrypoint, running in the strategy's process.
+// The container provides isolation; this harness validates hooks, measures
+// event budgets and emits authenticated results.
 //
 //   node harness.mjs <job-dir>      job on stdin, results on stdout
 
@@ -24,28 +17,14 @@ import { rowPending, newMakerStats, addMakerStats } from '../../engine/maker.mjs
 import { CHANNEL, RESULT_FD, EXIT, RECORD_FIELDS, MAX_RECORD_ROWS, MAX_RECORD_BYTES, lineBytes } from '../protocol.mjs';
 
 /**
- * REPLACE `console`, before any strategy code is imported. Do not patch it.
- *
- * fd 1 is the result channel now (see protocol.mjs), and Node exposes no dup2,
- * so it cannot be repointed the way the Python harness repoints it. Swapping
- * out the METHODS is not enough: Node's console keeps the underlying stream on
- * `console._stdout`, and `console.Console` will build a fresh one over any
- * stream handed to it. `console._stdout.write(...)` passes the analyser today
- * and puts arbitrary bytes on the result channel — not a forgery, the MAC still
- * holds, but a half-line written between two real ones corrupts the record that
- * follows it, and a dropped result reads as a run that produced nothing and
- * gets refunded.
- *
- * So the strategy gets an object that holds no stream at all. Silently dropped
- * rather than redirected: ctx.log is the documented, bounded, archived channel,
- * and a strategy printing megabytes should not be able to turn that into worker
- * output.
+ * Replace console before importing strategy code. Patching methods leaves
+ * console._stdout and console.Console able to write to the result channel.
+ * MACs reject forged lines, but stray writes can corrupt valid framing.
+ * The replacement holds no streams; use the bounded ctx.log channel.
  */
 let warnedAboutConsole = false;
 function consoleIsGone() {
-  // Not silent: a strategy author whose console.log vanishes without a word
-  // will spend an afternoon on it. stderr is the harness's own channel, and
-  // `ot run` prints it.
+  // Warn once on stderr, which ot run displays.
   if (warnedAboutConsole) return undefined;
   warnedAboutConsole = true;
   try {
@@ -54,9 +33,8 @@ function consoleIsGone() {
   return undefined;
 }
 globalThis.console = Object.freeze(Object.fromEntries(
-  // Every method the platform documents, so a strategy calling a real one gets
-  // a no-op instead of a TypeError. Deliberately absent: _stdout, _stderr and
-  // Console — the three names that hand back a writable stream.
+  // Keep documented methods as no-ops. Exclude _stdout, _stderr and Console,
+  // which expose writable streams.
   [
     'assert', 'clear', 'count', 'countReset', 'debug', 'dir', 'dirxml', 'error',
     'group', 'groupCollapsed', 'groupEnd', 'info', 'log', 'profile',
@@ -67,49 +45,15 @@ globalThis.console = Object.freeze(Object.fromEntries(
 
 
 /**
- * The built-ins, locked before any strategy is imported.
+ * Protect built-ins before importing strategies. Strategies share the engine's
+ * realm; patched methods, inherited setters, iterators and global bindings can
+ * expose engine state or alter replay. Static analysis alone cannot stop aliases.
  *
- * The strategy shares this realm with the engine, and static analysis is not a
- * wall (`const O = Object; O.defineProperty(…)` passes it). Three ways in,
- * each verified, each closed here:
- *
- *  - Replacing a method the engine calls on its own state — Array.prototype
- *    push/filter/slice/iterator, Map.prototype.get, WeakSet.prototype.add, the
- *    Object statics: the replacement receives the engine's internal array,
- *    map or row as `this` or an argument, and can rewrite it (fabricate
- *    liquidity, jump a queue, edit fills).
- *  - A SETTER on Object.prototype: every engine constructor's `this.x = …` on
- *    a fresh instance runs an inherited setter, handing the strategy the whole
- *    MakerBook, Portfolio or MarketReplay.
- *  - Replacing the generator prototype's `next`: the replay loop pulls events
- *    from a generator, so a strategy could FEED the engine invented events.
- *  - Replacing a String or Buffer method the stdin reader uses (`split`,
- *    `toString`): each read is a 64 KiB chunk, so the replacement saw rows not
- *    yet replayed — the future, in the process after all — and could rewrite
- *    them. Same for Math (`Math.min` sizes every fill) and the other value
- *    prototypes the engine calls.
- *  - Re-binding a global (`globalThis.Math = …`): engine code resolves `Math`,
- *    `Buffer`, `Object`… by name at call time, so the bindings themselves are
- *    made read-only too.
- *
- * Not a forged output line (the HMAC stops that) but a genuinely computed
- * report that means nothing. Freezing makes every such write throw (modules
- * are strict); a strategy that patches built-ins fails with the error saying so.
- *
- * Nothing can simply be frozen, because of two ordinary library patterns.
- * Assigning an own `toString` on an object (decimal.js does `P.toString = …`)
- * throws when the property is frozen further up the chain — the "override
- * mistake". And polyfills write a built-in back to itself
- * (`Number.isFinite = Number.isFinite || …` — danfojs-node's bundled mathjs),
- * which throws on a frozen property even though nothing changes. So, as SES
- * does, the writable data properties of Object.prototype, Function.prototype,
- * every constructor (its statics), Math and Reflect become accessors: a write
- * to another object defines that object's own property, a write of the SAME
- * value to the built-in itself is a no-op, and only a write that would change
- * it throws. The other prototypes (Array, String, Map… — the engine's hot
- * path, where an accessor per method lookup doubled replay time) are frozen
- * plainly; the allowlisted packages load and run under this, verified in the
- * image (runner/sandbox.test.mjs).
+ * Accessors on constructors, Object.prototype, Function.prototype, Math and
+ * Reflect allow overrides on derived objects and same-value assignments to
+ * built-ins. Assignments that change a built-in throw. Other prototypes are
+ * frozen directly: accessor lookups on hot paths doubled replay time in sandbox
+ * measurements. runner/sandbox.test.mjs checks package compatibility.
  */
 {
   const { defineProperty, getOwnPropertyDescriptors, freeze, getPrototypeOf } = Object;
@@ -169,28 +113,15 @@ globalThis.console = Object.freeze(Object.fromEntries(
 }
 
 /**
- * The parser, captured at module load — before any strategy is imported.
- *
- * Defence in depth behind the streaming fix below: even reading one event at a
- * time, a strategy that had replaced `JSON.parse` would see each row a moment
- * before its own hook does. Capturing costs nothing.
+ * Capture the parser before strategy import to prevent JSON.parse rebinding
+ * from intercepting the job stream.
  */
 const parseJson = JSON.parse;
 
 /**
- * Our own JSON writer. `JSON.stringify` is not used for output at all.
- *
- * Capturing `JSON.stringify` at module load is not enough, and neither is
- * projecting rows onto null-prototype objects. `JSON.stringify` looks up
- * `toJSON` through the PROTOTYPE CHAIN — on arrays, and even on primitives via
- * boxing — so a single `Object.prototype.toJSON = …` compromises it no matter
- * what it is handed. (Deleting the property is not a fix either: a strategy can
- * define it non-configurable.)
- *
- * Thirty lines of writer sidesteps the entire question: nothing here consults a
- * prototype, so there is nothing to poison. The shapes are simple — numbers,
- * strings, booleans, nulls, arrays and flat objects — because that is all the
- * protocol allows out.
+ * Serialise protocol values without JSON.stringify or inherited toJSON hooks.
+ * Capturing stringify alone still permits prototype lookups on arrays and boxed
+ * primitives. Supports numbers, strings, booleans, null, arrays and objects.
  */
 const ESCAPES = {
   '"': '\\"', '\\': '\\\\', '\n': '\\n', '\r': '\\r', '\t': '\\t',
@@ -227,12 +158,8 @@ function stringify(value) {
 }
 
 /**
- * Copy a row onto a NULL-PROTOTYPE object with primitive-coerced values.
- *
- * A captured stringify still consults `toJSON` on the value it is given, and
- * `Object.prototype.toJSON = …` would reach every ordinary object. A
- * null-prototype object inherits nothing, so there is no hook to install, and
- * coercing each field means a getter cannot be smuggled in either.
+ * Project known fields onto a null-prototype object with primitive values.
+ * Remove inherited hooks and object-valued fields before serialisation.
  */
 function projectRow(row, fields) {
   const out = Object.create(null);
@@ -247,11 +174,7 @@ function projectRow(row, fields) {
 }
 
 /**
- * Deep-copy the result onto null-prototype objects.
- *
- * Same reasoning as projectRow, applied to the whole document: nothing that
- * inherits from Object.prototype survives, so there is no toJSON hook to
- * install anywhere in the tree.
+ * Deep-copy results into primitives, arrays and null-prototype objects.
  */
 function projectResult(value) {
   if (value == null) return null;
@@ -270,9 +193,8 @@ const TRADE_FIELDS = [
   'market_id', 'side', 'size', 'entry_px', 'exit_px', 'pnl', 'fees',
   'opened_ms', 'closed_ms', 'how', 'outcome',
 ];
-// Generic markets (runner/generic-data.mjs) add these; archive rows never carry
-// a `label`, so their projection is exactly the fields above.
-// MUST MATCH GENERIC_TRADE_FIELDS in otharness.py.
+// Generic market fields, selected when a row carries a label.
+// Keep in sync with GENERIC_TRADE_FIELDS in otharness.py.
 const GENERIC_TRADE_FIELDS = [
   ...TRADE_FIELDS, 'label', 'mark_px', 'marked_size', 'marked_pnl', 'mark_source',
   'mark_ts_ms', 'mark_age_ms', 'mark_missing',
@@ -286,31 +208,11 @@ const FILL_FIELDS = [
 const GENERIC_FILL_FIELDS = [...FILL_FIELDS, 'label'];
 
 /**
- * Pull lines off a file descriptor SYNCHRONOUSLY, one at a time.
- *
- * Synchronous, and reading only as far as it is asked to, because that is what
- * makes the product's central claim literally true rather than approximately
- * true. The docs say:
- *
- *     Look-ahead is impossible, because future rows are not in the process
- *     yet — not filtered out, not present.
- *
- * The previous version buffered a whole market's events into an array before
- * replay started. The future WAS in the process, and the strategy — imported
- * before that buffering — only had to intercept something the harness used to
- * fill it. `JSON.parse = …` and `Array.prototype.push = …` both pass static
- * analysis, and either one hands the strategy every tick of the market before
- * its first hook fires. It could then trade on data it should not have, and the
- * engine would execute those orders for real: not a forged report, a genuinely
- * computed one that means nothing.
- *
- * Pulling one line at a time, driven by the replay loop, removes the thing
- * being stolen. An intercepted parser now sees exactly the event the strategy
- * is about to be handed anyway.
- *
- * Sync rather than async so the replay loop stays a plain `for…of`: an
- * `await` per event across hundreds of millions of events is a real cost, and
- * this runs inside a 400µs-per-event budget.
+ * Read newline-framed input synchronously as replay requests each line.
+ * The reader buffers 64 KiB chunks that may contain later rows, but does not
+ * decode a full market before replay. Captured parsing and protected built-ins
+ * prevent strategies from intercepting buffered input. Synchronous reads avoid
+ * an await per event in the replay loop.
  */
 function syncLineReader(fd) {
   const CHUNK = 1 << 16;
@@ -332,7 +234,7 @@ function syncLineReader(fd) {
         n = readSync(fd, buf, 0, CHUNK, null);
       } catch (err) {
         // A pipe that Node has put into non-blocking mode has nothing ready
-        // yet. Spin rather than fail — the worker is still writing.
+        // yet. Spin rather than fail, the worker is still writing.
         if (err.code === 'EAGAIN') continue;
         if (err.code === 'EOF') n = 0;
         else throw err;
@@ -356,11 +258,7 @@ function syncLineReader(fd) {
 }
 
 /**
- * Load the strategy class the manifest named.
- *
- * By exact name, with no discovery. A module that exports one class under a
- * different name is a rejection rather than a guess: guessing is how a run
- * silently executes something other than what the submitter meant.
+ * Load the class named in the manifest without class discovery.
  */
 async function loadStrategy(dir, entry) {
   const file = path.join(dir, entry.file);
@@ -381,11 +279,7 @@ async function loadStrategy(dir, entry) {
 }
 
 /**
- * Check the declared hooks exist with the right arity before anything runs.
- *
- * A declared-but-missing hook is a rejection, and finding that out now costs
- * nothing — finding it out after 700 market-days have been decoded costs the
- * customer a run.
+ * Validate declared hooks and their arity before replay.
  */
 function checkHooks(Klass, hooks, arities) {
   const proto = Klass.prototype;
@@ -395,7 +289,7 @@ function checkHooks(Klass, hooks, arities) {
       throw new RunAbort('E_HOOK_SIG', `${canonical} was declared but ${name}() is not defined on the class`);
     }
     const want = arities[canonical];
-    // Arity is advisory in JS — rest params and defaults both report oddly —
+    // Arity is advisory in JS, rest params and defaults both report oddly —
     // so only an obviously wrong signature is refused.
     if (want != null && fn.length > want) {
       throw new RunAbort('E_HOOK_SIG',
@@ -423,10 +317,8 @@ async function main() {
   const job = parseJson(first);
   const srcDir = path.join(jobDir, 'src');
 
-  // Every result line goes out over stdout, authenticated with the per-run key
-  // that arrived in the job — before any strategy was imported. See the long
-  // note in protocol.mjs: /out used to be a writable mount, and an allowlisted
-  // pandas could rewrite trades.jsonl from on_settle.
+  // Emit authenticated stdout lines using the key read before strategy import.
+  // See protocol.mjs for the protocol and its limits.
   const outputKey = String(job.outputKey ?? '');
   if (!outputKey) {
     process.stderr.write('no output key in the job\n');
@@ -456,13 +348,10 @@ async function main() {
     maker: null,
   };
 
-  // The recorder (engine.record_ms, market mode): each finished market's
-  // samples, keyed by instance, within the run's row and byte budgets.
-  // Reaching either stops recording for the whole run; the report then shows
-  // no series at all. MUST MATCH otharness.py.
+  // Record per-market samples within run-wide row and byte budgets. Exceeding
+  // either discards all recorded series. Keep in sync with otharness.py.
   const record = engine?.record_ms ? { rows: 0, bytes: 0, truncated: false, instance: 0 } : null;
-  // Counted where samples are MADE (MarketReplay recordBudget), one for the
-  // run: memory stays bounded however long a market is.
+  // Count samples as they are created to bound memory within long markets.
   const recordBudget = record ? { rows: 0, limit: MAX_RECORD_ROWS, truncated: false } : null;
   const emitRecord = (entry, rows) => {
     if (recordBudget.truncated) { record.truncated = true; return; }
@@ -488,22 +377,15 @@ async function main() {
     result.budget = monitor.summary();
     if (record) result.record = { rows: record.rows, bytes: record.bytes, truncated: record.truncated || recordBudget.truncated };
     if (orderStats) result.orders = orderStats;
-    // Projected like the rows: `result` is an ordinary object built AFTER
-    // untrusted code has run, and Object.prototype.toJSON reaches every
-    // ordinary object — so a captured stringify alone still let a strategy
-    // forge markets_run, fees_paid, crosschecks and the budget summary.
+    // Project results created after strategy execution to remove inherited hooks.
     emit(CHANNEL.result, stringify(projectResult(result)));
     return code;
   };
 
-  // One monitor across the whole run: resetting it per market would let a
-  // strategy be pathological on every market and never trip. That is also
-  // exactly why the verdict is a WINDOW rather than a lifetime mean — spanning
-  // the run means a cheap prefix would otherwise pay for an expensive phase.
+  // Use a run-wide monitor and rolling window so cheap earlier events cannot
+  // dilute a later phase that exceeds the budget.
   const monitor = new BudgetMonitor({ limitMicros: job.limits?.perEventBudgetMicros ?? 400 });
-  // ONE log allowance for the whole run. Every market gets the same object, so
-  // a strategy cannot multiply its budget by the number of markets in a day —
-  // which on polymarket is about 386.
+  // Share one log allowance across all markets.
   const logBudget = makeLogBudget({
     bytes: job.limits?.logBytesPerRun,
     lineChars: job.limits?.logLineChars,
@@ -533,16 +415,8 @@ async function main() {
 
   /** What the loop tracks for one open market, besides the replay itself. */
   const newMarket = (entry) => {
-    // Reference feeds and user series arrive INTERLEAVED in the same stream,
-    // in event time, and are appended to a growing array as they pass.
-    //
-    // Not shipped as a block on the market header, which would be simpler:
-    // a Binance price is very nearly the underlying that decides the outcome,
-    // so holding the whole window in the process would reopen exactly the hole
-    // the event stream was hardened against — a strategy that patched
-    // JSON.parse at import time could read the future off it. Streaming keeps
-    // the guarantee structural: a row the replay has not reached is not in the
-    // process at all.
+    // Reference and external-series rows arrive interleaved in event-time order.
+    // Append them as replay advances rather than loading full future feed windows.
     const feedRows = new Map();
     const rowsFor = (name) => {
       let a = feedRows.get(name);
@@ -554,20 +428,11 @@ async function main() {
       replay: null,
       before: null,
       seen: 0,
-      // The book as the ENGINE sees it, advanced by the same class.
-      //
-      // Three things were wrong with reading the last book event instead. A
-      // Polymarket snapshot carries one side, so the other came back null. Its
-      // ask ladder is published descending while Predict's is ascending, so
-      // element zero was the worst offer on one venue. And a `price_change`
-      // after the last snapshot moved the price for the engine but not for this
-      // number. Advancing a real Book removes all three, and removes a second
-      // implementation with them.
+      // Use the engine's Book to reconstruct both outcomes, sort venue ladders
+      // and apply deltas before computing opening quotes.
       summaryBook: new BookCls(),
-      // The first book state that quotes BOTH sides — the same rule the worker
-      // applies, so the two do not report different numbers for one run.
-      // Locking each side as it appears would mix prices from two instants, and
-      // the favourite is the dearer of the pair.
+      // Capture the first state quoting both outcomes, matching the worker.
+      // Reading each side at a different instant could change the opening favourite.
       openQuotes: null,
       rowsFor,
       clock: sessionClock ?? { t: -Infinity },
@@ -586,10 +451,8 @@ async function main() {
     }
     // A spot value is quiet (DATASETS.spot): not counted as an event seen.
     if (ev.kind !== 'spot') m.seen += 1;
-    // This book exists only to find the opening quotes, so it stops being kept
-    // once they are known: the replay keeps its own, and applying every event
-    // to both was a second book's worth of work per event.
-    // MUST MATCH observe() in runner/harness/python/otharness.py.
+    // Stop maintaining this book once opening quotes are known; replay has its
+    // own book. Keep in sync with observe() in runner/harness/python/otharness.py.
     if (ev.kind === 'book' && m.openQuotes === null) {
       if (ev.snapshot) m.summaryBook.snapshot(ev.ts_ms, ev.levels);
       else if (ev.side && ev.ladder) {
@@ -617,14 +480,11 @@ async function main() {
     } else {
       instance = new Klass();
     }
-    // A fresh copy per instance. Sharing one object across markets let a
-    // strategy that wrote to ctx.p in market 1 change its own behaviour in
-    // market 2 — which is exactly the cross-market state that per-market
-    // reset exists to prevent, and it would break sharding silently.
+    // Copy params per instance to preserve market-mode independence and sharding.
     instance.p = { ...(job.params ?? {}) };
     m.before = { trades: pf.trades.length, fills: pf.fills.length };
     // The arrays are shared with the stream, so the feeds see each row the
-    // moment the replay passes its timestamp — and not before.
+    // moment the replay passes its timestamp, and not before.
     const references = buildFeeds(entry.references ?? [], Object.fromEntries(
       (entry.references ?? []).map((n) => [n, m.rowsFor(n)]),
     ), entry.lags ?? {});
@@ -638,8 +498,7 @@ async function main() {
       strategy: instance,
       hooks: job.hooks,
       portfolio: pf,
-      // ONE allowance for the whole run, handed to every market. Per-market
-      // was the old shape and the reason ctx.log was an export channel.
+      // Share the run-wide log allowance across markets.
       logBudget,
       fillDelayMs: job.fillDelayMs ?? 0,
       budget: monitor,
@@ -662,41 +521,20 @@ async function main() {
     const { entry } = m;
     result.markets_run += 1;
     result.events_seen += m.seen;
-    // Acknowledge the market-day AFTER it is replayed, so the panel a
-    // customer is watching counts finished work rather than queued bytes.
+    // Acknowledge completed replay, not queued stdin bytes.
     emit(CHANNEL.progress, stringify({ n: result.markets_run }));
     if (out.logTruncated && !result.log_truncated) {
       result.log_truncated = true;
-      // SAID IN THE LOG ITSELF, once, where someone reading it will see it.
-      // A log that just stops looks like a strategy that stopped calling
-      // ctx.log — and the reader goes hunting for a bug in their own code.
+      // Include one truncation notice in the log.
       logsOut.write('[runner] log budget spent — the rest of this run\'s'
         + ' ctx.log output was dropped. ctx.log is for reading, not for'
         + ' exporting; see the SDK docs for the limit.\n');
     }
-    // OPENING TIME FIRST, then a short id.
-    //
-    // The prefix used to be the full 64-character condition hash, which
-    // identifies a market to the venue and to nobody reading a log: there is
-    // no way to tell from it which market this was, or when. The opening
-    // time is the thing a person actually navigates by — it is what the
-    // venue puts in the slug — and eight characters of the hash still
-    // separate the several strikes that open at the same instant.
-    //
-    // MUST MATCH THE PYTHON HARNESS. Two log formats from one archive is the
-    // kind of divergence the conformance suite exists to catch.
-    // A market with no opening time keeps the id alone rather than gaining a
-    // leading space — every consumer of this file splits on whitespace, and
-    // a blank first field shifts all of them by one.
+    // Prefix logs with UTC opening time and a short market id. Omit the time
+    // when absent to preserve whitespace-separated fields.
+    // Keep in sync with the Python harness.
     const shortId = String(entry.market.market_id ?? '').slice(0, 10);
-    // READABLE, because ctx.log already puts the EVENT time on every line as
-    // epoch millis. Two bare 13-digit numbers side by side are two numbers
-    // nobody can tell apart — and the one this prefix exists for is the one
-    // that would be mistaken for the other.
-    //
-    // UTC, to the minute: the market schedule is published in UTC and a
-    // market-day is a UTC day, so a local rendering would file a row under a
-    // different date than the archive does.
+    // Format opening time to UTC minutes to distinguish it from event epoch ms.
     const openedAt = entry.market.open_ts_ms == null
       ? null
       : new Date(entry.market.open_ts_ms).toISOString().slice(0, 16).replace('T', ' ');
@@ -709,16 +547,15 @@ async function main() {
       for (const k of ['created', 'fired', 'dropped']) t[k] += out.timers[k] ?? 0;
     }
     // The spot dataset: how many markets actually got any (absent unless
-    // declared). MUST MATCH otharness.py.
+    // declared). Keep in sync with otharness.py.
     if (job.spot === true) {
       const s = result.spot ?? (result.spot = { markets: 0, markets_without: 0 });
       if (out.spot_seen > 0) s.markets += 1;
       else s.markets_without += 1;
     }
 
-    // Tracked as the stream went past rather than scanned afterwards: there
-    // is no array left to scan, which is the point. The worker prices the
-    // report's baselines from its OWN copy anyway; this is informational.
+    // Track observations as they arrive. The worker computes baselines from its
+    // own data; these summaries are informational.
     result.market_summaries.push({
       market_id: entry.market.market_id,
       asset: entry.market.asset ?? null,
@@ -733,10 +570,8 @@ async function main() {
       flush(m.replay.pf, m.before, emit, entry.market.market_id, fillExtras);
       result.fees_paid += m.replay.pf.feesPaid;
     } else {
-      // Session: everything the shared portfolio has written so far goes out
-      // now, and the arrays are emptied. Its positions and running fee total
-      // are untouched — only the append-only logs are drained — so a long
-      // session holds one market's worth of rows, not the whole run's.
+      // Drain session logs without changing positions or accumulated fees,
+      // keeping emitted-row memory bounded.
       flush(shared, { trades: 0, fills: 0 }, emit, true, fillExtras);
     }
   };
@@ -745,9 +580,7 @@ async function main() {
     const id = m?.entry?.market?.market_id ?? '?';
     if (err instanceof RunAbort) {
       result.rejection = { code: err.code, detail: `${id}: ${err.detail}` };
-      // A budget breach kills the shard, and a strategy that throws is not
-      // going to stop throwing on the next market. Either way the run is
-      // over and nothing is billed.
+      // Abort the shard on a budget breach or strategy error.
       if (shared) flush(shared, { trades: 0, fills: 0 }, emit, true, fillExtras);
       else if (m?.replay) flush(m.replay.pf, m.before, emit, id, fillExtras);
       return finish(err.code === 'E_BUDGET' ? EXIT.budget : EXIT.rejected);
@@ -780,14 +613,12 @@ async function main() {
     m.openTs = entry.market?.open_ts_ms ?? null;
     const remaining = { n: entry.n ?? 0 };
     const one = [{ m, k: 0 }];
-    // Global mode: the line's own time — a feed row becomes visible at its
+    // Global mode: the line's own time, a feed row becomes visible at its
     // stamp plus its declared lag, exactly as the stream ordered it.
     const lineTime = (ev) => ((ev.kind === 'ref' || ev.kind === 'ext')
       ? Number(ev.ts_ms) + (Number(entry.lags?.[ev.name]) || 0) : ev.ts_ms);
 
-    // The market's events, pulled ONE AT A TIME as the replay loop asks for
-    // them. Nothing here holds more than the current row, which is the whole
-    // point — see syncLineReader above.
+    // Pull events as replay requests them without accumulating the market.
     function* eventStream() {
       while (remaining.n > 0) {
         remaining.n -= 1;
@@ -797,8 +628,7 @@ async function main() {
         try {
           ev = parseJson(line);
         } catch {
-          // A corrupt row in OUR OWN data is not the strategy's problem. The
-          // worker reconciles what it sent against what came back.
+          // The worker reconciles malformed archive rows against emitted counts.
           continue;
         }
         if (global) {
@@ -848,15 +678,13 @@ async function main() {
 }
 
 /**
- * The session stream: every open market replayed from ONE time order.
+ * Replay all open markets in shared event-time order.
  *
- * Lines are `{"open":{i, market, stream, references?, series?, lags?}}`,
- * `{"i":k,"e":<event>}` and `{"close":k}`, written by runner/session-feed.mjs.
- * Feeding whole markets one after another — what session mode used to do — let
- * the shared instance carry 00:15 of a 00:00–00:15 market back into a market
- * that opened at 00:05. MUST MATCH _run_session in otharness.py.
+ * Lines are {"open":{i, market, stream, references?, series?, lags?}},
+ * {"i":k,"e":<event>} and {"close":k}, from runner/session-feed.mjs.
+ * Keep in sync with _run_session in otharness.py.
  *
- * Returns an exit code if the run ended early, null when the stream ended.
+ * Return an exit code on early termination, or null at the end of the stream.
  */
 function runSession({ nextLine, newMarket, observe, start, finished, rejected, logsOut, global = false }) {
   const active = new Map();
@@ -864,12 +692,8 @@ function runSession({ nextLine, newMarket, observe, start, finished, rejected, l
   // come (`{"end":k}` then, later, `{"close":k}`). Out of `active`: nothing
   // reaches them in between, and settleEarlier has nothing of theirs to drain.
   const ending = new Map();
-  // Before ANY hook runs at instant `ts` — an opening, an event, a closing —
-  // every other open market settles what it had scheduled strictly earlier,
-  // against its own book as it stands. The same "strictly before" rule a
-  // market applies to its own events, extended across the shared portfolio:
-  // a hook at `ts` sees every fill that had already happened anywhere, and
-  // nothing that had not.
+  // Before a hook at ts, drain strictly earlier work in every open market
+  // against its current book. Hooks see prior fills across the shared portfolio.
   const settleEarlier = (except, ts) => {
     if (typeof ts !== 'number' || !Number.isFinite(ts)) return;
     for (const other of active.values()) {
@@ -889,8 +713,8 @@ function runSession({ nextLine, newMarket, observe, start, finished, rejected, l
     if (!msg || typeof msg !== 'object') continue;
     if (global) {
       // Phase 2b: one time line. The stream says when each line happens (t);
-      // every job strictly before it — in every market, in (at, rank, market,
-      // seq) order — runs first; end and close also run the jobs AT their time.
+      // every job strictly before it, in every market, in (at, rank, market,
+      // seq) order, runs first; end and close also run the jobs at their time.
       const code = sessionGlobal(msg, { active, ending, newMarket, observe, start, finished, rejected });
       if (code !== undefined) return code;
       continue;
@@ -954,7 +778,7 @@ function runSession({ nextLine, newMarket, observe, start, finished, rejected, l
 /**
  * Run every job due before `t` (or at it, `inclusive`) across `markets`
  * ([{m, k}]), one at a time, always the globally earliest by (at, rank, k,
- * seq) — re-scanning after each, because a job can create jobs. MUST MATCH
+ * seq), re-scanning after each, because a job can create jobs. Keep in sync with
  * run_due in otharness.py.
  */
 function runDue(markets, t, inclusive) {
@@ -975,7 +799,7 @@ function runDue(markets, t, inclusive) {
   }
 }
 
-/** The run has reached `t`: nothing may be filed or run before it now. MUST MATCH advance_clock. */
+/** The run has reached `t`: nothing may be filed or run before it now. Keep in sync with advance_clock. */
 function advanceClock(clock, t) {
   if (clock && typeof t === 'number' && t > clock.t) clock.t = t;
 }
@@ -1033,7 +857,7 @@ function sessionGlobal(msg, { active, ending, newMarket, observe, start, finishe
 
 /**
  * The run's fee policy: `job.fees` when the writer sent one, else the legacy
- * flat `feeBps`. MUST MATCH fee_policy in otharness.py.
+ * flat `feeBps`. Keep in sync with fee_policy in otharness.py.
  */
 function feePolicy(job) {
   const f = job.fees;
@@ -1043,8 +867,8 @@ function feePolicy(job) {
 
 /**
  * The run's execution options (enginePolicyFor), or null. Anything malformed is
- * null — every option off, the fail-closed direction for options that only
- * ever add rules. MUST MATCH engine_policy in otharness.py.
+ * null, every option off, the fail-closed direction for options that only
+ * ever add rules. Keep in sync with engine_policy in otharness.py.
  */
 function enginePolicy(job) {
   const e = job.engine;
@@ -1054,7 +878,7 @@ function enginePolicy(job) {
 /**
  * The fill-row fields the run's options can produce, in column order. Fixed
  * per run, before any row exists, so every writer (the worker's streaming
- * fills.csv included) knows its columns up front. MUST MATCH
+ * fills.csv included) knows its columns up front. Keep in sync with
  * engine_fill_fields in otharness.py and fillColumnsFor in runner/archive.mjs.
  */
 function engineFillFields(engine) {
@@ -1067,8 +891,8 @@ function engineFillFields(engine) {
 
 /**
  * The run's resting-order policy, as the writer decided it (restingPolicyFor in
- * api/lib/backtest-datasets.mjs). Anything malformed is "not allowed" — the
- * fail-closed direction. MUST MATCH resting_policy in otharness.py.
+ * api/lib/backtest-datasets.mjs). Anything malformed is "not allowed", the
+ * fail-closed direction. Keep in sync with resting_policy in otharness.py.
  */
 function restingPolicy(job) {
   const r = job.resting;
@@ -1088,7 +912,7 @@ function flush(pf, before, emit, marketId, fillExtras = []) {
     const row = pf.trades[i];
     emit(CHANNEL.trade, stringify(projectRow(row, row.label !== undefined ? GENERIC_TRADE_FIELDS : TRADE_FIELDS)));
   }
-  // A session drain (marketId === true) happens whenever ANY market closes, so
+  // A session drain (marketId === true) happens whenever a market closes, so
   // it can meet maker rows of a market still open, whose markouts are not
   // final yet. Those stay behind, in order, until their own market's close.
   const held = [];
@@ -1098,8 +922,7 @@ function flush(pf, before, emit, marketId, fillExtras = []) {
     const base = row.label !== undefined ? GENERIC_FILL_FIELDS : FILL_FIELDS;
     emit(CHANNEL.fill, stringify(projectRow(row, fillExtras.length ? [...base, ...fillExtras] : base)));
   }
-  // Keep memory flat across hundreds of market-days: once written, the rows
-  // are the worker's problem, not ours.
+  // Release emitted rows to keep memory bounded across market-days.
   if (marketId) {
     pf.trades.length = before.trades;
     pf.fills.length = before.fills;

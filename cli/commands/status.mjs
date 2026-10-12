@@ -1,19 +1,9 @@
-// `ot status <run_id>` — where a submitted run got to.
-//
-// This command exists because `ot submit` prints it. A tool that tells you to
-// run something that does not exist is worse than one that tells you nothing.
-//
-// It reads; it never bills, cancels or retries. The archive it points at is
-// fetched through the API rather than a stored URL: archive links are 15-minute
-// bearer tokens for someone's strategy results, so the right thing to hold onto
-// is the run id, not the link.
+// Read a submitted run status. Fetch archives by run id through the API;
+// presigned archive URLs expire after 15 minutes.
 
 import { readKey, get } from '../api-client.mjs';
 
-// The server's own run statuses (api/lib/backtest-db.mjs). These were once
-// written from memory as done/expired — names the server never sends — so
-// every finished run printed its credits as still "held". cli/ot-remote.test.mjs
-// now checks this table against the server's list in the monorepo.
+// Keep in sync with server statuses in api/lib/backtest-db.mjs.
 export const STATUS_LINE = {
   staging: 'staging — the submission is still being stored',
   queued: 'queued — waiting for a worker',
@@ -25,9 +15,7 @@ export const STATUS_LINE = {
   cancelled: 'cancelled',
 };
 
-// Statuses in which the ledger has settled (the server's TERMINAL_STATES), so
-// spent-vs-returned is a fact rather than a guess. Anything else still holds
-// the credits.
+// Terminal states have settled ledger entries; other states still hold funds.
 export const SETTLED = new Set(['complete', 'failed', 'rejected', 'cancelled']);
 
 function ms(v) {
@@ -71,20 +59,8 @@ export async function cmdStatus({ dir, flags }) {
     process.stdout.write(`\n  ${json.rejection.code}\n  ${json.rejection.detail}\n`);
   }
 
-  // Held vs spent, said plainly: a partial run bills for the market-days it
-  // actually read, and the difference goes back. Printing only one of the two
-  // numbers is how a refund looks like an overcharge.
-  //
-  // But "returned" may only be said once the run has actually finished. While
-  // it is still staging or queued nothing has been spent and nothing has been
-  // returned either — the credits are HELD. Deriving the refund from
-  // held - spent in that state prints "0 spent (100 returned)" at a moment when
-  // the customer's balance is still 100 short, which is the opposite of
-  // reassuring.
-  // A run that ended WITHOUT a report may carry no credits_spent at all: the
-  // queue's give-up path (attempts exhausted, api/lib/backtest-db.mjs leaseRun)
-  // refunds in full but leaves the field null. Every such run was refunded, so
-  // it is 0 spent — printing "held" told those customers the opposite.
+  // Show spent and returned amounts only after settlement. A terminal run
+  // without credits_spent spent zero; nonterminal runs still hold the amount.
   const spent = json.credits_spent ?? (SETTLED.has(json.status) && json.status !== 'complete' ? 0 : null);
   if (SETTLED.has(json.status) && spent != null) {
     const held = json.credits_held ?? 0;

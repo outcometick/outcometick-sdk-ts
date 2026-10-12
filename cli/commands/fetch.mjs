@@ -1,11 +1,5 @@
-// `ot fetch <run_id>` — download a finished run's archive.
-//
-// Referenced by `ot status`, which is why it exists: the same rule as `ot
-// status` itself — do not print a command that is not real.
-//
-// The archive URL is presigned for 15 minutes and is a bearer token for someone
-// else's strategy results, so this asks the API for a fresh one each time
-// rather than caching anything.
+// Download a finished run archive. Request a fresh URL for each download;
+// the presigned bearer URL expires after 15 minutes.
 
 import { writeFile } from 'node:fs/promises';
 import { readKey, getBinary, DEFAULT_API } from '../api-client.mjs';
@@ -25,8 +19,7 @@ export async function cmdFetch({ dir, flags }) {
     return 1;
   }
   if (status === 409) {
-    // The run exists but has produced nothing yet — a different thing from a
-    // missing run, and the status is the useful part.
+    // An existing run may not have an archive yet. Show its status.
     process.stderr.write(`\n  no archive yet — run is ${json?.status ?? 'not finished'}\n`
       + `  ot status ${runId}\n\n`);
     return 1;

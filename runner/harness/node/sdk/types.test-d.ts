@@ -1,13 +1,5 @@
-// A strategy written in TypeScript, against the published declarations.
-//
-// Not run — COMPILED. `sdk-types.test.mjs` puts tsc over this file under
-// `strict`, so if index.d.ts stops describing the SDK a strategy author would
-// actually write, the suite goes red.
-//
-// The declarations are hand-written (the runtime is plain ESM, loaded directly
-// by the API, the worker and the sandbox with no build step), which means they
-// can drift from index.mjs. This file plus the export-parity check in
-// sdk-types.test.mjs is what stops that drift being silent.
+// Compile this strategy under strict TypeScript to check the published
+// declarations. sdk-types.test.mjs also checks runtime export parity.
 
 import type { RestingOrder, TwapLocked } from './index.js';
 import { Strategy, Order, SIDES } from './index.js';
@@ -25,8 +17,7 @@ export default class MeanReversion extends Strategy<Params> {
 
   onMarketOpen(ctx: Ctx<Params>, market: Market): void {
     this.entered = false;
-    // Present before settlement; `outcome` deliberately is not — asking for it
-    // here must not compile.
+    // Opening metadata includes the strike, but not the terminal outcome.
     const id: string = market.market_id;
     const closes: number | null = market.close_ts_ms;
     ctx.log(`${id} closes ${closes}`);

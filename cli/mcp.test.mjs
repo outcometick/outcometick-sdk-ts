@@ -1,7 +1,5 @@
-// `ot mcp`, driven the way an AI tool drives it: a child process speaking
-// newline-delimited JSON-RPC on stdin/stdout, against a local stand-in for the
-// API that answers like the real one (including /v1/dl's 302 with the sha256
-// on the redirect).
+// Exercise stdio JSON-RPC against a local API stub, including download
+// redirects with a SHA-256 header.
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -79,9 +77,8 @@ before(async () => {
 after(() => server?.close());
 
 /**
- * Start `ot mcp` and talk to it. `send` writes one message; `next(id)` waits
- * for the response with that id. Every stdout line is kept so the test can
- * assert that NOTHING but JSON-RPC was ever written there.
+ * Start the MCP subprocess. send writes a message; next(id) waits for its
+ * response. Retain stdout lines to check that all output is JSON-RPC.
  */
 function startServer({ env = {}, cwd = process.cwd() } = {}) {
   const child = spawn(process.execPath, ['--experimental-strip-types', CLI, 'mcp', '--api', base], {
@@ -142,7 +139,7 @@ test('handshake, tool list, and a clean exit when stdin closes', async () => {
     assert.ok(t.description.length > 20, t.name);
     assert.equal(typeof t.annotations.readOnlyHint, 'boolean', t.name);
   }
-  // Spending credits is the customer's decision, never an agent's.
+  // The MCP interface does not expose submission.
   assert.ok(!names.some((n) => /submit/i.test(n)), 'a submit tool must not exist');
 
   assert.equal(await s.stop(), 0);
@@ -291,7 +288,7 @@ test('check_strategy runs the queue validator locally', async () => {
     assert.equal(ok.value.ok, true);
     assert.equal(ok.value.language, 'python@3.14');
 
-    // An import the sandbox does not have: the validator's answer, not a crash.
+    // Unsupported imports return a validation result.
     await writeFile(path.join(dir, 'strategy.py'), 'import requests\nclass S:\n    def on_market_open(self, ctx, market):\n        pass\n\n    def on_tick(self, ctx, tick):\n        return None\n');
     const no = await s.call('check_strategy', { dir });
     assert.equal(no.isError, false);
@@ -304,7 +301,7 @@ test('check_strategy runs the queue validator locally', async () => {
     assert.match(none.value.error, /no outcometick\.json/);
     await rm(empty, { recursive: true, force: true });
 
-    // A directory that does not exist is a failure to check, not a verdict.
+    // A missing directory is a check failure.
     const gone = await s.call('check_strategy', { dir: path.join(dir, 'does-not-exist') });
     assert.equal(gone.isError, true);
     assert.match(gone.value.error, /ENOENT/);
@@ -315,8 +312,7 @@ test('check_strategy runs the queue validator locally', async () => {
 });
 
 test('the data key never reaches object storage', async () => {
-  // Asserted by the stand-in itself (it answers 400 if a key arrives); this
-  // makes the download path run once more and checks the request log too.
+  // The stub rejects leaked API keys; also check its request log.
   const work = await mkdtemp(path.join(tmpdir(), 'ot-mcp-'));
   try {
     const s = startServer({ env: { OT_KEY: DATA_KEY }, cwd: work });
@@ -410,9 +406,8 @@ test('without hard links it falls back to an exclusive copy that still never ove
     await assert.rejects(publishFile(path.join(work, 'b.csv.gz'), BODY, { linkImpl: noLink }), /already exists/);
     assert.equal(await readFile(victim, 'utf8'), 'precious', 'the fallback followed a link');
 
-    // A failed copy must not delete by path. libuv removes its own partial
-    // target before returning; here another download creates the name in that
-    // gap, and that file must survive this one's failure.
+    // libuv removes a partial copy target on failure. A concurrent download
+    // may then claim the path, so cleanup must not remove it.
     const racedCopy = async (src, dst) => {
       await writeFile(dst, 'partial', { flag: 'wx' });
       await rm(dst); // what libuv does on failure
@@ -423,7 +418,7 @@ test('without hard links it falls back to an exclusive copy that still never ove
     assert.equal(await readFile(path.join(work, 'c.csv.gz'), 'utf8'), 'another download', 'deleted a file it did not create');
     assert.deepEqual((await readdir(work)).filter((n) => n.endsWith('.part')), [], 'temp left behind');
 
-    // Any other link failure is a real error, not a reason to copy.
+    // Copy fallback applies only to supported link failures.
     const eio = async () => { throw Object.assign(new Error('io'), { code: 'EIO' }); };
     let copied = false;
     await assert.rejects(publishFile(path.join(work, 'd.csv.gz'), BODY, { linkImpl: eio, copyImpl: async () => { copied = true; } }), /io/);

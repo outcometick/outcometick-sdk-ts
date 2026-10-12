@@ -1,19 +1,16 @@
-// Turn an archive path into the dimensions a customer actually thinks in:
-// venue, dataset, asset, interval. The archive's own layout grew organically
-// (three settlement streams, two venues, derived klines) and is not something a
-// buyer should have to learn.
-//
-// Pure and total: every mirrored path must classify, because the API lists
-// whatever the catalog holds. Anything unrecognised comes back with
-// dataset:'other' and null dimensions rather than being dropped — a file that
-// silently disappears from listings is worse than one that is awkward to filter.
+// Classify archive paths by venue, dataset, asset and interval. Unknown paths
+// return dataset other and null dimensions so catalog files remain listable.
 
 import { venueOfPath } from './venue-path.mjs';
 
-/** Asset symbols we collect, longest-first so BNBUSDT matches before BNB. */
+/**
+ * Collected asset prefixes matched at the start of a path segment.
+ */
 export const ASSETS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'BNB', 'HYPE', 'ZEC'];
 
-/** Datasets, as a customer would name them. */
+/**
+ * Public dataset descriptions.
+ */
 export const DATASETS = {
   prices: 'Settlement feed, tick by tick (instantaneous Chainlink stream)',
   twap30s: 'TWAP 30s settlement stream — settled 5-minute markets before they moved to the 60s lookback; archived daily through 2026-10-19 (UTC)',
@@ -30,19 +27,9 @@ export const DATASETS = {
 };
 
 /**
- * The same descriptions in Chinese.
- *
- * HERE, not in the page that renders them. Two of these lines state the
- * SETTLEMENT BASIS — which TWAP stream settles which market — and CLAUDE.md
- * pins that fact to four places that must move together. A Chinese copy living
- * in a component would be a fifth, and it would drift the way every other
- * hand-copy in this repo has: the basis already moved once (5-minute markets
- * settled on the 30s stream until 2026-08-07, on the 60s stream after), and an
- * AI assistant quoted a stale copy of our coverage back to a customer.
- *
- * Sitting beside DATASETS means changing one entry puts the other on screen in
- * the same diff. data-taxonomy.test.mjs asserts the key sets match, so a new
- * dataset cannot land with only one language.
+ * Chinese descriptions alongside DATASETS. Keep settlement wording in sync
+ * with content/llms.txt, lib/i18n.ts and lib/docs-pages.ts.
+ * data-taxonomy.test.mjs checks matching key sets.
  */
 export const DATASETS_ZH = {
   prices: '结算价流，逐 tick（Chainlink 瞬时流）',
@@ -90,27 +77,8 @@ export function classifyPath(filePath) {
       return { venue, dataset: 'klines', asset: assetOf(segs[3]), interval: num(segs[4]), ext };
     }
     if (ds === 'orderbook') {
-      // BTC-5M / BTC-15M / BTC-HOURLY / BTC-DAILY / BTC-OTHER / MARKET-<id>
-      //
-      // Predict names its hourly and daily series by word rather than by
-      // duration. Both are mapped onto the vocabulary every other dataset
-      // already uses, because the alternative cost customers real data twice
-      // over:
-      //
-      //   HOURLY matched neither branch of the earlier pattern, so the whole
-      //   series classified to interval:null. `interval=1h` returned an empty
-      //   list — no error, just nothing — while the files sat in the archive,
-      //   and /v1/meta never named the value at all, so a customer building an
-      //   enumeration from it could not learn the data existed.
-      //
-      //   DAILY did match, but produced `daily`: a value no duration parser
-      //   accepts, that sorts after 1mo because sortIntervals cannot read it,
-      //   and that shares one array with the klines' own `1d` while meaning
-      //   the same span.
-      //
-      // The list stays a whitelist. Widening the second group to \w+ would
-      // turn BTC-OTHER into interval:'other' — inventing a period for the
-      // series that exists precisely because its period is unknown.
+      // Map HOURLY and DAILY to 1h and 1d. Recognise periods explicitly:
+      // BTC-OTHER and MARKET-<id> have no known interval.
       const BY_WORD = { HOURLY: '1h', DAILY: '1d' };
       const m = /^([A-Za-z]+)-(\d+[mMhHdD]|HOURLY|DAILY)$/.exec(segs[3] ?? '');
       const period = m?.[2];
@@ -152,28 +120,13 @@ export function classifyPath(filePath) {
 }
 
 /**
- * The token that names "this dimension does not apply to the file".
- *
- * `interval` is only meaningful for datasets that are sliced by market period
- * (book, price_change, klines, …); the settlement streams (prices, twap30s,
- * twap60s) are continuous and classify to interval:null. Without a way to name
- * that, `interval=5m` drops them — the SQL `WHERE interval='5m'` vs NULL trap,
- * where "not applicable" reads as "does not match". A customer wanting "5m
- * market data plus every period-less dataset" then cannot express it at all.
- *
- * Spelling it as a value rather than widening `interval=5m` implicitly keeps
- * the filter-never-widens rule: only a query that asks for it gets it, so
- * someone pulling just 5m klines is not handed the settlement streams too.
- * No real dimension value is 'none' (intervals are 1s…1mo, assets are BTC…ZEC),
- * so the token cannot collide with data.
+ * NO_VALUE (none) explicitly matches null dimensions, e.g. interval=5m,none.
+ * Continuous settlement streams have no interval. Explicit selection avoids
+ * widening filters; none is not a real symbol or duration.
  */
 /**
- * In the archive, never offered publicly.
- *
- * ZEC markets were collected but never went live on the venue, so counting it
- * makes every public figure one too high — "Polymarket 8 assets" printed beside
- * a venue that shows seven. Excluded from what we ADVERTISE, not from what we
- * serve: a subscriber querying the archive still gets what the archive holds.
+ * Archived assets excluded from public counts. ZEC markets were collected
+ * but did not go live; their archived files remain available.
  */
 export const UNLISTED_ASSETS = Object.freeze(['ZEC']);
 
@@ -184,10 +137,8 @@ export const publicAssets = (assets) =>
 export const NO_VALUE = 'none';
 
 /**
- * Does a classified file match a structured query? Absent filters match
- * everything; every supplied filter must match (AND), and each may be a
- * comma-separated list (OR within it). Within that list, NO_VALUE matches a
- * file whose dimension is null — `interval=5m,none`.
+ * Match filters with AND across dimensions and OR within comma-separated
+ * values. Absent filters match all; NO_VALUE matches null dimensions.
  */
 export function matchesQuery(meta, q) {
   const hit = (want, got) => {
@@ -204,15 +155,8 @@ export function matchesQuery(meta, q) {
 }
 
 /**
- * Distinct dimension values across a set of classified files (for /v1/meta).
- *
- * `nullable` names the dimensions some file leaves empty, so a caller can find
- * NO_VALUE without reading the docs — undiscoverable is how the interval=5m
- * complaint started. It is deliberately NOT folded into `assets`/`intervals`:
- * those have always held real symbols and real durations, and a client that
- * builds an enum from them, parses them as durations, or loops over every
- * interval to fetch data would break on a token — or quietly start pulling the
- * period-less files it never asked for.
+ * Distinct values for /v1/meta. nullable lists dimensions containing nulls
+ * without mixing sentinel values into symbol or duration lists.
  */
 export function summarise(metas) {
   const s = { venues: new Set(), datasets: new Set(), assets: new Set(), intervals: new Set() };

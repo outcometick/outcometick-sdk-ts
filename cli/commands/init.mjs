@@ -1,12 +1,5 @@
-// `ot init <dir> --template <id> [--lang python|nodejs]` — start from a template.
-//
-// The templates are the files under templates/<id>/<lang>/, shipped in this
-// package. The same files are what the web editor offers and what the public
-// templates repository publishes, and runner/conformance runs them through both
-// engines — so what a user starts from here is code that is known to trade.
-//
-// It never overwrites: a directory that already holds an outcometick.json or a
-// strategy file is somebody's work.
+// Create a strategy directory from templates/<id>/<lang> without overwriting
+// existing files. These templates are also published and tested by conformance.
 
 import { lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -47,8 +40,7 @@ export async function cmdInit({ dir, flags }) {
   const src = path.join(TEMPLATES_DIR, t.id, lang);
   const names = (await readdir(src)).sort();
   await mkdir(dir, { recursive: true });
-  // Checked up front so a clash leaves nothing half-written; the 'wx' below
-  // still refuses anything that appears in between.
+  // Check conflicts before writing; 'wx' also protects against races.
   for (const name of names) {
     const exists = await lstat(path.join(dir, name)).then(() => true, () => false);
     if (exists) {

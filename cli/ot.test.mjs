@@ -1,11 +1,5 @@
-// Tests for the `ot` CLI.
-//
-// The load-bearing claim is the one the docs make: `ot check` runs the SAME
-// validator the queue runs, so a local pass is not rejected on submit. These
-// tests assert that by driving the CLI as a real subprocess and comparing its
-// rejection codes against the ones api/lib/backtest-routes.mjs would return —
-// not by asserting the CLI is "correct" in isolation, which would pass even if
-// the two had drifted apart completely.
+// Exercise the CLI as a subprocess and compare rejection codes with the
+// shared API validator.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -74,8 +68,7 @@ test('parseArgs defaults the directory to the working directory', () => {
 });
 
 test('parseArgs refuses a value-taking flag with no value', () => {
-  // `ot run . --data --date 2026-08-12` must not silently read "--date" as the
-  // data root and then report "no dated files under /…/--date".
+  // A missing --data value must be reported before archive discovery.
   assert.throws(() => parseArgs(['run', '.', '--data', '--date']), /--data needs a value/);
 });
 
@@ -117,9 +110,7 @@ test('ot check exits non-zero without a manifest', async () => {
   }
 });
 
-// The reason this file exists. Each case is something the queue rejects; the
-// CLI has to reject it with the SAME code, or "if it passes locally it will not
-// be rejected on submit" is a false statement in our own docs.
+// The CLI and API must reject each invalid submission with the same code.
 const REJECTIONS = [
   ['E_FORBIDDEN', 'import os\n', /filesystem|environment/],
   ['E_NONDETERMINISM', 'import time\n', /wall clock/],
@@ -218,26 +209,18 @@ test('unknown commands exit 2 with usage, not 0', async () => {
 });
 
 test('the bin shim runs the CLI exactly once', async () => {
-  // `bin/ot.mjs` imports this file, and this file self-invokes when run
-  // directly. A suffix match on the filename made both true at once and every
-  // command ran twice.
+  // Importing the CLI entry point must not also trigger its direct-run path.
   const { code, stdout } = await ot(['version']);
   assert.equal(code, 0);
   assert.equal(stdout.trim().split('\n').length, 1, `version printed twice:\n${stdout}`);
 });
 
 test('the CLI and the API analyse through the same function, not two dispatches', async () => {
-  // The promise in the docs is "ot check runs the exact validator the queue
-  // runs". Both sides import analyzeSource from runner/analyze/index.mjs; a
-  // second dispatch reappearing on either side is how that quietly stops being
-  // true, so this asserts on the source itself.
+  // Both entry points must use the shared source analyser.
   const { readFile } = await import('node:fs/promises');
   const cli = await readFile(new URL('./ot.mjs', import.meta.url), 'utf8');
 
-  // backtest-routes.mjs is the server and is deliberately NOT in the published
-  // package, so this half only runs in the monorepo. The CLI half runs
-  // everywhere — including for anyone who cloned the public mirror to check
-  // the claim for themselves, which is the point of shipping these tests.
+  // The server module is available only in the monorepo.
   const routes = await readFile(
     new URL('../api/lib/backtest-routes.mjs', import.meta.url), 'utf8',
   ).catch(() => null);
@@ -252,9 +235,7 @@ test('the CLI and the API analyse through the same function, not two dispatches'
 
 test('the shared analyser fails closed on a language it has no analyser for', async () => {
   const { analyzeSource } = await import('../runner/analyze/index.mjs');
-  // Fabricated because the contract cannot express this today. The point is
-  // what happens when it can: a new language must not fall through to the
-  // JavaScript analyser and be reported as clean.
+  // Unknown languages must not fall through to the JavaScript analyser.
   await assert.rejects(
     () => analyzeSource({ manifest: { languageId: 'golang', deps: [] }, files: [] }),
     /no analyser for golang/,
@@ -291,49 +272,31 @@ test('a local archive walk does not follow symlinks out of the archive', async (
 // ---------------------------------------------------------------------------
 
 test('the per-file ceiling admits a series, not just source', async () => {
-  // `ot check` refused any file over maxTotalSourceBytes before the shared
-  // validator ever saw it, so a 1MB CSV — well inside the advertised 8MB series
-  // limit — failed locally and passed on the API. That breaks the one promise
-  // this CLI exists to keep: a local pass is not rejected on submit.
+  // Series files use their own byte budget, separate from source files.
   const { LIMITS } = await import('../api/lib/backtest-contract.mjs');
   const ceiling = Math.max(LIMITS.maxTotalSourceBytes, LIMITS.maxSeriesBytes);
   assert.ok(
     ceiling >= LIMITS.maxSeriesBytes,
     `a ${LIMITS.maxSeriesBytes} byte series cannot get past a ${ceiling} byte ceiling`,
   );
-  // And the source limit is still the smaller of the two, so this is a real
-  // widening rather than the two numbers having quietly converged.
+  // The source limit remains lower than the series limit.
   assert.ok(LIMITS.maxTotalSourceBytes < LIMITS.maxSeriesBytes);
 });
 
 test('the CLI still refuses a file no budget could accept', async () => {
-  // The ceiling is a backstop against reading something enormous into memory,
-  // not a replacement for the validator's per-budget rules.
+  // The read ceiling supplements the validator's separate byte budgets.
   const { LIMITS } = await import('../api/lib/backtest-contract.mjs');
   const src = readFileSync(new URL('./ot.mjs', import.meta.url), 'utf8');
   assert.match(src, /over the \$\{ceiling\} byte limit for a single file/);
   assert.ok(LIMITS.maxSeriesBytes > 0);
 });
 
-// `ot run` and the queue must agree about how many passes to run, and at what
-// delay.
-//
-// The eighth time these two drifted was exactly this: when the comparison
-// passes became opt-in, the worker started reading `manifest.latency` while
-// `cmdRun` went on walking every built-in delay — the same manifest ran once
-// online and six times locally. Every previous divergence had the same shape:
-// they shared the decoder and nothing else.
-//
-// Now there is one pass on both sides, at the delay the manifest asked for.
+// Local and hosted runs use one pass at the manifest's fill delay.
 test('ot run replays once at the manifest delay, exactly as the worker does', async (t) => {
   const { readFile } = await import('node:fs/promises');
   const HERE = new URL('.', import.meta.url).pathname;
   const cli = await readFile(`${HERE}commands/run.mjs`, 'utf8');
-  // THE WORKER IS NOT IN THE PUBLISHED PACKAGE, and should not be — it is
-  // server code. This test compares the two halves of a divergence that can
-  // only exist in the monorepo, so outside it there is nothing to compare.
-  // Skipped with a reason rather than failed: a red test in the package
-  // someone just installed says the package is broken, and it is not.
+  // The worker is server code and is absent from the published package.
   const worker = await readFile(`${HERE}../runner/worker.mjs`, 'utf8').catch(() => null);
   if (worker == null) {
     t.skip('runner/worker.mjs is not in this tree — server-side only');
@@ -356,20 +319,7 @@ test('ot run replays once at the manifest delay, exactly as the worker does', as
   }
 });
 
-// NOTHING may branch on "is this the zero-delay pass" any more.
-//
-// This is the trap the single-pass model sets, and it has already been walked
-// into twice. Both the worker and `cmdRun` decided things by `step.ms === 0`
-// — back when pass 0 was the report and the rest were a survivable comparison
-// curve. With one pass at the manifest's delay, that test silently becomes
-// false the moment anyone writes `latency: 250`:
-//
-//   in the worker  the run replayed a SAMPLE and reported no progress at all;
-//   in `ot run`    sandbox rejections stopped being raised, so a refused or
-//                  over-budget replay produced a local report marked
-//                  `fill_delay_ms: 250` that the queue would reject outright.
-//
-// Neither errors. Both produce a report. It is only wrong.
+// Progress, full replay and error handling apply at every fill delay.
 test('neither side branches on the delay being zero', async (t) => {
   const { readFile } = await import('node:fs/promises');
   const HERE = new URL('.', import.meta.url).pathname;
@@ -382,7 +332,7 @@ test('neither side branches on the delay being zero', async (t) => {
     const src = await readFile(file, 'utf8').catch(() => null);
     if (src == null) continue;
     checked += 1;
-    // Comments are allowed to mention it — that is where the lesson lives.
+    // Ignore comments when checking for obsolete zero-delay branches.
     const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
     for (const pattern of [/step\.ms === 0/, /delayMs === 0/, /isMainPass/]) {
       assert.doesNotMatch(code, pattern,
@@ -391,9 +341,7 @@ test('neither side branches on the delay being zero', async (t) => {
         + ' exactly when a delay is asked for');
     }
   }
-  // A loop that read nothing passes silently, which is the shape of assertion
-  // this repo keeps getting caught by. `ot run` is in every tree this test can
-  // run in; only the worker is optional.
+  // Require at least the local runner to be checked; the worker is optional.
   assert.ok(checked > 0, 'neither file was readable — this test asserted nothing');
 });
 
@@ -401,12 +349,7 @@ test('neither side branches on the delay being zero', async (t) => {
 // --email
 // ---------------------------------------------------------------------------
 
-// The mirror of "do not print a command that does not exist": do not promise
-// an outcome that will not happen. `--email` is what fills `deliver_to`, and
-// the report delivery poller correctly skips a run without one — so the old
-// unconditional "(or wait for the email)" told every CLI submitter to wait for
-// something that could never arrive. The flag itself was implemented and left
-// out of the usage text, which is the same failure from the other side.
+// Email delivery requires --email, which sets deliver_to.
 test('--email is documented, because an undocumented flag is an absent one', async () => {
   const { readFile } = await import('node:fs/promises');
   const { fileURLToPath } = await import('node:url');
@@ -422,7 +365,7 @@ test('the email is only promised when one was asked for', async () => {
   const { fileURLToPath } = await import('node:url');
   const here = fileURLToPath(new URL('.', import.meta.url));
   const src = await readFile(`${here}commands/submit.mjs`, 'utf8');
-  // The promise has to be behind the flag that makes it true.
+  // Mention email delivery only when an address was supplied.
   assert.match(src, /flags\.email\s*\n?\s*\?[^]*wait for the email/,
     'the submit output promises an email unconditionally');
   assert.match(src, /no --email, so nothing will be sent/,
@@ -430,8 +373,7 @@ test('the email is only promised when one was asked for', async () => {
 });
 
 test('--email really reaches the request body', async () => {
-  // Documented and printed is not the same as sent. This is the link that
-  // makes the other two mean anything.
+  // Check that the flag reaches the submission metadata.
   const { readFile } = await import('node:fs/promises');
   const { fileURLToPath } = await import('node:url');
   const here = fileURLToPath(new URL('.', import.meta.url));
@@ -441,8 +383,7 @@ test('--email really reaches the request body', async () => {
 });
 
 test('ot run documents --venue and infers it from the archive when it is omitted', async () => {
-  // An undocumented flag is an absent one: without it a predict sample archive
-  // read as "no files for <day>" with nothing pointing at the fix.
+  // Document --venue so Predict archives can be selected.
   const { stderr, stdout } = await ot(['help']);
   assert.match(`${stdout}${stderr}`, /ot run <dir> --data <archive>[^\n]*--venue polymarket\|predict/);
   const src = readFileSync(fileURLToPath(new URL('./commands/run.mjs', import.meta.url)), 'utf8');

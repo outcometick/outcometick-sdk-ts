@@ -1,14 +1,5 @@
-// Node-side wrapper around the Python static analyser.
-//
-// The analysis itself has to run in Python — a Python AST is the only thing
-// that can tell a call from a docstring, and reimplementing one in JavaScript
-// would drift from the language it is meant to describe. This module only
-// shuttles a job in and a verdict out, so both languages reject through the
-// same BacktestRejection type and the same codes.
-//
-// The analyser runs as a SEPARATE PROCESS with no arguments and a JSON job on
-// stdin. It never imports the submitted code — it parses it. Importing to
-// inspect is how a validator becomes the first thing an attacker executes.
+// Run the Python AST analyser in a separate process with a JSON job on stdin.
+// Parse submitted code without importing it; convert verdicts to BacktestRejection.
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -34,9 +25,7 @@ export function analyzePythonSubmission(files, { deps = [], timeoutMs = 10_000, 
   return new Promise((resolve, reject) => {
     const child = spawn(PYTHON, [SCRIPT], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      // No inherited environment: the analyser needs nothing from it, and a
-      // PYTHONPATH or PYTHONSTARTUP pointing somewhere unexpected is a way to
-      // change what parses.
+      // Exclude inherited Python settings that could change the parser environment.
       env: { PATH: process.env.PATH ?? '', PYTHONDONTWRITEBYTECODE: '1', PYTHONHASHSEED: '0' },
     });
 
@@ -48,8 +37,7 @@ export function analyzePythonSubmission(files, { deps = [], timeoutMs = 10_000, 
       if (settled) return;
       settled = true;
       child.kill('SIGKILL');
-      // A parse that will not terminate is not a strategy we can validate, and
-      // it must not hold a worker open.
+      // Stop analysis that exceeds the validation deadline.
       reject(new BacktestRejection('E_BUDGET', `static analysis did not finish within ${timeoutMs}ms`));
     }, timeoutMs);
 

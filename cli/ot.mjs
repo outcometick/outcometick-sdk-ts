@@ -1,20 +1,11 @@
 #!/usr/bin/env node
-// `ot` — the command line the SDK docs tell customers to use.
+// ot CLI.
 //
-//   ot check .                                          validate, free, no data
-//   ot run . --data ./polymarket-data-samples           replay locally
-//   ot submit . --assets btc,eth --days 30              send it to the queue
+//   ot check .                                     validate without data
+//   ot run . --data ./polymarket-data-samples        replay locally
+//   ot submit . --assets btc,eth --days 30           submit to the hosted queue
 //
-// The one thing this file must get right is that `ot check` runs the SAME
-// validator the queue runs. The docs promise "if it passes locally it will not
-// be rejected on submit", and that promise only survives if there is exactly
-// one implementation — so check() calls the very modules api/lib/backtest-
-// routes.mjs calls, rather than reimplementing any of it.
-//
-// Written in Node because everything it needs already is: the contract, the
-// validator, both analysers, the engine, the report and the archive writer. A
-// Python submission is still run by the Python harness — the CLI spawns it the
-// same way the worker does.
+// Share the API validator and analysers. Python strategies use the Python harness.
 
 import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -121,12 +112,8 @@ export function parseArgs(argv) {
 }
 
 /**
- * Read a submission directory.
- *
- * Only files the manifest could plausibly reference, and only from the top two
- * levels — a strategy directory that happens to contain a virtualenv or a
- * .git should not turn into a 400 MB submission attempt. The limits are
- * enforced properly by the validator; this is about not reading the disk.
+ * Read eligible submission files from the top two directory levels. Skip
+ * virtualenvs and other unrelated trees; the validator enforces file budgets.
  */
 export async function readSubmission(dir) {
   const out = [];
@@ -142,12 +129,8 @@ export async function readSubmission(dir) {
       if (!/\.(py|mjs|js|json|csv)$/.test(e.name)) continue;
       const full = path.join(dir, name);
       const s = await stat(full);
-      // The ceiling for ANY one file is the series limit, not the source limit:
-      // a CSV series is allowed to be much larger than the code, and the shared
-      // validator is what enforces which budget a given file falls under.
-      // Refusing a 1MB CSV here meant `ot check` rejected a submission the API
-      // accepts — and "a local pass is not rejected on submit" is a promise the
-      // docs make.
+      // Use the series limit as the file-read ceiling. The validator applies the
+      // appropriate source or series budget afterwards.
       const ceiling = Math.max(LIMITS.maxTotalSourceBytes, LIMITS.maxSeriesBytes);
       if (s.size > ceiling) {
         throw new Error(`${name} is ${s.size} bytes, over the ${ceiling} byte limit for a single file`);
@@ -171,8 +154,7 @@ export async function readSubmission(dir) {
  */
 export async function validate(files, scope = null) {
   const checked = checkSubmission({ files, scope });
-  // analyzeSource, not a dispatch of our own: see runner/analyze/index.mjs for
-  // why the two sides sharing this exact function is the whole promise.
+  // Share analyzeSource with the server (runner/analyze/index.mjs).
   const analysis = await analyzeSource(checked);
   return { ...checked, analysis };
 }
@@ -206,18 +188,13 @@ async function cmdCheck({ dir, flags }) {
   process.stdout.write(`\n  ok — ${manifest.language}, entry ${manifest.entry.file}:${manifest.entry.className}\n`);
   process.stdout.write(`  hooks     ${Object.entries(res.hookNames).map(([k, v]) => `${k} → ${v}`).join(', ')}\n`);
   process.stdout.write(`  datasets  ${manifest.datasets.join(', ')}\n`);
-  // Both of these change what comes back, so `ot check` has to show them:
-  // this command exists to say what the queue will do with this submission,
-  // and a run narrowed to 5m at a 250ms fill delay is a different answer to
-  // the same strategy.
+  // Display intervals and latency because both affect replay results.
   process.stdout.write(`  intervals ${manifest.intervals.join(', ')}\n`);
   process.stdout.write(`  delay     ${manifest.latency ? `${manifest.latency} ms` : 'none'}\n`);
   if (manifest.reference.length) process.stdout.write(`  reference ${manifest.reference.join(', ')}\n`);
   process.stdout.write(`  files     ${res.files.length} / ${LIMITS.maxFiles} · ${(res.totalBytes / 1024).toFixed(1)} / ${LIMITS.maxTotalSourceBytes / 1024} KB\n`);
   if (manifest.mode === 'session') {
-    // NOT "3x the market-day rate". That multiplier was deleted, and this was
-    // its third hiding place after both i18n dictionaries — the guard that
-    // caught the other two only scans lib/backtest-i18n.ts.
+    // Show the server rate without an extra multiplier.
     process.stdout.write('  mode      session — same price as market mode\n');
   }
   process.stdout.write('\n');
@@ -285,9 +262,7 @@ async function main(argv) {
   }
 }
 
-// Exact identity, not a suffix match. The npm package's bin shim is also called
-// ot.mjs, so `endsWith('/ot.mjs')` was true when it merely IMPORTED this file —
-// and the CLI ran twice, once from the shim and once from here.
+// Compare module URLs directly; the npm bin shim also has the name ot.mjs.
 const invokedDirectly = process.argv[1]
   && pathToFileURL(process.argv[1]).href === import.meta.url;
 if (invokedDirectly) {

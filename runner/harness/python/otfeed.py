@@ -1,28 +1,10 @@
-"""Point-in-time views over an out-of-band series — the Python half.
+"""Point-in-time views over reference feeds and external series.
 
-The mirror of runner/engine/feed.mjs. ``ctx.ref(name)`` and ``ctx.ext(name)``
-call ``feed.view_at(ctx.now)`` here and ``feed.viewAt(ctx.now)`` there; neither
-existed until now, so a manifest declaring ``reference`` or ``series`` was
-accepted, queued, billed, and then crashed on the strategy's first
-``ctx.ref(...)`` claiming the feed had not been declared -- which it had.
+ctx.ref(name) and ctx.ext(name) use feed.view_at(ctx.now). Views expose
+only rows visible at that time and return copies to protect later reads.
+lag_ms delays visibility until ts_ms + lag_ms.
 
-Two properties, the same two the JavaScript guarantees:
-
-1. NOTHING STAMPED AFTER ctx.now IS REACHABLE. The cursor never advances past
-   ``now``, so a later row is not something a strategy can ask for. It is not
-   filtered on the way out; it is not reachable. A reference feed is exactly
-   where look-ahead would otherwise leak, because we hold the whole series up
-   front.
-
-2. WHAT THE STRATEGY GETS IS A COPY. ``ctx.book()`` and ``ctx.history()`` were
-   both caught handing out live objects a strategy could rewrite; a rewritten
-   reference row would poison every later ``window()`` over it.
-
-``lag_ms`` models publication delay: a row is invisible until ts_ms + lag_ms.
-
-Any change here needs the same change in feed.mjs. runner/conformance compares
-the two engines row by row and will go red if they drift.
-"""
+Keep in sync with runner/engine/feed.mjs; runner/conformance checks parity."""
 
 from __future__ import annotations
 
@@ -79,9 +61,7 @@ class PointInTimeFeed:
             self.lag_ms = float(lag_ms) or 0.0
         except (TypeError, ValueError):
             self.lag_ms = 0.0
-        # Monotone cursor: replay only moves forward, so the feed is walked once
-        # across a market-day. A fresh feed is built per market, so this is not
-        # an assumption about what the strategy does.
+        # Replay advances monotonically, so each market's feed is scanned once.
         self.cursor = 0
 
     def _visible_count(self, now):

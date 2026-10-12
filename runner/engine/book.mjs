@@ -1,52 +1,19 @@
-// The order book, and how a returned Order becomes fills.
-//
-// This is the module the slippage panel is a report of, so its bias is fixed:
-// where the archive is ambiguous, resolve AGAINST the strategy. An optimistic
-// matcher is what makes a backtest flatter, and a flattering backtest is worth
-// less than no backtest.
-//
-// Three rules that are not negotiable:
-//
-//  - An order fills against the depth that was RESTING at that millisecond.
-//    Not the best price during the second, not the next tick's price.
-//  - Size beyond the visible depth walks the book and the shortfall is
-//    reported. It is never assumed to fill at the top of book.
-//  - We only ever take. Posting a quote and waiting to be filled needs a
-//    queue-position model, and guessing at it inflates market-making returns by
-//    multiples — so it is refused rather than modelled badly.
-//
-// Prices are outcome-token prices in dollars, 0..1. A binary market quotes a
-// probability, so "price" and "implied probability" are the same number.
-//
-// SHAPE: a binary market has TWO tradeable tokens (UP, DOWN), and each has its
-// own bid and ask ladder. Buying UP lifts UP's asks; getting out of UP sells
-// into UP's bids. An earlier version of this file modelled one ladder per token
-// and could not express an exit at all.
+// Order books and taker matching. Consume visible depth at the current event
+// time; excess size remains unfilled. Resting orders use maker.mjs.
+// Prices are outcome-token dollars (0..1), also implied probabilities.
+// UP and DOWN each have separate bid and ask ladders. Resolve archive
+// ambiguity conservatively, against the strategy.
 
 /** The two outcome tokens of an Up/Down market. */
 export const SIDES = Object.freeze(['UP', 'DOWN']);
 export const isSide = (s) => SIDES.includes(s);
 
-/**
- * Prices are quantised to 1e-4 before any comparison.
- *
- * Venue tick sizes are 0.01 or 0.001 and the archive carries floats. Letting
- * `0.1 + 0.2 > 0.3` decide whether an order fills is exactly the
- * non-determinism this product promises does not exist, so every comparison
- * downstream is on integers.
- */
+/** Quantise prices to 1e-4 for integer comparisons without float noise. */
 export const PRICE_SCALE = 10_000;
 export const toTicks = (px) => Math.round(px * PRICE_SCALE);
 export const fromTicks = (t) => t / PRICE_SCALE;
 
-/**
- * One ladder — all the resting size on one side of one token.
- *
- * `dir` is the direction "better" runs in: asks are best-cheapest (+1, sorted
- * ascending, walk from the front), bids are best-dearest (-1, sorted
- * descending). Keeping both in one class with a direction is what stops the
- * bid path and the ask path drifting into two slightly different matchers.
- */
+/** One token's ladder, best first: +1 for ascending asks, -1 for descending bids. */
 class Ladder {
   constructor(dir) {
     this.dir = dir; // +1 asks (ascending), -1 bids (descending)
@@ -64,13 +31,7 @@ class Ladder {
       .sort((a, b) => this.#order(a.ticks, b.ticks));
   }
 
-  /**
-   * Apply one delta. A size of zero removes the level.
-   *
-   * `ts` is carried on the level itself so `prune` can tell a level the venue
-   * has moved past from one that arrived in the same millisecond as the bound
-   * about to delete it. See prune.
-   */
+  /** Apply a size delta; non-positive size removes the level. Store ts for pruning. */
   apply(px, size, ts = 0) {
     const ticks = toTicks(px);
     const n = Number(size);
@@ -86,54 +47,22 @@ class Ladder {
   }
 
   /**
-   * Delete every level STRICTLY BETTER than `bound` that is older than `ts`.
-   *
-   * This is the whole of what the unthrottled top-of-book stream is allowed to
-   * do. That stream carries prices and no sizes, so it can state what is NOT on
-   * the ladder — "nothing better than this exists right now" — and can never
-   * state what is. Adding a level from it would be liquidity invented without a
-   * size, which is the class of bug this engine has had to fix five times.
-   *
-   * WHY IT MATTERS AT ALL: `take()` eats from the best end, and the delta stream
-   * that maintains this ladder is thinned to the venue's capture cadence (500ms
-   * for most assets). So the levels that are stalest are exactly the ones an
-   * order hits first, and they are stale in one direction only — a price that
-   * has since been taken still looks available. That is a systematic bias in the
-   * strategy's favour, which is the opposite of this file's stated bias.
-   *
-   * OLDER THAN, not "at or older than", and that is the point of carrying `ts`
-   * per level. A delta and a bound stamped the same millisecond contradict each
-   * other and the archive does not say which came first; leaving it to arrival
-   * order would make the result depend on how the reader happened to sort a tie.
-   * Requiring the level to be strictly older makes the outcome the same either
-   * way.
-   *
-   * Levels are best-first, so everything better than the bound is a prefix —
-   * but the age test is not prefix-aligned, so the prefix is filtered rather
-   * than sliced.
+   * Remove levels better than bound and older than ts. Size-free BBO bounds
+   * remove stale liquidity but cannot add it. Same-ms levels survive unless
+   * inclusive is set, making tied bounds and deltas independent of arrival order.
+   * Filter the best-price prefix because its age test is not prefix-aligned.
    */
   prune(bound, ts, inclusive = false) {
-    // Not just finite: inside [0, 1]. An outcome token pays 0 or 1, so a bound
-    // outside that is a row we cannot read, and a bound is a MAXIMAL deletion
-    // instruction — acting on a misread one empties the ladder and the market
-    // silently stops filling. The decoder already refuses these; this is the
-    // second door, and it is what makes the engines, the Python engine and
-    // scripts/audit-report.py agree on the same rule rather than three
-    // slightly different ones.
-    // A NUMBER, not something that parses as one. `Number.isFinite('0.45')` is
-    // false because it does not coerce, while Python's `float('0.45')` is 0.45
-    // — so accepting strings on one side would make the same event prune in one
-    // engine and not the other. Both refuse anything that is not already a
-    // number, which is what the decoder emits.
+    // Require a finite numeric price in [0, 1]: coercion differs across engines,
+    // and malformed bounds can empty a ladder. Keep in sync with otengine.py
+    // and scripts/audit-report.py.
     if (typeof bound !== 'number' || !Number.isFinite(bound)) return 0;
     if (bound < 0 || bound > 1) return 0;
     const cap = toTicks(bound);
     let removed = 0;
     const kept = [];
     for (const l of this.levels) {
-      // `inclusive` is generic data only (generic-data.mjs): there the input
-      // order IS the venue's order, so every level present when the bound is
-      // applied came before it, same millisecond or not.
+      // Generic data preserves venue order, including same-ms predecessors.
       if (this.#order(l.ticks, cap) < 0 && (inclusive ? l.ts <= ts : l.ts < ts)) { removed += 1; continue; }
       kept.push(l);
     }
@@ -147,11 +76,7 @@ class Ladder {
   /** When the best level was last set (its ts), or null when empty. */
   bestTs() { return this.levels.length ? this.levels[0].ts : null; }
 
-  /**
-   * Remove up to `size` resting at exactly `ticks` — the other half of a
-   * mirrored level an order just took (mirror_depth "shared"). Removes only,
-   * never adds; a level that is not there is nothing to remove.
-   */
+  /** Remove up to size at ticks from the shared mirrored level. */
   reduceAt(ticks, size) {
     const i = this.levels.findIndex((l) => l.ticks === ticks);
     if (i < 0) return;
@@ -183,7 +108,7 @@ class Ladder {
     return 0;
   }
 
-  /** Visible size at prices STRICTLY better than `ticks`. */
+  /** Visible size at prices strictly better than ticks. */
   depthBetterTicks(ticks) {
     let total = 0;
     for (const l of this.levels) {
@@ -193,7 +118,7 @@ class Ladder {
     return total;
   }
 
-  /** Best-first [ticks, size] pairs — what the maker ledger diffs across a book event. */
+  /** Best-first [ticks, size] pairs for maker-ledger diffs. */
   pairs() { return this.levels.map((l) => [l.ticks, l.size]); }
 
   /** Consume up to `size` from the best end, respecting `bound`. */
@@ -247,19 +172,9 @@ export class Book {
   }
 
   /**
-   * Apply an unthrottled top-of-book bound: the venue says nothing better than
-   * this rests on either ladder right now.
-   *
-   * DELETES ONLY. `bid` and `ask` are prices with no size behind them, so they
-   * can shrink the book and never grow it.
-   *
-   * 0 and 1 need no special case. `bid = 0` is how the venue writes "no bid",
-   * and deleting every bid strictly better than 0 deletes all of them, which is
-   * exactly what it means. Its complement is `ask = 1` on the other token of the
-   * same market, since UP + DOWN = 1 — measured as an exact pairing in the
-   * archive, count for count.
-   *
-   * @returns {number} levels removed, for the caller that reports it
+   * Prune stale levels using size-free BBO bounds; no liquidity is added.
+   * bid = 0 removes positive bids; its binary complement is ask = 1.
+   * @returns {number} levels removed
    */
   bbo(ts, side, bid, ask, { inclusive = false } = {}) {
     this.ts = ts;
@@ -269,10 +184,8 @@ export class Book {
   }
 
   /**
-   * A delta on a single-book market whose other token is the mirror (pmdata
-   * data, client/backtest/generic.py): applied to BOTH tokens in one step, so
-   * no hook or fill ever sees one leg updated and the other not. A bid at q on
-   * one token is an ask at 1 - q on the other.
+   * Update both tokens of a mirrored single book atomically (pmdata data,
+   * client/backtest/generic.py). A bid at q mirrors an ask at 1 - q.
    */
   deltaMirrored(ts, side, kind, px, size) {
     this.delta(ts, side, kind, px, size);
@@ -282,13 +195,7 @@ export class Book {
     this.delta(ts, other, kind === 'asks' ? 'bids' : 'asks', m, size);
   }
 
-  /**
-   * `book.best(side)` — the price to BUY that outcome at, i.e. the best ask.
-   *
-   * This is the number a strategy means by "the price of UP", and it is what
-   * the SDK examples pass as a buy limit. The bid is reachable through
-   * `bestBid`, which is what an exit prices against.
-   */
+  /** Best ask for buying side; exits use bestBid. */
   best(side) { return this.ladders[side]?.asks.best() ?? null; }
 
   bestBid(side) { return this.ladders[side]?.bids.best() ?? null; }
@@ -303,19 +210,15 @@ export class Book {
   bidLevels(side, n = 10) { return this.ladders[side]?.bids.view(n) ?? []; }
 
   /**
-   * `{bid, ask}`: the exchange time each best level of `side` was last set,
-   * null for an empty ladder. MUST MATCH quote_ts in otengine.py.
+   * {bid, ask}: exchange timestamps of best levels, null when empty.
+   * Keep in sync with quote_ts in otengine.py.
    */
   quoteTs(side) {
     const l = this.ladders[side];
     return l ? { bid: l.bids.bestTs(), ask: l.asks.bestTs() } : { bid: null, ask: null };
   }
 
-  /**
-   * A taker took `size` at `px` from `side`'s `kind` ladder of a SINGLE book
-   * published with its mirror: the same liquidity rests on the other token's
-   * opposite ladder at 1 - px, and is gone there too.
-   */
+  /** Remove consumed liquidity from the opposite mirrored ladder at 1 - px. */
   consumeMirror(side, kind, px, size) {
     const other = side === 'UP' ? 'DOWN' : 'UP';
     const m = Number((1 - px).toFixed(10));
@@ -337,18 +240,8 @@ export class Book {
 }
 
 /**
- * Match a taker order against resting depth, consuming what it takes.
- *
- * Consuming matters: two orders returned from the same event must not both fill
- * against the same depth, or "close and reverse in one event" prices the
- * reversal off size the close already ate.
- *
- * `limit` is a bound in whichever direction protects the trader — a CEILING
- * when opening (nothing fills above it) and a FLOOR when reducing (nothing
- * fills below it). The SDK reference states only the buy case; a floor is the
- * only reading of a sell limit that is not simply harmful, since the alternative
- * would let an exit dump into an empty book at any price.
- *
+ * Match a taker order, consuming depth so later orders cannot reuse it.
+ * limit is a ceiling for buys and a floor for reduce-only sells.
  * @param {Book} book
  * @param {{side:string,size:number,limit:number|null,reduce_only?:boolean}} order
  */
@@ -362,17 +255,8 @@ export function matchOrder(book, order) {
   const quotedPx = ladder.best();
 
   const { fills, remaining, notional } = ladder.take(size, order.limit ?? null);
-  // SUMMED FROM WHAT WAS TAKEN, not derived as `size - remaining`.
-  //
-  // `remaining` is the requested size with each level's depth subtracted from
-  // it, and at IEEE-754 precision `1e308 - 1000` is still `1e308`. So a huge
-  // but finite order consumed the whole ladder while reporting `filled: 0` —
-  // no position, no cash, no trade row, and an empty book for every order
-  // after it in that market. The report said nothing happened; the book said
-  // otherwise.
-  //
-  // Adding up the levels actually taken cannot drift from what was removed,
-  // because it IS what was removed. otengine.py mirrors this.
+  // Sum consumed sizes: subtraction from huge requests loses small fills
+  // to float precision (1e308 - 1000 == 1e308). Keep in sync with otengine.py.
   const filled = fills.reduce((a, f) => a + f.size, 0);
 
   return {
@@ -382,8 +266,7 @@ export function matchOrder(book, order) {
     notional,
     avgPx: filled > 0 ? notional / filled : null,
     worstPx: fills.length ? fills[fills.length - 1].px : null,
-    // The counterfactual the slippage panel measures against: what the whole
-    // size would have cost at the price on the screen when the order was sent.
+    // Touch price used as the slippage benchmark.
     quotedPx,
     reduceOnly: reducing,
   };

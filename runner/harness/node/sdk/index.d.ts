@@ -1,21 +1,13 @@
-// Type declarations for the `outcometick` strategy SDK.
-//
-// Hand-written against runner/engine/replay.mjs rather than generated, because
-// the runtime is plain ESM. The value here is that a strategy which
-// type-checks is a strategy the validator will accept: the hook names, the
-// hook arities and the shape of `ctx` are all things the queue rejects on, and
-// finding out at compile time is free while finding out after queueing is not.
-//
-// Anything not declared here does not exist at runtime either. `ctx` is frozen
-// and the SDK deliberately exposes no way to reach the network, the clock or
-// the filesystem — see the docs' "Not supported" list.
+// Type declarations for the outcometick strategy SDK.
+// Maintained by hand for the plain ESM runtime; keep hook signatures and ctx
+// in sync with runner/engine/replay.mjs. Strategies use event time and cannot
+// access network, wall-clock or filesystem APIs through the SDK.
 
 export type Side = 'UP' | 'DOWN';
 
 /**
- * How a market settled. `'TIE'` is a 50:50 settlement — Predict.fun resolves
- * an end price equal to the start price this way, and every UP and DOWN
- * contract pays $0.50.
+ * Settlement result. TIE pays $0.50 per UP and DOWN contract; Predict.fun
+ * uses it when the end price equals the start price.
  */
 export type Outcome = Side | 'TIE';
 
@@ -25,15 +17,13 @@ export declare const SIDES: readonly ['UP', 'DOWN'];
 export type Level = [number, number];
 
 /**
- * The book as of one millisecond, frozen.
- *
- * A read-only facade over the engine's live book — mutating what you get back
- * reaches nothing, and there is no way to see a later state through it.
+ * Frozen book view at one millisecond.
+ * Returned data cannot mutate the live book or reveal later states.
  */
 export interface BookView {
   readonly marketId: string;
   readonly ts: number;
-  /** Best ask for `side` — what you pay to open. */
+  /** Best ask for `side`, what you pay to open. */
   best(side: Side): number | null;
   bestBid(side: Side): number | null;
   best_bid(side: Side): number | null;
@@ -50,7 +40,7 @@ export interface BookView {
   quote_ts(side: Side): { bid: number | null; ask: number | null };
 }
 
-/** A settlement-stream observation — what on_tick receives. */
+/** A settlement-stream observation, what on_tick receives. */
 export interface Tick {
   kind: 'tick';
   ts_ms: number;
@@ -63,9 +53,8 @@ export interface Tick {
 }
 
 /**
- * The asks and bids of one outcome token, as the archive sent them. The order is
- * not guaranteed (venues sort differently), so find the best price rather than
- * taking element 0 — `ctx.book()` already does.
+ * Archived asks and bids for an outcome token. Venues use different sort
+ * orders, so find the best price rather than using element 0, or use ctx.book().
  */
 export interface Ladders {
   asks: Level[];
@@ -73,12 +62,11 @@ export interface Ladders {
 }
 
 /**
- * What on_book receives: the book CHANGE that was just applied, not the book.
+ * The book change passed to onBook. Read the resulting book through ctx.book().
  *
- * Read the book it produced through `ctx.book()`. The event carries no
- * `market_id` — the hook only fires for the market being replayed. A snapshot
- * replaces the ladders it names (Polymarket sends one side per row, so `levels`
- * may hold only `side`); a delta sets one level, and size 0 removes it.
+ * No market_id is included: the hook belongs to the current market. Snapshots
+ * replace the named ladders; Polymarket rows may contain only one side. Deltas
+ * set absolute level sizes, with size 0 removing a level.
  */
 export type BookEvent =
   | {
@@ -112,11 +100,8 @@ export interface TradeEvent {
 }
 
 /**
- * A market, as a hook sees it.
- *
- * `outcome` is absent everywhere except `onSettle`. That is not an oversight:
- * before settlement the official label does not exist yet from the strategy's
- * point of view, and handing it over early is look-ahead.
+ * Strategy-visible market data.
+ * The official outcome is provided only at onSettle to prevent look-ahead.
  */
 export interface Market {
   market_id: string;
@@ -146,23 +131,18 @@ export interface FeedView<T = Record<string, number>> {
 }
 
 /**
- * Everything a strategy can do.
- *
- * Constructed by the runner and frozen. Every accessor is clamped to the
- * current event time, so none of it can see the future by construction rather
- * than by convention.
+ * Runner-provided, frozen strategy context.
+ * Accessors expose data at or before the current event time.
  */
 export interface Ctx<P = Record<string, unknown>> {
   /** Params from the manifest, injected before the first hook. */
   readonly p: P;
-  /** Current event time in epoch ms. Not the wall clock — there isn't one. */
+  /** Current event time in epoch ms. Not the wall clock, there isn't one. */
   readonly now: number;
 
   /**
-   * The book as of this millisecond.
-   *
-   * Passing another market's id throws unless the manifest declared session
-   * mode; cross-market reads are what that mode is for.
+   * Frozen book view at one millisecond.
+   * Returned data cannot mutate the live book or reveal later states.
    */
   book(id?: string | null): BookView;
 
@@ -178,8 +158,8 @@ export interface Ctx<P = Record<string, unknown>> {
   random(seed?: number | null): number;
 
   /**
-   * This market's resting (gtc) orders that are not final yet, as copies.
-   * No queue position: a venue does not tell you that, so neither do we.
+   * Copies of this market's non-final GTC orders.
+   * Queue position is omitted because it is not observable at the venue.
    */
   orders(): RestingOrder[];
 
@@ -217,7 +197,7 @@ export interface Ctx<P = Record<string, unknown>> {
 
   /**
    * The elapsed part of the settlement TWAP window [close - lookback, close),
-   * from the spot values seen in it -- an APPROXIMATION of Chainlink's average
+   * from the spot values seen in it, an approximation of Chainlink's average
    * (it uses finer observations than this per-second stream). null when the
    * market does not settle on a TWAP, the window has not started, or no spot
    * value in it has arrived. Needs the `spot` dataset (throws otherwise).
@@ -233,19 +213,15 @@ export interface Ctx<P = Record<string, unknown>> {
   ema(window?: number): number | null;
 
   /**
-   * Record the strategy's own recompute of the outcome against the official
-   * one. Recorded for the cross-check panel, never enforced — a mismatch is
-   * information, not a failed run.
+   * Record the strategy's recomputed outcome for comparison with the official
+   * result. A mismatch is informational and does not fail the run.
    */
   assert_outcome(market: unknown, outcome: Outcome): void;
 }
 
 /**
- * Size an order in contracts, or in money.
- *
- * A union rather than two optional fields, so `{ size, notional }` together is
- * a compile error rather than a run-time rejection: they answer the same
- * question two ways and there is no sensible reading of both.
+ * Size an order in contracts or money.
+ * The union rejects providing size and notional together at compile time.
  */
 export type OrderSizing =
   | {
@@ -256,14 +232,8 @@ export type OrderSizing =
   | {
     size?: never;
     /**
-     * Spend at most this much, converted to contracts as
-     * `floor(notional / limit)`.
-     *
-     * REQUIRES `limit`, which is why this arm makes it non-optional: a
-     * contract costs whatever it fills at and a marketable order walks the
-     * book, so dividing by the current best price overspends the moment there
-     * is any slippage. The limit is the price you have already said you will
-     * not exceed, which is what makes "at most" true.
+     * Opening-spend budget, converted to contracts as floor(notional / limit).
+     * Requires limit to bound fill prices when the order walks the book.
      */
     notional: number;
     limit: number;
@@ -272,9 +242,7 @@ export type OrderSizing =
 export type OrderInit = OrderSizing & {
   side: Side;
   /**
-   * A bound in whichever direction protects you: a ceiling when opening, a
-   * floor when reducing. Must be within [0, 1] — a binary outcome token
-   * trades nowhere else.
+   * Price ceiling when opening or floor when reducing, within [0, 1].
    */
   limit?: number | null;
   holdS?: number | null;
@@ -286,7 +254,7 @@ export type OrderInit = OrderSizing & {
   | {
     /**
      * `ioc` (the default): take what is resting now; anything unfilled is
-     * dropped. `fok`: all of it within the limit, or none of it — the
+     * dropped. `fok`: all of it within the limit, or none of it, the
      * manifest must declare `"fok": true`.
      */
     tif?: 'ioc' | 'fok';
@@ -333,10 +301,7 @@ export interface RestingOrder {
 }
 
 /**
- * An order a hook returns.
- *
- * Never sent — returned, and matched by the runner against the depth that was
- * actually resting at that millisecond.
+ * An order returned by a hook for simulated execution by the runner.
  */
 export declare class Order {
   constructor(init: OrderInit);
@@ -388,16 +353,14 @@ export interface TimerEvent {
 }
 
 /**
- * Base class for a submitted strategy.
+ * Base class for submitted strategies.
  *
- * The hooks are intentionally not declared as members: implementing one you
- * did not list in the manifest does nothing, and listing one you did not
- * implement is a rejection. Declare them in `outcometick.json` and write them
- * with these signatures.
+ * Hooks run only when declared in outcometick.json; a declared hook without
+ * an implementation is rejected. Use these signatures:
  *
  *     onMarketOpen(ctx: Ctx, market: Market): void
  *     onTick(ctx: Ctx, tick: Tick): Order | null
- *     onBook(ctx: Ctx, event: BookEvent): Order | null   // the book itself: ctx.book()
+ *     onBook(ctx: Ctx, event: BookEvent): Order | null   // read depth with ctx.book()
  *     onTrade(ctx: Ctx, trade: TradeEvent): Order | null
  *     onSettle(ctx: Ctx, market: Market, outcome: Outcome): void
  *     onTimer(ctx: Ctx, timer: TimerEvent): Order | null   // ctx.schedule(atMs, tag)

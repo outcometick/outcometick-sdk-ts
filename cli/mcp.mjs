@@ -1,20 +1,11 @@
-// `ot mcp` — an MCP server over stdio, for AI coding tools.
+// MCP server over stdio for local coding tools.
 //
 //   claude mcp add outcometick -e OT_KEY=ck_… -- npx -y -p outcometick ot mcp
 //
-// It runs on the USER's machine, started by their editor or agent, and is just
-// another API client: every tool is one call the SDK clients already make,
-// under the same per-key rate limits. Nothing new runs on our servers.
-//
-// Hand-written JSON-RPC rather than the MCP SDK: the package ships no runtime
-// dependencies, and the stdio transport is newline-delimited JSON with five
-// methods. stdout carries protocol messages ONLY — anything else written there
-// corrupts the stream — so diagnostics go to stderr.
-//
-// Deliberately absent: submitting a backtest. A submit spends the customer's
-// credits, and an agent must not be able to do that on its own initiative.
-// The tools here read, quote, validate locally, and download files the key
-// already pays for.
+// Uses the API client and its per-key limits. No MCP SDK dependency: the stdio
+// transport is newline-delimited JSON-RPC. Reserve stdout for protocol messages
+// and send diagnostics to stderr. Tools read, quote, validate and download;
+// submission is excluded.
 
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
@@ -49,24 +40,13 @@ const LIST = (what) => ({
 class ToolError extends Error {}
 
 /**
- * Write `bytes` to `target` without ever writing through an existing path.
+ * Publish bytes without overwriting existing paths or following symlinks.
  *
- * Written whole to a fresh temp file first ('wx' fails on ANY existing entry,
- * a symlink included, and never follows one), then published with link(),
- * which also refuses an existing name — so a link planted under the archive
- * name cannot redirect the write, a concurrent download of the same file
- * cannot interleave with this one, and a failure part-way leaves no partial
- * file under the real name and never touches a file that was already there.
- *
- * Filesystems without hard links (exFAT/FAT, the usual external drive) refuse
- * link(); there it falls back to an exclusive copy (COPYFILE_EXCL opens the
- * target O_CREAT|O_EXCL: still refuses any existing name, still never follows
- * a link). That copy is not atomic — an interruption can leave a partial file
- * under the real name. A failed copy is NOT cleaned up here: libuv already
- * unlinks its own half-written target before returning the error, and by the
- * time we saw it a concurrent download may have created that name afresh —
- * deleting by path would delete someone else's file. A partial file left by a
- * crash is the lesser harm, and the error says the download failed.
+ * Write an exclusive temporary file, then link it to the target atomically.
+ * On filesystems without hard links, use COPYFILE_EXCL. That fallback is not
+ * atomic: a crash may leave a partial target. Do not unlink a failed copy by
+ * path; libuv cleans up its failed write, and a concurrent writer may have
+ * created a new file under the same name.
  */
 const NO_HARD_LINKS = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV']);
 
@@ -176,8 +156,7 @@ export const TOOLS = [
         throw new ToolError(`not an archive file name: ${JSON.stringify(a.name)}`);
       }
       await mkdir(path.resolve(ctx.cwd, a.dir ?? '.'), { recursive: true });
-      // Reported resolved, so a directory that is itself a link says where the
-      // file really went. The directory is the caller's choice; the FILE is not.
+      // Resolve the chosen directory so the response identifies the actual destination.
       const dir = await realpath(path.resolve(ctx.cwd, a.dir ?? '.'));
       const target = path.join(dir, a.name);
       const { bytes, sha256 } = await ctx.data(true).download(a.date, a.name);
@@ -240,9 +219,8 @@ export const TOOLS = [
           imports: res.analysis.imports,
         };
       } catch (err) {
-        // A rejection is the ANSWER to "is this valid", not a tool failure.
-        // Only the validator's own: a missing directory also carries a `code`
-        // (ENOENT), and is a failure to check, not a verdict.
+        // Validator rejection codes are validation results. Filesystem errors such as
+        // ENOENT mean the check failed.
         if (err instanceof BacktestRejection) return { ok: false, dir, code: err.code, detail: err.detail ?? err.message };
         throw err;
       }
@@ -304,8 +282,8 @@ async function callTool(name, args, ctx) {
   try {
     return textResult(await tool.run(args ?? {}, ctx));
   } catch (err) {
-    // Tool failures go back to the model as results it can read and act on —
-    // a 403 carries the real floor/ceiling — not as protocol errors.
+    // Return tool failures as MCP results, including API coverage bounds.
+    // Reserve protocol errors for JSON-RPC failures.
     if (err instanceof OutcometickError) {
       return textResult({ error: err.message, status: err.status, body: err.body }, true);
     }

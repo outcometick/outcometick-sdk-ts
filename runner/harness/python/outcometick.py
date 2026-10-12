@@ -1,20 +1,13 @@
-"""The SDK surface a submitted Python strategy imports.
-
-Deliberately tiny. `Strategy` is a base class that exists so `entry` can be
-checked against something, and `Order` is a value object. Everything a strategy
-can actually DO arrives through `ctx`, which the runner constructs — there is no
-way to reach the outside from here, because there is nothing here to reach it
-with.
-"""
+"""Python strategy SDK: Strategy is the base class and Order is a value object.
+The runner provides execution methods through ctx.
+Keep in sync with runner/harness/node/sdk/index.mjs."""
 
 from __future__ import annotations
 
 import math
 import re
 
-# Named explicitly so `from __future__ import annotations` does not leak
-# `annotations` into the package's public surface — this module is also
-# published to PyPI, where dir(outcometick) is what a user reads as the API.
+# Export only the SDK names, excluding the future-import annotations binding.
 __all__ = ("Strategy", "Order", "SIDES")
 
 SIDES = ("UP", "DOWN")
@@ -24,42 +17,29 @@ _ENGINE_ID = re.compile(r"o[0-9]+")
 
 
 class Strategy:
-    """Base class for a submitted strategy.
+    """Base class for submitted strategies.
 
-    The hooks are not defined here on purpose. A default no-op `on_tick` would
-    turn "you declared a hook you did not implement" — a rejection the submitter
-    can fix in seconds — into a run that quietly never trades and bills for an
-    empty equity curve.
-    """
+    Hooks have no default implementations, so missing declared hooks are rejected."""
 
     #: Params from the manifest, injected by the runner before the first hook.
     p: dict = {}
 
 
 class Order:
-    """An order a hook returns. Never sent — returned, and matched by the runner
-    against the depth that was actually resting at that millisecond.
+    """An order returned by a hook for simulated execution by the runner.
 
-    `limit` is a bound in whichever direction protects you: a ceiling when
-    opening, a floor when reducing.
-    """
+    limit is a price ceiling when opening and a floor when reducing."""
 
     __slots__ = ("side", "size", "limit", "hold_s", "reduce_only", "tif", "tag", "post_only", "client_id")
 
     def __init__(self, side, size=None, limit=None, hold_s=None, reduce_only=False,
                  tif="ioc", tag=None, notional=None, post_only=False, client_id=None):
-        # "UP" / "DOWN", or an outcome label on generic data -- see index.mjs.
+        # "UP" / "DOWN", or an outcome label on generic data, see index.mjs.
         if side not in SIDES and not (isinstance(side, str) and side.strip() != ""):
             raise ValueError(f'side must be "UP", "DOWN" or an outcome label, got {side!r}')
-        # SIZING IN MONEY -- this is about the `notional` argument below.
-        # `size` is CONTRACTS (see OrderSizing in index.d.ts); it is not
-        # money, and reading this heading as if it were is the one wrong
-        # turn this comment can cause. Mirrors index.mjs exactly -- see
-        # the reasoning there.
-        # Position sizing is nearly always a budget, and the only honest
-        # divisor is your own limit: a contract costs whatever it fills at, so
-        # dividing by the current best price overspends the moment there is any
-        # slippage. `notional` therefore REQUIRES `limit`.
+        # size is in contracts. Convert notional using the limit to bound opening
+        # spend when the order walks the book. A notional order requires a limit.
+        # Keep in sync with index.mjs.
         if notional is not None:
             if size is not None:
                 raise ValueError(
@@ -74,37 +54,27 @@ class Order:
             px = float(limit)
             if not (math.isfinite(px) and px > 0):
                 raise ValueError(f"notional needs a limit above 0, got {limit!r}")
-            # FLOOR, so the spend is at most the budget rather than around it.
-            # floor(a / b), NOT a // b — see otengine.py. Python's float
-            # floor-division disagrees with Math.floor(a / b) on decimal
-            # boundaries: 80 // 0.64 is 124, Math.floor(80 / 0.64) is 125.
+            # Use floor(a / b) to match JavaScript, not Python float floor-division:
+            # 80 // 0.64 is 124, while floor(80 / 0.64) is 125.
             derived = math.floor(notional / px)
             if derived < 1:
                 raise ValueError(f"notional {notional} buys no contracts at limit {px}")
             size = derived
-        # FINITE, and not a bool. Node's Order uses Number.isFinite here, so
-        # without this `Order(size=float("inf"))` constructs in Python and
-        # throws in JS -- the published SDK behaving differently in the two
-        # languages it ships for.
+        # Require finite numeric sizes, excluding bool, to match the JS SDK.
         if not (isinstance(size, (int, float)) and not isinstance(size, bool)
                 and math.isfinite(size) and size > 0):
             raise ValueError(f"size must be a positive number, got {size!r}")
-        # A NUMBER, matching the engine and index.mjs. float('0.5') and
-        # Number('0.5') both give 0.5, but float([0.5]) raises where
-        # Number([0.5]) gives 0.5 -- the same published SDK behaving
-        # differently in the two languages it ships for.
+        # Require a numeric limit; JS and Python coercions differ.
         if limit is not None and not (
                 isinstance(limit, (int, float)) and not isinstance(limit, bool)
                 and math.isfinite(limit) and 0 <= float(limit) <= 1):
-            # A binary outcome token trades between 0 and 1. A limit outside
-            # that is not a price, and silently clamping it would fill an order
-            # the strategy never asked for.
+            # Binary token prices are in [0, 1]; reject rather than clamp.
             raise ValueError(f"limit must be between 0 and 1, got {limit!r}")
-        # fok: all of it within the limit, or none of it -- see index.mjs.
+        # fok: all of it within the limit, or none of it, see index.mjs.
         if tif not in ("ioc", "gtc", "fok"):
             raise ValueError(f'tif must be "ioc", "gtc" or "fok", got {tif!r}')
-        # Mirrors index.mjs: a resting order rests AT a price; hold_s has no
-        # single fill to time from; post_only and client_id mean nothing to an ioc.
+        # GTC requires a limit and disallows hold_s because fills may be partial.
+        # post_only and client_id apply only to GTC. Keep in sync with index.mjs.
         if tif == "gtc":
             if limit is None:
                 raise ValueError("a gtc order needs a limit — the price it rests at")

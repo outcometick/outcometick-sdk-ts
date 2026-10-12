@@ -1,51 +1,24 @@
-// Resting (maker) orders: a conservative queue-position model for Polymarket.
+// Conservative resting-order queue model. Aggregated levels and transaction
+// prints do not reveal individual maker orders, so fills are estimates.
 //
-// Every number this module produces is a fill nobody can verify against the
-// venue — the archive has aggregated book levels and one print per
-// transaction, not the maker orders inside a level. So, like book.mjs, its
-// bias is fixed: where the archive is ambiguous, resolve AGAINST the strategy.
-// A resting-order backtest that is generous about queue position overstates
-// market-making returns by multiples, which is the whole reason this engine
-// refused GTC for so long.
+// The public sample and per-match venue API show mirrored liquidity: UP bids
+// at q and DOWN asks at 1 - q share one canonical UP queue. Prints appear once
+// on the taker's token, with total transaction size and one maker price; that
+// price may be the best or worst of a sweep. Complementary-token prints also
+// consume the canonical queue.
 //
-// WHAT THE ARCHIVE ACTUALLY SAYS (measured on the public sample + the venue's
-// own per-match trade API, 2026-10-11):
+// A print spends one size budget, best price first: depletion ledger, external
+// queue ahead, own order, remaining level. It reaches only prices at least as
+// good as the printed price. Book removals stay in the ledger for PRINT_LAG_MS
+// to prevent late prints from consuming them twice.
+// New orders ignore prints within PRINT_LAG_MS of activation. Cancelled orders
+// remain exposed for that period after cancellation, a stress assumption for
+// late prints. Book updates shorten queue estimates to visible size but never
+// fill orders; crossing books are diagnostics. Fills use the order's limit.
+// No market impact: own orders do not consume visible depth.
 //
-//  - The book is MIRRORED. A bid for UP at q and an ask for DOWN at 1−q are one
-//    queue, published twice with the same size. So every own order is placed in
-//    ONE canonical queue, the UP token's view: an UP bid at q and a DOWN
-//    reduce-only ask at 1−q compete for the same volume.
-//  - A trade prints ONCE, on the TAKER's token, with the taker's direction and
-//    TOTAL size, at one maker price — the best or the worst of a sweep, which
-//    the print does not say. Half the prints in a measured market were mint
-//    matches (a DOWN buyer taking resting UP bids), so a resting UP bid is
-//    consumed by DOWN prints at 1−p as well. A single-token model misses them.
-//  - Prints can arrive after the book already shows the trade. So the volume a
-//    book update removed is held in a DEPLETION LEDGER for PRINT_LAG_MS and
-//    deducted, at its original price, from the print that explains it — never
-//    treated as gone, which would let that print reach an order behind it.
-//
-// THE RULES, each conservative on its own:
-//
-//  - A print reaches only prices at least as good as its own price: the taker
-//    certainly traded there, and nothing beyond it is assumed.
-//  - One sequential waterfall per print: at each reached price, best first,
-//    ledger volume, then the external queue in front of each own order, the
-//    order itself, then the rest of the level — all out of ONE budget, the
-//    print's size. Own fills plus everything else never exceed what printed.
-//  - A new order ignores every print stamped within PRINT_LAG_MS of its
-//    activation: that print may describe a match from before it existed.
-//  - A cancelled order stays exposed for PRINT_LAG_MS after the cancel takes
-//    effect: a print in that window may describe a match from before the
-//    cancel. A stress assumption, and documented as one.
-//  - Book updates only ever SHORTEN the queue estimate by the visible size at
-//    the order's level (what is in front of us and still resting is visible).
-//    They never fill: a crossing book is counted as a diagnostic.
-//  - Fills are at the order's own limit. No market impact: our orders never
-//    consume visible depth.
-//
-// MUST MATCH otmaker.py, rule for rule and in the order of every floating-point
-// operation; runner/conformance holds the two to the same rows.
+// Keep in sync with otmaker.py, including floating-point operation order.
+// runner/conformance checks matching rows.
 
 import { PRICE_SCALE, toTicks, fromTicks } from './book.mjs';
 
@@ -53,24 +26,16 @@ import { PRICE_SCALE, toTicks, fromTicks } from './book.mjs';
 export const QUEUE_MODEL = 'polymarket-queue-v1';
 
 /**
- * Optional probabilistic queue models (manifest `queue_model`, job.engine
- * .queue_prob = {prob, n}): where in the queue an UNEXPLAINED book decrease
- * came from, after hftbacktest's ProbQueueModel. Absent, nothing below runs
- * and the conservative model above is the whole story.
- *
- * Two separate records, so one unit of volume is explained once:
- *  - the ARCHIVE level (no own orders exist there): `ledger` = volume the book
- *    removed that no print explained yet, `unseen` = volume a print removed
- *    that the book has not shown yet; shadow(q) = visible(q) - unseen(q). A
- *    print walks it once (consuming ledger, adding unseen); a book decrease
- *    first absorbs unseen, and only the rest is ledgered and treated as
- *    cancellation.
- *  - the ORDER level: `ahead`, advanced by the counterfactual waterfall as
- *    today and, for the unexplained part of a decrease at its price, by
- *    est = front - (1 - p) * chg + min(0, back - p * chg).
- * Both lists live PRINT_LAG_MS: a heuristic window, stated in the report.
- * MUST MATCH otmaker.py bit for bit (queueProb uses only + - * / in a fixed
- * order for that reason).
+ * Optional probabilistic cancellation model (queue_model; engine.queue_prob
+ * = {prob, n}), based on hftbacktest's ProbQueueModel. Null uses the default.
+ * At archive level, ledger holds book removals unexplained by prints; unseen
+ * holds print removals not yet reflected in the book. shadow = visible - unseen.
+ * Prints consume ledger and add unseen. Book decreases absorb unseen before
+ * ledgering the unexplained remainder as cancellations.
+ * At order level, the waterfall advances ahead; unexplained decreases apply
+ * est = front - (1 - p) * chg + min(0, back - p * chg).
+ * Both records expire after PRINT_LAG_MS, a heuristic reconciliation window.
+ * Keep in sync with otmaker.py, including the fixed + - * / operation order.
  */
 export const QUEUE_PROB_VERSION = 'prob-v1';
 export const QUEUE_PROBS = Object.freeze(['power', 'power2', 'power3', 'log', 'log2']);
@@ -106,9 +71,9 @@ export function ln1p(x) {
 }
 
 /**
- * The share of a cancellation that came from BEHIND an order with `a` in
- * front and `b` behind, in [0, 1]; null outside the input contract (no
- * probabilistic update then). MUST MATCH queue_prob in otmaker.py.
+ * Cancellation share behind an order with a ahead and b behind, in [0, 1].
+ * Invalid inputs return null and skip the probabilistic update.
+ * Keep in sync with queue_prob in otmaker.py.
  */
 export function queueProb(model, a, b) {
   if (!(Number.isFinite(a) && Number.isFinite(b)) || !(a > 0) || !(b >= 0)
@@ -134,14 +99,10 @@ export function queueProb(model, a, b) {
 }
 
 /**
- * How long a print may trail the book update that already showed its trade.
- *
- * One constant with three uses: the entry exclusion, the cancel exposure and
- * the ledger's lifetime. Chosen from the pre-print BBO absence duration on
- * observed transitions in the public BTC-5m sample day (2026-09-08): p99.9 was
- * 702ms for taker buys and 639ms for taker sells, so max of the two rounded up
- * to 100ms. A heuristic from one series, not a bound, and stated in every
- * report.
+ * Print-lag window for entry exclusion, cancel exposure and ledger expiry.
+ * Public BTC-5m sample (2026-09-08) pre-print BBO absence p99.9: 702ms for
+ * buys, 639ms for sells. Round the maximum up to 100ms. This one-series
+ * heuristic is not a bound; include it in the report.
  */
 export const PRINT_LAG_MS = 800;
 
@@ -151,11 +112,7 @@ export const MAX_RESTING = 50;
 /** Polymarket's finest tick, in PRICE_SCALE ticks (0.001). */
 export const TICK_GRID = 10;
 
-/**
- * What a client_id may look like. ASCII on purpose: a length limit means
- * different things to JavaScript (UTF-16 units) and Python (code points), and
- * the two engines must refuse exactly the same ids.
- */
+/** ASCII client ids keep JS UTF-16 and Python code-point length limits equivalent. */
 const CLIENT_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 /** Engine ids look like this; a client_id may not, so a cancel is never ambiguous. */
@@ -168,17 +125,14 @@ export const MARKOUT_HORIZONS = Object.freeze([
   Object.freeze({ key: 'markout_60s', ms: 60_000 }),
 ]);
 
-/** A mid older than this at the horizon is not a mid. */
+/** Maximum mid-price age at a markout horizon. */
 export const MARKOUT_MAX_AGE_MS = 5_000;
 
 const EPS = 1e-9;
 
 /**
- * Maker fill rows whose markouts are not final yet. In session mode one
- * portfolio serves every open market and the harness drains its rows whenever
- * any market closes — a row from a market still open would leave with its
- * markouts unset. The harness holds back rows for which this is true; the
- * market's own close releases them.
+ * Hold maker rows until their market closes so session-mode drains from other
+ * markets cannot export them before markouts are final.
  */
 const PENDING_ROWS = new WeakSet();
 export const rowPending = (row) => PENDING_ROWS.has(row);
@@ -188,7 +142,7 @@ const FINAL = new Set([
   'rejected', 'rejected_post_only', 'rejected_self_cross',
 ]);
 
-/** Counters for the report's maker block. MUST MATCH new_maker_stats in otmaker.py. */
+/** Counters for the report's maker block. Keep in sync with new_maker_stats in otmaker.py. */
 export function newMakerStats() {
   return {
     submitted: 0,
@@ -220,11 +174,8 @@ export function addMakerStats(total, part) {
 }
 
 /**
- * Where an own order sits in the canonical (UP) queue.
- *
- * Buying UP at q is a canonical bid at q; selling UP is a canonical ask. Buying
- * DOWN at q is economically selling UP at 1−q — a canonical ask at 1−q — and
- * selling DOWN is a canonical bid at 1−q.
+ * Map orders to the canonical UP queue: UP buys/sells are bids/asks at q;
+ * DOWN buys/sells are asks/bids at 1 - q.
  */
 export function canonicalOf(side, reduce, ticks) {
   if (side === 'UP') return { kind: reduce ? 'asks' : 'bids', q: ticks };
@@ -256,27 +207,19 @@ export class MakerBook {
     this.marketId = marketId;
     this.pf = portfolio;
     this.lag = printLagMs;
-    /** job.engine.queue_prob, or null: the conservative model, untouched. */
+    /** job.engine.queue_prob; null selects the conservative model. */
     this.prob = queueProb;
     /** Prob mode: print-removed volume the book has not shown yet, per side. */
     this.unseen = { asks: [], bids: [] };
     /** Every order ever submitted in this market, by engine id. */
     this.byId = new Map();
-    /**
-     * The orders that are not final, in submission order. Everything that runs
-     * per event iterates THIS, not every order the market has seen: a strategy
-     * re-quoting each second leaves hundreds of final orders behind.
-     */
+    /** Non-final orders in submission order, avoiding per-event scans of final orders. */
     this.open = [];
     this.seq = 0;
     /** Ledger entries per canonical side: {ts, q, amount}, in arrival order. */
     this.ledger = { asks: [], bids: [] };
     this.stats = newMakerStats();
-    /**
-     * Fill rows waiting for their markouts, one FIFO per horizon. Fills happen
-     * in time order and every horizon is a fixed offset, so each queue is
-     * sorted by due time and resolves from its head.
-     */
+    /** Markout FIFO per horizon; time-ordered fills give time-ordered deadlines. */
     this.markoutQ = MARKOUT_HORIZONS.map(() => ({ items: [], head: 0 }));
     /** Last book event per token, for markout freshness. */
     this.tokenTs = { UP: null, DOWN: null };
@@ -289,7 +232,7 @@ export class MakerBook {
     if (this.open.some((o) => FINAL.has(o.state))) this.open = this.open.filter((o) => !FINAL.has(o.state));
   }
 
-  /** Non-final orders, the thing MAX_RESTING bounds. */
+  /** Non-final orders bounded by MAX_RESTING. */
   openCount() { this.#compact(); return this.open.length; }
 
   #active() {
@@ -359,8 +302,7 @@ export class MakerBook {
   activate(rec, ts, book) {
     if (rec.state !== 'pending') return;
     const eff = this.pf.normalize(rec.order, this.marketId);
-    // The engine's side from here on: on a generic market the order may have
-    // named it by label (Portfolio.sideOf). Identical for archive markets.
+    // Normalise generic side labels through Portfolio.sideOf.
     if (eff) rec.side = eff.side;
     const limit = eff?.limit;
     const ticks = limit == null ? null : toTicks(limit);
@@ -373,19 +315,15 @@ export class MakerBook {
       this.stats.rejected_invalid += 1;
       return;
     }
-    // quote_guard refuses the WHOLE order: a guarded order that may not take
-    // must not rest and fill later either.
+    // quote_guard rejects the full order, including its resting remainder.
     if (this.pf.quoteGuard && this.pf.quoteGuardFailure(book, ts, eff)) {
       rec.state = 'rejected';
       this.pf.countReject('quote_guard');
       return;
     }
     const { kind, q } = canonicalOf(rec.side, rec.reduce, ticks);
-    // Our own orders may not cross each other: on the venue they would trade
-    // with each other (a mint or merge at a loss), which no strategy means.
-    // Only LIVE orders count. A cancel_pending order has left the venue — its
-    // exposure window is our pessimism about late prints, not a quote still
-    // resting — so re-quoting through a just-cancelled price is legitimate.
+    // Reject self-crosses against live orders. cancel_pending orders have
+    // left the venue; their late-print exposure does not block re-quoting.
     const opp = kind === 'asks' ? 'bids' : 'asks';
     this.#compact();
     for (const o of this.open) {
@@ -402,8 +340,7 @@ export class MakerBook {
     rec.size = eff.size;
     rec.remaining = eff.size;
 
-    // Marketable on arrival, judged on the order's OWN token exactly as an IOC
-    // would be: a bid crossing the ask, a reduce crossing the bid.
+    // Test marketability on the order's token, as for IOC.
     const touch = rec.reduce ? book.bestBid(rec.side) : book.best(rec.side);
     const marketable = touch != null && (rec.reduce ? toTicks(touch) >= ticks : toTicks(touch) <= ticks);
     if (marketable) {
@@ -417,8 +354,7 @@ export class MakerBook {
       });
       const filled = res?.filled ?? 0;
       this.stats.taker_on_arrival_size += filled;
-      // What is left rests — the normalised size minus what filled, never a
-      // fresh conversion of the original notional.
+      // Rest normalised size minus fills; do not reconvert original notional.
       rec.remaining = eff.size - filled;
       if (!(rec.remaining > EPS)) {
         rec.remaining = 0;
@@ -502,9 +438,7 @@ export class MakerBook {
     }
     if (this.prob) { this.#bookEventProb(ev, book, apply); return; }
     if (!this.tracking()) { apply(); return; }
-    // Only the canonical (UP) ladders matter, and most events cannot touch
-    // them: a DOWN delta or snapshot leaves UP as it was — and so every queue
-    // estimate and every ledger entry. Half of all book events end here.
+    // DOWN-only updates leave the canonical UP queues and ledger unchanged.
     const touchesUp = ev.snapshot ? ev.levels?.UP != null : ev.side === 'UP';
     if (!touchesUp) { apply(); return; }
     const T = ev.ts_ms;
@@ -533,9 +467,8 @@ export class MakerBook {
     for (const o of this.#active()) {
       const v = book.ladders.UP[o.kind].sizeAtTicks(o.q);
       if (v < o.ahead) o.ahead = v;
-      // A visible level on the other side at or through our price: the archive
-      // and our hypothetical order disagree. Counted once per episode, never
-      // filled — an absolute size is not arriving aggressive volume.
+      // Count each crossing episode without filling: a size update is not
+      // evidence of aggressive volume.
       const oppBest = o.kind === 'bids' ? book.ladders.UP.asks.levels[0] : book.ladders.UP.bids.levels[0];
       const crossed = oppBest != null && (o.kind === 'bids' ? oppBest.ticks <= o.q : oppBest.ticks >= o.q);
       if (crossed && !o.crossed) this.stats.crossed_observations += 1;
@@ -576,7 +509,7 @@ export class MakerBook {
     for (const c of changes) {
       const drop = c.prev - c.now;
       if (!(drop > EPS)) continue;
-      // Absorbed ONCE per price, oldest unseen first.
+      // Absorbed once per price, oldest unseen first.
       let absorbed = 0;
       for (const e of this.unseen[c.kind]) {
         if (e.q !== c.q || !(e.amount > EPS)) continue;
@@ -618,8 +551,7 @@ export class MakerBook {
   trade(ev, book) {
     if (this.prob) { this.#tradeProb(ev, book); return; }
     if (!this.tracking()) return;
-    // The decoder already refuses these; this is the second door, so both
-    // engines agree on the same rule rather than on whatever each tolerates.
+    // Validate decoded prints here too, with the same rules in both engines.
     if (!(typeof ev.size === 'number' && Number.isFinite(ev.size) && ev.size > 0)) return;
     if (!(typeof ev.px === 'number' && ev.px >= 0 && ev.px <= 1)) return;
     if ((ev.side !== 'UP' && ev.side !== 'DOWN') || (ev.taker !== 'BUY' && ev.taker !== 'SELL')) return;
@@ -680,10 +612,9 @@ export class MakerBook {
   }
 
   /**
-   * Prob mode's print: the counterfactual waterfall (fills, `ahead`) reads the
-   * archive level as it stood before this print and never changes it; the
-   * REAL walk (no own orders) then consumes ledger and records unseen. Two
-   * budgets, each run out where it runs out.
+   * Probabilistic print handling: the counterfactual waterfall reads archive
+   * state without changing it. A separate archive walk consumes ledger and
+   * records unseen. Each walk has its own print-size budget.
    */
   #tradeProb(ev, book) {
     if (!(this.stats.submitted > 0)) return;
@@ -698,8 +629,7 @@ export class MakerBook {
     const shadow = (x) => Math.max(0, (visible.get(x) ?? 0) - this.#unseenAt(kind, x));
     const order = (a, b) => (kind === 'asks' ? a - b : b - a);
 
-    // The counterfactual walk: today's waterfall on a copy of the ledger, the
-    // level's rest from shadow.
+    // Counterfactual walk uses a ledger copy and shadow level sizes.
     const own = this.#active().filter((o) => o.kind === kind && reached(kind, o.q, p));
     if (own.length) {
       const prices = new Set();
@@ -742,7 +672,7 @@ export class MakerBook {
       for (const [o, used] of advance) o.ahead = Math.max(0, o.ahead - used);
     }
 
-    // The REAL walk: what the archive says this print removed.
+    // Archive walk records what the print removed.
     const prices = new Set();
     for (const l of ladder.levels) if (reached(kind, l.ticks, p)) prices.add(l.ticks);
     for (const e of led) prices.add(e.q);
@@ -769,8 +699,7 @@ export class MakerBook {
   #fill(o, take, T, book) {
     let size = take;
     if (o.reduce) {
-      // Sequential, against what is open right now — two reduce orders filled
-      // by one print cannot sell the same contracts.
+      // Apply reductions sequentially so fills cannot sell the same contracts twice.
       const open = this.pf.sizeOf(this.marketId, o.side);
       if (!(open > EPS)) {
         o.state = 'cancelled_no_position';
@@ -817,7 +746,7 @@ export class MakerBook {
 
   /**
    * Resolve every markout horizon that falls strictly before `T` from the book
-   * as it stands — which is the latest state at or before the horizon, since
+   * as it stands; which is the latest state at or before the horizon, since
    * the event at T has not been applied yet.
    */
   resolveMarkouts(T, book) {
@@ -848,7 +777,7 @@ export class MakerBook {
 
   /**
    * At the close: horizons at or before it resolve from the closing book, the
-   * rest stay null, and every order that is not final expires — pending ones
+   * rest stay null, and every order that is not final expires; pending ones
    * included. Nothing fills after this.
    */
   close(closeTs, book) {

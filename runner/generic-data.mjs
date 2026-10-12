@@ -1,29 +1,15 @@
-// Backtesting ANY Polymarket binary market from the user's own data.
+// Decode user-supplied binary Polymarket markets and CLOB frames into replay
+// events. Archive decoding remains separate; engine differences are selected
+// by market.kind === 'generic'.
 //
-// The archive path (events.mjs + spool-day.mjs) reads the outcometick archive:
-// crypto Up/Down markets, a settlement stream, a day per file. This module reads
-// a dataset the user recorded or downloaded — a markets file plus Polymarket
-// CLOB market-channel frames — for any binary market, and turns it into the SAME
-// internal event stream the engines replay.
+// Events sort by (time, input sequence), preserving recorded ties across markets.
+// Unreadable book rows or unknown tokens make the entire market unusable.
+// Trading ends at the earliest of the declared end, the millisecond before
+// public resolution, or the last event. Resolved markets pay at resolution;
+// unresolved markets use marks from external data, independent of strategy fills.
 //
-// The archive path is FROZEN: nothing here is imported by it, and every engine
-// branch that differs is keyed on `market.kind === 'generic'`. Where generic
-// data needs a different rule, it is a different rule on purpose:
-//
-//   - Order. Input order is the truth: events sort by (time, input sequence),
-//     never by kind. The archive sorts a millisecond by kind because its files
-//     are read in an arbitrary order; a recorded stream is not.
-//   - Strictness. A book row this decoder cannot read, or that names a token
-//     the market does not own, makes the WHOLE market unusable. A partial book
-//     is a book that fills at prices that no longer exist.
-//   - Lifecycle. Trading ends at the first of: the declared trading end, the
-//     millisecond before the outcome became public, the last event. Nothing
-//     after that reaches a hook. A resolved market pays at its resolution time;
-//     an unresolved one is valued at a mark computed HERE, from external data
-//     only, so a strategy cannot move its own valuation.
-//
-// MUST MATCH client/backtest/generic.py, line for line in behaviour. The
-// equivalence suite compares every event and every market record.
+// Keep in sync with client/backtest/generic.py. The equivalence suite compares
+// events and market records.
 
 import { createReadStream } from 'node:fs';
 import { appendFile, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
@@ -49,7 +35,7 @@ export const MERGE_FANIN = 64;
 /** Event lines buffered per market before they are appended to its spool. */
 const SPOOL_FLUSH = 512;
 
-/** The dataset as a whole cannot be read (local runs only; never a hosted rejection). */
+/** Dataset-level read error for local decoding. */
 export class DatasetError extends Error {}
 
 /** Integer epoch milliseconds (number, or a string of digits), or null. */
@@ -62,12 +48,9 @@ export function parseTimeMs(v) {
 }
 
 /**
- * An ISO-like date-time WITH an explicit zone -> epoch ms, or null.
- *
- * Gamma writes `2025-01-01T12:00:00Z` and `2025-01-01 12:00:00+00`. Parsed by
- * hand rather than by Date.parse, whose acceptance of the second form is an
- * engine detail Python would not reproduce. A time without a zone is refused:
- * guessing UTC would schedule a payout hours off.
+ * Parse a zoned ISO-like date-time to epoch milliseconds, or null.
+ * Accept Gamma forms such as 2025-01-01T12:00:00Z and 2025-01-01 12:00:00+00.
+ * Parse explicitly for Python parity; reject times without a zone.
  */
 export function parseIsoMs(v) {
   if (typeof v !== 'string') return null;
@@ -116,8 +99,8 @@ function priceNum(v) {
 }
 
 /**
- * A settled pair -> UP / DOWN / TIE, or null. EXACTLY 1/0, 0/1 or 0.5/0.5:
- * a live price of 0.9995 is not a resolution, however sure it looks.
+ * Read UP, DOWN or TIE from settled pairs 1/0, 0/1 or 0.5/0.5.
+ * Other prices, including 0.9995, are not resolution evidence.
  */
 function outcomeOfPair(v) {
   const p = jsonList(v);
@@ -139,11 +122,9 @@ const isGamma = (e) => Object.prototype.hasOwnProperty.call(e, 'clobTokenIds')
   || Object.prototype.hasOwnProperty.call(e, 'conditionId');
 
 /**
- * One entry of the markets file -> a generic market record, or `{ why }`.
- *
- * An entry is a generic record, a Gamma market object, or a generic record
- * carrying the Gamma object under `gamma` (explicit fields win for identity;
- * BOTH count as resolution evidence and must agree).
+ * Normalise a markets entry, or return {why}. Accept a generic record,
+ * a Gamma object, or a record with a nested gamma object. Explicit identity
+ * fields take precedence; resolution evidence from both sources must agree.
  */
 export function genericRecord(entry) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return { id: null, why: 'entry is not an object' };
@@ -331,8 +312,7 @@ export class FrameRouter {
     const payload = obj.payload && typeof obj.payload === 'object' && !Array.isArray(obj.payload) ? obj.payload : obj;
     const type = obj.event_type ?? payload.event_type;
 
-    // Which market. Every identifier the row carries must agree; one that names
-    // a market we do not know, next to one we do, is a row we cannot trust.
+    // Require all supplied market identifiers to agree and be recognised.
     const ids = [];
     let unknown = false;
     const name = (v, lookup) => {
@@ -480,7 +460,7 @@ export class FrameRouter {
     st.buf.push(JSON.stringify(ev));
   }
 
-  /** Lines buffered for `id`, handed over and forgotten. */
+  /** Return and clear buffered lines for id. */
   take(id) {
     const st = this.state.get(id);
     const out = st.buf;
@@ -567,8 +547,7 @@ export async function readMarketsFile(root) {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Sorting one market's spooled events by (ts, seq), in bounded memory.
+// Sort a market's spooled events by (ts, seq) in bounded memory.
 
 const cmpEv = (a, b) => (a.ts_ms - b.ts_ms) || (a.seq - b.seq);
 
@@ -616,9 +595,8 @@ async function* mergeRuns(files) {
 }
 
 /**
- * One market's events in (ts, seq) order. At most SORT_RUN events are held at
- * once; beyond that, sorted runs are written next to the spool and merged,
- * MERGE_FANIN files at a time.
+ * Sort one market by (ts, seq), holding at most SORT_RUN events per run.
+ * Larger markets use sorted scratch runs merged MERGE_FANIN files at a time.
  */
 export async function* sortedEvents(file, count, { runSize = SORT_RUN, fanIn = MERGE_FANIN } = {}) {
   if (count <= runSize) {
@@ -673,21 +651,14 @@ export async function* sortedEvents(file, count, { runSize = SORT_RUN, fanIn = M
   }
 }
 
-// ---------------------------------------------------------------------------
-// Valuation state: what the external market said, never what the engine did.
+// Valuation from external market data, independent of simulated fills.
 
 /**
- * The external quote per token: what the venue last STATED as best bid and best
- * ask, and when — from market data only, never the engine's own book.
- *
- * Processed in input order, one event at a time, so "which came later" is the
- * input's answer even inside a millisecond. A bbo row states both prices. A
- * snapshot restates the token's book. A delta changes the quote only when it
- * touches it — a price at or better than the current best — and then the quote
- * is the book's new top, stated at that event; a change deeper in the book
- * says nothing about the top and leaves its time alone. A quote's age is the
- * time since the OLDER of its two sides was stated: conservative on purpose,
- * because an old price valued as current flatters the strategy.
+ * Track external best bids, asks and quote times in input order.
+ * BBO states both prices; snapshots replace the token's book. Deltas refresh
+ * the quote only at or better than the current best, using the new book top.
+ * Deeper changes leave quote times unchanged. Quote age uses the older side
+ * to avoid treating a stale price as current.
  */
 export class QuoteState {
   constructor() {
@@ -812,7 +783,7 @@ export function resolutionOf(rec, frame) {
   };
 }
 
-/** The record a strategy is NOT allowed to see before settlement, private fields included. */
+/** Settlement record with private fields, hidden from strategies until settlement. */
 function finalRecord(rec, { start, tradeUntil, resolution }) {
   const { evidence, start_ts_ms: _s, ...rest } = rec;
   return {
@@ -920,8 +891,8 @@ export async function decodeGeneric({ entries, frames = null, feed = null, event
     const openWindow = async () => {
       opened = true;
       if (!preBook) return;
-      // The book as it stood when the window opens: one snapshot of both tokens,
-      // replayed AT `start`. Its quote times stay in QuoteState, untouched.
+      // Replay the opening book as a two-token snapshot at start.
+      // Preserve the original quote times in QuoteState.
       await emit({ kind: 'book', ts_ms: start, snapshot: true, synthetic: true, levels: bookLevels(pre), seq: -1, recv_ts_ms: null });
     };
     for await (const ev of sortedEvents(raw, st.n)) {
@@ -969,7 +940,10 @@ export async function decodeGeneric({ entries, frames = null, feed = null, event
   return { markets: out, unusable, counts: { ...router.counts, ...dropped } };
 }
 
-/** Can order_rules "venue" read this market's tick and minimum? MUST MATCH rules_readable in generic.py. */
+/**
+ * Check whether venue order_rules can read tick size and minimum order size.
+ * Keep in sync with rules_readable in client/backtest/generic.py.
+ */
 export function rulesReadable(rec) {
   const tick = rec.tick_size;
   const min = rec.min_size;

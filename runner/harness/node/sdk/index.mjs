@@ -1,28 +1,12 @@
-// The SDK surface a submitted Node.js strategy imports.
-//
-// The mirror of runner/harness/python/outcometick.py, and it has to exist as a
-// resolvable PACKAGE rather than a file beside the harness: the docs, the
-// editor sample and the analyser all say
-//
-//     import { Strategy, Order } from "outcometick";
-//
-// and Node resolves that by walking node_modules upward from the strategy's own
-// directory. Without a package the documented form fails at load time inside
-// the sandbox — accepted by the validator, then rejected after queueing, which
-// is the worst place to find out.
-//
-// Deliberately tiny. Everything a strategy can actually DO arrives through
-// `ctx`, which the runner constructs; there is nothing here to reach out with.
+// Node.js strategy SDK. Keep in sync with runner/harness/python/outcometick.py.
+// Packaged as outcometick so imports resolve from the strategy directory.
+// The runner provides execution methods through ctx.
 
 export const SIDES = Object.freeze(['UP', 'DOWN']);
 
 /**
- * Base class for a submitted strategy.
- *
- * The hooks are not defined here on purpose. A default no-op `onTick` would
- * turn "you declared a hook you did not implement" — a rejection fixable in
- * seconds — into a run that quietly never trades and bills for an empty equity
- * curve.
+ * Base class for submitted strategies.
+ * Hooks have no defaults, so missing declared hooks are rejected.
  */
 export class Strategy {
   /** Params from the manifest, injected by the runner before the first hook. */
@@ -30,41 +14,21 @@ export class Strategy {
 }
 
 /**
- * An order a hook returns. Never sent — returned, and matched by the runner
- * against the depth that was actually resting at that millisecond.
- *
- * `limit` is a bound in whichever direction protects you: a ceiling when
- * opening, a floor when reducing.
+ * An order returned by a hook for simulated execution.
+ * limit is a ceiling when opening and a floor when reducing.
  */
 export class Order {
   constructor({ side, size, notional = null, limit = null, holdS = null, hold_s = null,
     reduceOnly = false, reduce_only = false, tif = 'ioc', tag = null,
     postOnly = false, post_only = false, clientId = null, client_id = null } = {}) {
-    // "UP" / "DOWN", or — on your own data for any binary market — one of the
-    // market's outcome labels ("Yes", "No", a team name). The runner checks
-    // the label against the market and stops the run on one it does not have.
+    // Accept UP/DOWN or a generic-market outcome label; the runner validates the label.
     if (!SIDES.includes(side) && !(typeof side === 'string' && side.trim() !== '')) {
       throw new Error(`side must be "UP", "DOWN" or an outcome label, got ${JSON.stringify(side)}`);
     }
-    // Both spellings accepted: the docs use holdS in the Node examples and
-    // hold_s is the wire field. Neither should be a trap.
+    // Accept the SDK and wire spellings.
     const hold = holdS ?? hold_s;
-    // SIZING IN MONEY — this is about the `notional` field, converted here
-    // rather than in the engine. `size` is CONTRACTS (see OrderSizing in
-    // index.d.ts); it is not money, and reading this heading as if it were
-    // is the one wrong turn this comment can cause.
-    //
-    // Position sizing is nearly always a budget, not a contract count, and the
-    // conversion has exactly one honest divisor: your own limit. A contract
-    // costs whatever it fills at, and a marketable order walks the book — so
-    // dividing by the current best price overspends the moment there is any
-    // slippage, by an amount nobody stated. Dividing by the limit is the price
-    // you have already said you will not exceed, which makes "spend at most
-    // this much" true rather than approximately true.
-    //
-    // Hence: `notional` REQUIRES `limit`. Without one there is no upper bound
-    // on the fill price, so "spend $80" has no answer, and picking one for the
-    // caller would be inventing a number they never wrote.
+    // size is in contracts. Convert notional using the limit to bound opening
+    // spend when the order walks the book. A notional order requires a limit.
     if (notional != null) {
       if (size != null) {
         throw new Error('give size or notional, not both — they answer the same question two ways');
@@ -79,7 +43,7 @@ export class Order {
       if (!(Number.isFinite(px) && px > 0)) {
         throw new Error(`notional needs a limit above 0, got ${JSON.stringify(limit)}`);
       }
-      // FLOOR, so the spend is at most the budget rather than around it.
+      // Round down to stay within the notional budget.
       const derived = Math.floor(notional / px);
       if (derived < 1) {
         throw new Error(`notional ${notional} buys no contracts at limit ${px}`);
@@ -90,16 +54,10 @@ export class Order {
     if (!(typeof size === 'number' && Number.isFinite(size) && size > 0)) {
       throw new Error(`size must be a positive number, got ${JSON.stringify(size)}`);
     }
-    // A NUMBER, matching the engine. `Number('0.5')` is 0.5, `Number([0.5])`
-    // is 0.5 and `Number(true)` is 1 — while Python's `float([0.5])` raises,
-    // so the same published SDK accepted a list in one language and threw in
-    // the other. Coercion is not validation, and the two languages do not
-    // coerce alike.
+    // Require a numeric limit; JS and Python coercions differ.
     if (limit != null
       && !(typeof limit === 'number' && Number.isFinite(limit) && limit >= 0 && limit <= 1)) {
-      // A binary outcome token trades between 0 and 1. A limit outside that is
-      // not a price, and silently clamping it would fill an order the strategy
-      // never asked for.
+      // Binary token prices are in [0, 1]; reject rather than clamp.
       throw new Error(`limit must be between 0 and 1, got ${JSON.stringify(limit)}`);
     }
     // fok: all of it within the limit on arrival, or none of it. The run must
@@ -110,7 +68,7 @@ export class Order {
     const postOnlyFlag = Boolean(postOnly || post_only);
     const cid = clientId ?? client_id;
     if (tif === 'gtc') {
-      // A resting order rests AT a price; without one there is nothing to queue.
+      // Resting orders require a limit price.
       if (limit == null) throw new Error('a gtc order needs a limit — the price it rests at');
       if (hold != null) throw new Error('hold_s is not supported on gtc orders; exit with a reduce_only order');
     } else if (postOnlyFlag || cid != null) {

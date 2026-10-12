@@ -1,12 +1,4 @@
-// Turning a run's trades and fills into the report.
-//
-// Every panel here exists to make the data's value visible, not the strategy's.
-// Calibration, latency and slippage are the three that most often kill a
-// promising curve, and they are on by default for exactly that reason — a
-// backtest that only showed an equity line would be flattering by omission.
-//
-// Nothing in this module can see the strategy. It reads the trade and fill logs
-// the engine produced, so a report cannot be tuned by the thing it is judging.
+// Build reports from engine trade and fill logs, without access to strategy state.
 
 import { contractValue, FEE_MODEL_PM } from './portfolio.mjs';
 
@@ -25,34 +17,18 @@ function stdev(xs) {
   return Math.sqrt(sum(xs.map((x) => (x - m) ** 2)) / (xs.length - 1));
 }
 
-/** Round for reporting only — never for arithmetic that feeds another number. */
+/** Round for reporting only; never for arithmetic that feeds another number. */
 const r2 = (x) => (Number.isFinite(x) ? Number(x.toFixed(2)) : null);
 const r4 = (x) => (Number.isFinite(x) ? Number(x.toFixed(4)) : null);
 const r6 = (x) => (Number.isFinite(x) ? Number(x.toFixed(6)) : null);
 
-/**
- * Collateral a trade tied up: contracts times the price paid.
- *
- * The denominator for return-on-collateral. Using notional-at-settlement
- * instead would flatter cheap entries, which is the opposite of what this
- * report is for.
- */
+/** Entry collateral (size × entry price), the return-on-collateral denominator. */
 const collateralOf = (t) => (t.entry_px ?? 0) * (t.size ?? 0);
 
 /**
- * The most money this strategy had at risk AT ONE TIME.
- *
- * THE NUMBER THAT ANSWERS "how much do I need to run this", and the one this
- * report was missing. Summing every entry answers a different question: the
- * sample strategy opened 1,676 positions over fifteen days and never held more
- * than one, so its entries total $72,175 while it never needed more than $80.
- * Dividing a loss by the sum therefore reported −4.35% for a strategy that had
- * burned through its stake thirty-nine times over.
- *
- * Computed by sweeping the open/close events, so overlapping positions add up
- * and sequential ones do not. Trades with no timestamps are skipped rather
- * than assumed concurrent — an unknown that inflates the peak would make the
- * strategy look safer to fund than it is.
+ * Peak concurrent entry collateral, found by sweeping open/close events.
+ * Overlapping positions add; sequential positions reuse capital. Skip trades
+ * without timestamps rather than assuming concurrency.
  */
 function peakCapital(trades) {
   const events = [];
@@ -75,12 +51,11 @@ function peakCapital(trades) {
   return peak;
 }
 
-/** Share of the run's span with a position open. Money idle is money wasted. */
+/** Fraction of the run's span with a position open. */
 function holdingRatio(trades) {
   const withTimes = trades.filter((t) => t.opened_ms != null && t.closed_ms != null);
   if (withTimes.length === 0) return null;
-  // A loop, not Math.min(...rows): one argument per trade throws RangeError
-  // somewhere past ~100k, which is a normal trade count for a busy strategy.
+  // Avoid spread arguments: trade counts above ~100k can exceed the call limit.
   let first = Infinity;
   let last = -Infinity;
   for (const t of withTimes) {
@@ -104,14 +79,11 @@ function holdingRatio(trades) {
 }
 
 /**
- * Headline metrics — the twelve cells at the top of the report.
+ * Headline report metrics.
  */
 export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
-  // In CLOSE order. "Longest losing streak" is a statement about a sequence in
-  // time, and `trades` arrives in whatever order the worker flushed markets —
-  // roughly chronological, but not guaranteed, and a run that sharded would
-  // report a streak that never happened.
+  // Losing streaks require close-time order; shard flush order is not reliable.
   const pnls = [...closed]
     .sort((a, b) => (a.closed_ms ?? 0) - (b.closed_ms ?? 0))
     .map((t) => t.pnl);
@@ -125,7 +97,7 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
   const equity = equityCurve(closed);
   const dd = maxDrawdown(equity.map((p) => p.equity));
 
-  // Sharpe over per-day PnL, annualised at 365 — these markets settle every
+  // Sharpe over per-day PnL, annualised at 365; these markets settle every
   // day of the week, so a 252-day year would overstate it.
   const byDay = new Map();
   for (const t of closed) {
@@ -136,7 +108,7 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
   const sd = stdev(daily);
   const sharpe = sd === 0 ? null : (mean(daily) / sd) * Math.sqrt(365);
   // Sortino: the same daily P&L, scored against its downside only (target 0,
-  // over every day). MUST MATCH metrics in client/backtest/report.py.
+  // over every day). Keep in sync with metrics in client/backtest/report.py.
   let downSq = 0;
   let winningDays = 0;
   let bestDay = null;
@@ -157,14 +129,10 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
   return {
     net_pnl: r2(netPnl),
     win_rate: closed.length ? r4(wins.length / closed.length) : null,
-    // Gross profit over gross loss. Undefined rather than Infinity when there
-    // were no losses — a number that cannot be compared is worse than a blank.
+    // Profit factor is undefined when there are no losses.
     profit_factor: losses.length ? r2(sum(wins) / Math.abs(sum(losses))) : null,
-    // Absolute dollars is the headline figure, because a PERCENTAGE needs a
-    // capital base we were never told. Measuring against the running peak — the
-    // textbook definition — reports -171% for a curve that went +50 then -35,
-    // which is arithmetically true and useless. The percentage is still
-    // published, defined against the running peak, for anyone who wants it.
+    // Absolute drawdown needs no starting capital. Also report percentage
+    // drawdown relative to the running peak.
     max_drawdown: dd.pct == null ? null : r4(dd.pct),
     max_drawdown_abs: r2(dd.abs),
     sharpe: sharpe == null ? null : r2(sharpe),
@@ -177,32 +145,18 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
     best_day: bestDay == null ? null : r2(bestDay),
     worst_day: worstDay == null ? null : r2(worstDay),
     trades: closed.length,
-    // Distinct markets the strategy actually took a position in. The engine
-    // does not stop a strategy trading a market twice, so `trades / markets`
-    // is only an entry rate for strategies that enter once — this one is an
-    // entry rate for all of them, and equals `trades` in the common case.
+    // Count distinct entered markets, including strategies with repeated entries.
     markets_traded: new Set(closed.map((t) => t.market_id)).size,
-    // Net P&L over the SUM of every entry — "for each dollar traded, how much
-    // was made". Renamed on the page to say that, because "return on capital"
-    // reads as an account return and is not one: the same stake recycled a
-    // thousand times makes this number a thousand times smaller than what
-    // happened to the money.
+    // Return per dollar of entry collateral traded, including recycled stakes.
     return_on_collateral: collateral > 0 ? r4(netPnl / collateral) : null,
-    // THE ACCOUNT NUMBER. Net P&L over the most that was ever at risk at once,
-    // which is what someone funding this strategy actually has to put up.
+    // Return relative to peak concurrent collateral.
     peak_capital: r2(peak),
     return_on_peak: peak > 0 ? r4(netPnl / peak) : null,
-    // How much of the run had a position open. The sample strategy is in the
-    // market 13% of the time, which is the other half of why the two return
-    // figures differ by three orders of magnitude.
+    // Fraction of run time with an open position.
     holding_ratio: hold == null ? null : r4(hold),
-    // Cents of edge per contract: what the outcome was worth minus what was
-    // paid, averaged. This is the number that says whether there was an edge
-    // at all, as opposed to a lucky run of variance.
+    // Size-weighted realised edge per contract, in cents.
     edge_per_contract: closed.length ? r4(edgePerContract(closed)) : null,
-    // The same edge with every settled trade counting once, whatever its
-    // size. The two can have opposite signs: a few large losing trades and
-    // many small winners.
+    // Unweighted settled-trade edge can differ in sign from size-weighted edge.
     edge_per_trade: edgePerTrade(closed),
     brier_score: r4(brier(closed)),
     fees: r2(-Math.abs(feesPaid)),
@@ -214,13 +168,9 @@ export function metrics(trades, { feesPaid = 0, days = 1 } = {}) {
 }
 
 /**
- * Mean realised edge per contract, in dollars.
- *
- * A binary token bought at p is worth 1 if its side settles and 0 otherwise
- * (0.5 on a TIE — `contractValue`), so the edge on one contract is
- * (outcome - p). Only settled trades carry an outcome; a trade closed early is
- * edge against the market, not against the truth, and is excluded rather than
- * scored as if it had settled.
+ * Mean realised edge per contract in dollars: outcome value minus entry price.
+ * Values are 1/0 (0.5 for TIE). Exclude early exits: their realised prices
+ * measure an exit against the market, not the settlement outcome.
  */
 export function edgePerContract(trades) {
   const settled = trades.filter((t) => t.how === 'settled' && t.entry_px != null && t.outcome);
@@ -255,23 +205,15 @@ export function brier(trades) {
   }));
 }
 
-/**
- * The most equity points the report carries; the archive's equity.csv has all.
- * report.json is stored in Postgres, served by the API and drawn by the page,
- * so anything in it that grows with the trade count is a ceiling on how much a
- * strategy may trade. 400k trades made a ~100MB curve on its own.
- */
+/** Cap report equity points; equity.csv retains the full curve. */
 export const EQUITY_MAX_POINTS = 2000;
 
 /** How many trades the report shows as a preview; trades.csv has all. */
 export const TRADES_HEAD = 20;
 
 /**
- * Thin a curve to at most `max` points without hiding its extremes.
- *
- * Min and max of each bucket, in their original order, plus both ends. A plain
- * stride would step over the trough and the drawn curve would show a smaller
- * drawdown than the metric printed above it.
+ * Keep bucket minima and maxima in original order plus both endpoints.
+ * A fixed stride could omit drawdown troughs. Output is bounded by max.
  */
 export function downsampleEquity(points, max = EQUITY_MAX_POINTS) {
   if (points.length <= max) return points;
@@ -303,12 +245,8 @@ export function equityCurve(trades) {
 }
 
 /**
- * Peak-to-trough decline.
- *
- * Expressed against the running peak, so a drawdown early in a run is not
- * diluted by profits that had not happened yet. A curve that never reaches a
- * positive peak reports the absolute decline and a null percentage rather than
- * dividing by something near zero and printing -4000%.
+ * Peak-to-trough decline relative to the running peak. Without a positive
+ * peak, return absolute decline and a null percentage.
  */
 export function maxDrawdown(series) {
   let peak = 0;
@@ -335,13 +273,7 @@ export function worstLosingRun(pnls) {
   return worst;
 }
 
-/**
- * Calibration: what you paid, against what actually settled.
- *
- * The panel this feeds is the one that separates edge from variance. Buckets
- * where the realised rate sits above the price paid are where the money came
- * from; everywhere else is a good equity curve wearing variance.
- */
+/** Calibration of entry prices against realised settlement rates. */
 export function calibration(trades) {
   const settled = trades.filter((t) => t.how === 'settled' && t.entry_px != null && t.outcome);
   return CALIBRATION_BUCKETS.map(([lo, hi]) => {
@@ -362,29 +294,14 @@ export function calibration(trades) {
   }).filter(Boolean);
 }
 
-/**
- * Naive baselines over the same markets, at the SAME SIZE the strategy traded.
- *
- * The size matters or the panel is meaningless: a baseline priced at one
- * contract sitting next to a strategy that traded five hundred compares two
- * different quantities and makes the strategy look several hundred times
- * better than it is. The caller passes the strategy's average trade size.
- *
- * Not decoration: if a strategy cannot beat buying the favourite, no parameter
- * sweep is going to save it, and the customer should find that out here rather
- * than after a month of subscription.
- */
+/** Baselines on the same markets, using the strategy's average trade size. */
 export function baselines(marketSummaries, { size = 1 } = {}) {
   const out = { always_up: 0, always_down: 0, always_favourite: 0 };
   for (const m of marketSummaries) {
     if (!m.outcome || m.up_px == null || m.down_px == null) continue;
     out.always_up += (contractValue('UP', m.outcome) - m.up_px) * size;
     out.always_down += (contractValue('DOWN', m.outcome) - m.down_px) * size;
-    // The favourite is the side the market thinks is MORE likely, and on a
-    // binary market the price IS the implied probability — so it is the DEARER
-    // side, not the cheaper one. This was inverted: the panel labelled "always
-    // buy the favourite" was actually buying the underdog every time, which
-    // handed customers a backwards comparison to judge their strategy against.
+    // The favourite is the higher-priced outcome (higher implied probability).
     const favSide = m.up_px >= m.down_px ? 'UP' : 'DOWN';
     const favPx = Math.max(m.up_px, m.down_px);
     out.always_favourite += (contractValue(favSide, m.outcome) - favPx) * size;
@@ -397,19 +314,9 @@ export function baselines(marketSummaries, { size = 1 } = {}) {
 }
 
 /**
- * Fill quality against the depth that was resting.
- *
- * `quoted_px` is the price on the screen when the order was sent and `avg_px`
- * is what it actually cost. The gap is the slippage, and the unfilled remainder
- * is the size the book never had.
- */
-/**
- * The slippage panel, fed one fill at a time.
- *
- * Streaming because the worker no longer holds the fill log in memory — it can
- * be millions of rows, and the panel needs a handful of counters plus one
- * number per filled order for the percentiles. `slippage(fills)` below is the
- * same accumulator over an array, so there is one definition of the panel.
+ * Streaming taker slippage: avg_px against decision-time quoted_px, plus
+ * unfilled size. Retain counters and one value per filled order for percentiles.
+ * slippage(fills) uses the same accumulator for array input.
  */
 export function slippageAccumulator() {
   let orders = 0;
@@ -419,16 +326,13 @@ export function slippageAccumulator() {
   let cost = 0;
   let unfilledSize = 0;
   let requestedSize = 0;
-  // Float64Array, grown by doubling and sorted in place: 8 bytes per filled
-  // order, off the V8 heap (so it does not compete with the trades for the
-  // heap limit), and no second copy for the sort. A plain array plus a sorted
-  // copy was the one per-fill cost left once the fills moved to disk.
+  // Grow a Float64Array by doubling: 8 bytes per fill outside the V8 heap,
+  // sorted in place without a second copy.
   let slips = new Float64Array(1024);
   let n = 0;
   return {
     add(f) {
-      // Maker fills are at the order's own price by definition: there is no
-      // quote to slip from, and counting them would dilute the panel.
+      // Maker fills have no touch-price slippage; exclude them from this panel.
       if (f.action !== 'open' || f.liquidity === 'maker') return;
       orders += 1;
       if (f.filled > 0 && f.levels_walked === 1) atQuote += 1;
@@ -481,7 +385,7 @@ export function slippage(fills) {
 /**
  * The fill-derived half of the maker block, fed one fill at a time: queue
  * position and time in queue per maker fill, markouts weighted by size.
- * MUST MATCH maker_fill_accumulator in client/backtest/report.py.
+ * Keep in sync with maker_fill_accumulator in client/backtest/report.py.
  */
 export const MARKOUT_KEYS = Object.freeze([
   ['1s', 'markout_1s'], ['10s', 'markout_10s'], ['60s', 'markout_60s'], ['settle', 'markout_settle'],
@@ -543,16 +447,10 @@ export function fillStats(fills) {
 }
 
 /**
- * The maker block: how resting orders fared, and how they are modelled.
- *
- * `stats` are the engine's counters (summed over markets by the harness);
- * `fills` is makerFillAccumulator().result(). Null when the strategy never
- * submitted a resting order — the block describes resting orders, and an
- * empty one would read as "tried and never filled".
- *
- * The model's name and its lag constant ride along for the same reason
- * fee_model does: a forwarded report must say how its fills were produced.
- * MUST MATCH maker_report in client/backtest/report.py.
+/**
+ * Maker report from summed engine stats and makerFillAccumulator().result().
+ * Null if no resting orders were submitted. Include model and lag assumptions.
+ * Keep in sync with maker_report in client/backtest/report.py.
  */
 export function makerReport({ stats, fills, queueModel, queueProb = null, printLagMs }) {
   if (!stats || !(stats.submitted > 0)) return null;
@@ -560,7 +458,7 @@ export function makerReport({ stats, fills, queueModel, queueProb = null, printL
   const f = fills ?? makerFillAccumulator().result();
   return {
     queue_model: queueModel,
-    // Phase 2c: the probability function behind queue_model, only when one was used.
+    // Include the probability function when a queue model was selected.
     ...(queueProb ? { queue_prob: { prob: queueProb.prob, n: queueProb.n ?? null } } : {}),
     print_lag_ms: printLagMs,
     orders: {
@@ -582,7 +480,7 @@ export function makerReport({ stats, fills, queueModel, queueProb = null, printL
       maker_filled: r2(stats.maker_filled_size),
       taker_on_arrival: r2(stats.taker_on_arrival_size),
     },
-    // Of what rested, how much the queue model filled — by size and by order.
+    // Of what rested, how much the queue model filled; by size and by order.
     fill_rate_size: rate(stats.maker_filled_size, stats.rested_size),
     fill_rate_orders: rate(stats.orders_with_maker_fill, stats.rested),
     maker_fills: f.fills,
@@ -592,9 +490,7 @@ export function makerReport({ stats, fills, queueModel, queueProb = null, printL
     markout: Object.fromEntries(Object.entries(f.markout).map(([k, m]) => [k, {
       mean: r4(m.mean), fills: m.fills, size: r2(m.size),
     }])),
-    // What the model declined to fill, said out loud: volume that reached an
-    // order inside its entry window, and how often the archive's book crossed
-    // a resting order without a print to fill it.
+    // Entry-window suppressed volume and crossing-book episodes without prints.
     lag_suppressed_size: r2(stats.lag_suppressed_size),
     crossed_observations: stats.crossed_observations,
   };
@@ -603,7 +499,7 @@ export function makerReport({ stats, fills, queueModel, queueProb = null, printL
 /**
  * The report's `orders` block: which execution options the run used, what they
  * refused, and the rebate estimate. Null when the run enabled none.
- * MUST MATCH orders_report in client/backtest/report.py.
+ * Keep in sync with orders_report in client/backtest/report.py.
  */
 export function ordersReport({ policy, stats }) {
   if (!policy || (!policy.fok && !policy.order_rules && policy.maker_rebate == null
@@ -658,11 +554,9 @@ export const MARKET_COLUMNS = Object.freeze([
 ]);
 
 /**
- * One row per market the run replayed — including every market the strategy
- * never entered, which a per-trade file cannot show and which any
- * market-level statistic (a confidence interval over markets, a permutation
- * test on outcomes) needs. In the order the run listed its markets.
- * MUST MATCH market_rows in client/backtest/report.py.
+ * One row per replayed market, entered or not, in market-list order. Includes
+ * unentered markets for market-level confidence intervals and permutation tests.
+ * Keep in sync with market_rows in client/backtest/report.py.
  */
 export function marketRows(trades, marketMeta = new Map()) {
   const byMarket = new Map();
@@ -710,12 +604,7 @@ export function marketRows(trades, marketMeta = new Map()) {
   return rows;
 }
 
-/**
- * Results by settlement rule (the stream each market settles on). Markets on
- * different rules are different games — a strategy tuned on the instantaneous
- * stream says little about a TWAP market — so they are reported side by side
- * and never only blended. Built from marketRows; sorted by rule.
- */
+/** Report settlement streams separately, built from marketRows and sorted by rule. */
 export function bySettlement(rows, trades) {
   const rule = new Map(rows.map((r) => [r.market_id, r.settlement ?? 'unknown']));
   const groups = new Map();
@@ -753,7 +642,7 @@ export function bySettlement(rows, trades) {
 
 /**
  * Trading activity off the fill log, one fill at a time: contracts and dollars
- * that changed hands, taker and maker. MUST MATCH ActivityAccumulator in
+ * that changed hands, taker and maker. Keep in sync with ActivityAccumulator in
  * client/backtest/report.py.
  */
 export function activityAccumulator() {
@@ -781,16 +670,12 @@ export function activityAccumulator() {
 export const RECORD_VALUATION = 'liquidation at the best bid; a leg with no bid counts 0; quotes are not checked for freshness';
 
 /**
- * The account's value on the record grid, from the per-instance samples the
- * harness wrote (engine.record_ms; see replay.mjs). Grid points are absolute,
- * so instances align: at each point an instance contributes nothing before its
- * first sample, then its latest sample at or before the point (its FINAL after
- * it ends). Built by one sweep over the samples in (ts, write order), adding
- * each instance's change to running sums.
- *
- * `maxRows` bounds samples + account points TOGETHER and is checked BEFORE a
- * point is built (W6): over it, the result is { truncated: true } and nothing
- * else. MUST MATCH account_series in client/backtest/report.py.
+ * Account series on an absolute record_ms grid. Each instance contributes zero
+ * before its first sample, then its latest sample at or before the point,
+ * retaining its final sample after it ends. Sweep in (ts, write order).
+ * maxRows bounds samples plus account points before allocation. Exceeding it
+ * returns {truncated:true, points:[]}.
+ * Keep in sync with account_series in client/backtest/report.py.
  */
 export function accountSeries(samples, recordMs, { maxRows = Infinity } = {}) {
   const n = samples.length;
@@ -879,22 +764,14 @@ export function recordReport({ samples, recordMs, harness, maxRows }) {
       max_position_value: r2(maxPos),
       mean_position_value: pts.length ? r2(sumPos / pts.length) : null,
     },
-    // Rounded where they are written out (record.csv, record_markets.csv,
-    // Result.record): money here has at most 5 decimals, so 6 keeps every one
-    // and drops float noise like -7.399999999999999. The block above is
-    // computed from the unrounded series.
+    // Round exported rows to 6 decimals to preserve 5-decimal money and
+    // remove float noise. Compute the block above from unrounded values.
     points: pts.map((p) => ({ ...p, value: r6(p.value), position_value: r6(p.position_value) })),
     samples: samples.map((x) => ({ ...x, cash: r6(x.cash), marked: r6(x.marked), position_value: r6(x.position_value) })),
   };
 }
 
-/**
- * The parameter sweep grid.
- *
- * Billed once per market-day, not per cell: the archive is decoded once and
- * every cell is evaluated against the same decoded stream. Charging per cell
- * would be charging for our CPU rather than for data scanned.
- */
+/** Arrange sweep-cell metrics on the x/y parameter grid. */
 export function sweepPanel(cells, { xParam, yParam, metric = 'sharpe' }) {
   const xs = [...new Set(cells.map((c) => c.params[xParam]))].sort((a, b) => a - b);
   const ys = [...new Set(cells.map((c) => c.params[yParam]))].sort((a, b) => a - b);
@@ -917,19 +794,10 @@ export function sweepPanel(cells, { xParam, yParam, metric = 'sharpe' }) {
 }
 
 /**
- * Which fees this report was computed under, and how many markets that
- * actually applied to.
- *
- * NOT DECORATION. Net PnL moves with the fee assumption more than with most
- * parameter changes, and a report forwarded without this block reads as
- * "fees included" whatever was used. So it names the mode, the model and its
- * rounding assumption, and counts the markets the venue schedule could not be
- * read for — those were charged nothing, and a reader has to be able to see
- * that rather than infer it.
- *
- * `markets` are the market records that were fed (each with its normalised
- * `fee`, see feeOf in events.mjs). MUST MATCH fee_model_report in
- * client/backtest/report.py.
+ * Fee policy, model, rounding assumptions and market schedule counts. Unknown
+ * venue schedules are charged zero and reported separately. markets contains
+ * replayed records with normalised fee data (feeOf in events.mjs).
+ * Keep in sync with fee_model_report in client/backtest/report.py.
  */
 export function feeModelReport({ policy, markets }) {
   const venue = policy?.mode !== 'bps';
@@ -944,7 +812,7 @@ export function feeModelReport({ policy, markets }) {
     mode: venue ? 'venue' : 'bps',
     bps: venue ? null : (Number.isFinite(policy?.bps) ? policy.bps : 0),
     model: venue ? FEE_MODEL_PM : null,
-    // The venue rounds per MATCH; the archive has book levels, not the maker
+    // The venue rounds per match; the archive has book levels, not the maker
     // orders inside them. See feeFor in portfolio.mjs.
     rounding: venue ? 'per book level taken, 5 decimals, ties up' : null,
     estimate: venue,
@@ -952,13 +820,7 @@ export function feeModelReport({ policy, markets }) {
   };
 }
 
-/**
- * Assemble the whole report.
- *
- * `coverage` is carried through untouched from the archive: which stream backed
- * each market-day, and where the gaps were. It is the part of the report that
- * makes the rest of it checkable, so it is never summarised away.
- */
+/** Assemble the report, preserving archive stream coverage and gaps unchanged. */
 export function buildReport({
   runId, submittedAt, manifest, scope, sourceSha256 = null,
   trades, fillStats: fillSummary, marketSummaries, marketMeta,
@@ -972,9 +834,7 @@ export function buildReport({
 
   return {
     run_id: runId,
-    // WHICH CODE PRODUCED THIS. The source itself is no longer in the archive
-    // — a report is a thing you forward to someone and the strategy is not —
-    // so this is what answers "which version of my strategy was this?".
+    // Strategy source digest for identifying the version used.
     source_sha256: sourceSha256,
     // Pre-registration: code + manifest + params + options + scope + seed, one
     // sha256 (api/lib/backtest-fingerprint.mjs). Null where it cannot be formed.
@@ -999,52 +859,37 @@ export function buildReport({
       markets_touched: new Set(closed.map((t) => t.market_id)).size,
       recompute_checks: crosschecks.length,
       recompute_matches: matched,
-      // Reported even when zero checks were made — a blank panel would read as
-      // "everything reconciled".
+      // Include mismatch count even when no checks ran.
       mismatches: crosschecks.length - matched,
     },
-    // NO FULL ROW ARRAYS. They made report.json grow with the trade count,
-    // and report.json is a Postgres jsonb value (hard cap ~256MB) that the API
-    // hands to the page. The rows live in trades.csv / fills.csv; the key is
-    // renamed rather than truncated in place so a reader of the old `trades`
-    // fails loudly instead of summing a preview as if it were the run.
+    // Bound JSON row previews; full rows live in trades.csv / fills.csv.
+    // trades_head distinguishes the preview from the full trades array.
     trades_head: closed.slice(0, TRADES_HEAD),
     rows: { trades: closed.length, fills: fillSummary.count, equity_points: equity.length },
     calibration: calibration(closed),
-    // Same markets, same sizing — the average size the strategy actually
-    // traded, so the comparison is like for like.
+    // Compare using the strategy's average trade size.
     baselines: baselines(marketSummaries ?? [], {
       size: closed.length ? closed.reduce((a, t) => a + (t.size ?? 0), 0) / closed.length : 1,
     }),
     split: splitByMarket(closed, marketMeta ?? new Map()),
-    // By settlement rule, every market counted (entered or not) — see bySettlement.
+    // By settlement rule, every market counted (entered or not); see bySettlement.
     by_settlement: bySettlement(marketRows(closed, marketMeta ?? new Map()), closed),
     // Contracts and dollars traded, from the fill log.
     activity: fillSummary.activity ?? null,
     // From the caller's pass over the fill log (fillStats / the worker's
     // streaming pass): the log itself is never handed to the report.
     slippage: fillSummary.slippage,
-    // THE DELAY THIS RUN WAS PRICED AT, not a comparison table.
-    //
-    // There used to be five extra replays at 100ms..2s, then one, and the
-    // panel that compared them. It is gone: a run now replays ONCE, at
-    // whatever delay the submitter asked for, which is both the fastest answer
-    // and the only one that is a measurement rather than an extrapolation.
-    //
-    // It has to be IN the report, because it changes every number in it and
-    // nothing else in here would tell a reader whether they are looking at a
-    // zero-latency run or a 250ms one.
+    // Execution delay used for this run's replay.
     fill_delay_ms: fillDelayMs,
     fee_model: feeModel,
     // Resting orders, when the strategy used any (makerReport).
     maker,
-    // Execution options and what they refused (ordersReport) — only when the
-    // run enabled any, so a run without them has the same bytes as always.
+    // Execution options and rejections, when enabled.
     ...(orders ? { orders } : {}),
     // Timers (on_timer): how many were set, fired, and dropped at the end of
-    // trading — only when the strategy declared the hook.
+    // trading; only when the strategy declared the hook.
     ...(timers ? { timers } : {}),
-    // The time-grid mark-to-market (record_ms) — only when the run asked for it.
+    // The time-grid mark-to-market (record_ms); only when the run asked for it.
     ...(record ? { record } : {}),
     // The spot dataset: how many markets had any spot value -- only when declared.
     ...(spot ? { spot } : {}),

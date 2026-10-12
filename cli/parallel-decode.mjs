@@ -1,28 +1,10 @@
-// spoolDay on several threads, for `ot run`: the same events files and the same
-// answer as the sequential spool (runner/spool-day.mjs), byte for byte.
-//
-//  1. CHUNKS. This thread reads and gunzips each file of the day ONCE (zlib
-//     runs on libuv's pool) and cuts it into ~4 MB chunks at line ends; each
-//     chunk is handed, without a copy, to one of n parse threads in turn. A
-//     parse thread splits a chunk into lines exactly as the sequential reader
-//     does (readline: \r\n, \n or a lone \r ends a line; trimmed; blank lines
-//     skipped; a CSV's header is its first non-blank line) and decodes each row.
-//     Every event goes, tagged (file, chunk, line, position in the row), to that
-//     thread's file for its market -- in order, since a thread's chunks arrive
-//     in order. The book throttle is STATEFUL per market and order-dependent, so
-//     it is not applied here: a row that consults it leaves a marker (position
-//     -1) carrying what it asked.
-//  2. MERGE. n threads each take a share of the markets and, one market at a
-//     time, merge its n files in the sequential order (file, chunk, line,
-//     position) while a fresh throttle made from the same spec replays the
-//     markers, dropping what the sequential run dropped. So only what the
-//     sequential spool keeps is ever held, one market per thread; each market is
-//     finished by finishSpooledMarket, the sequential spool's own second half.
-//
-// Anything unusual -- a row that throws, a thread that dies or cannot start, a
-// throttle that is not a fresh makeBookThrottle -- and the caller decodes the
-// day sequentially instead, so a malformed archive fails exactly as it does
-// without threads.
+// Parallel spoolDay with sequential event-file output.
+// 1. Read and gunzip once, split at line endings, then transfer chunks to parse
+//    threads. Records retain (file, chunk, line, row position) order. Stateful
+//    throttle calls are saved as position -1 markers.
+// 2. Merge each market in that order, replay throttle markers with a fresh gate,
+//    and finish it with finishSpooledMarket. Hold one market per merge thread.
+// Parsing, thread or throttle failures return control to sequential decoding.
 
 import { appendFileSync, createReadStream } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
@@ -57,8 +39,7 @@ export function defaultDecodeWorkers({ cores, totalBytes }) {
 /** Can this day be decoded on threads at all? */
 export function canSpoolInParallel({ workers, markets, throttle }) {
   if (!(workers > 1) || markets.size < 2) return false;
-  // Phase 2 rebuilds the gate from its spec, so it must be one that has not
-  // seen a row yet -- or none at all.
+  // Phase 2 needs an unused throttle with a reproducible spec, or no throttle.
   return throttle == null || (throttle.spec != null && throttle.untouched === true);
 }
 
@@ -137,10 +118,9 @@ function takeHeader(buf) {
 }
 
 /**
- * spoolDay's answer ({ out, unusable, bboSeen, bytes }), decoded on `workers`
- * threads, or null when the caller should decode sequentially instead -- after
- * ANY failure here, so the sequential spool is what reports a bad archive.
- * `chunkBytes` is there for the tests, which cut tiny chunks.
+ * Return spoolDay results ({out, unusable, bboSeen, bytes}) using workers
+ * threads. Return null on failure so sequential decoding can report archive
+ * errors. chunkBytes allows small chunks in tests.
  */
 export async function spoolDayParallel({
   day, markets, bySlug, throttle = null, eventsDir, feedPaths, root, workers, chunkBytes = CHUNK_BYTES, spot = false,
@@ -150,8 +130,7 @@ export async function spoolDayParallel({
   const ids = [...markets.keys()];
   const indexOf = Object.fromEntries(ids.map((id, i) => [id, i]));
   const threads = [];
-  // Every thread is in `threads` the moment it exists, so the finally below
-  // ends it whatever happened; a thread that cannot be made is a fallback.
+  // Track each started thread so finally can terminate it on every exit path.
   const start = (data) => {
     const t = startThread(data);
     threads.push(t);

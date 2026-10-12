@@ -1,23 +1,11 @@
-"""How a job is run: the loop between the job stream and the replay engine.
+"""Job loop shared by the sandbox harness and local Python backtests.
+Keep in sync with runner/harness/node/harness.mjs.
 
-Shared by the sandbox harness (harness.py, which owns stdin/stdout and loads
-the submitted file) and the pure-Python local backtest (outcometick.backtest,
-which hands over a class from a notebook and an in-memory stream). One loop, so
-a local run and a queued run cannot differ in how markets are framed, how the
-session portfolio is shared, how logs are prefixed or how the result is
-counted. The mirror of the loop in runner/harness/node/harness.mjs.
-
-The stream is the one the worker writes (runner/stdin-writer.mjs callers):
-
-  market mode    a header {market, stream, n, references?, series?, lags?}
-                 followed by exactly n event lines, per market.
-  session mode   {"open": {i, market, stream, references?, series?, lags?}},
-                 {"i": k, "e": <event>} and {"close": k}, in ONE time order
-                 across every market (runner/session-feed.mjs). Markets that
-                 overlap are replayed interleaved, so a strategy instance shared
-                 across them never sees a later moment of one before an earlier
-                 moment of another.
-"""
+Market mode: a header {market, stream, n, references?, series?, lags?}
+followed by n event lines per market.
+Session mode: {"open": {i, market, stream, references?, series?, lags?}},
+{"i": k, "e": <event>} and {"close": k}, interleaved in event-time order
+across markets (runner/session-feed.mjs)."""
 
 from __future__ import annotations
 
@@ -34,11 +22,10 @@ CHANNEL_TRADE = "t"
 CHANNEL_FILL = "f"
 CHANNEL_LOG = "l"
 CHANNEL_RESULT = "r"
-# "I have finished replaying market-day N." Display only, and the mirror of
-# CHANNEL.progress in protocol.mjs -- see the long note there. Both engines or
-# neither: runner/conformance compares them line by line.
+# Completed-market acknowledgement, for display only.
+# Keep in sync with CHANNEL.progress in protocol.mjs.
 CHANNEL_PROGRESS = "p"
-# The recorder -- CHANNEL.record, RECORD_FIELDS and the budgets in protocol.mjs
+# The recorder, CHANNEL.record, RECORD_FIELDS and the budgets in protocol.mjs
 # (a test pins the copies).
 CHANNEL_RECORD = "v"
 RECORD_FIELDS = ("key", "ts", "cash", "marked", "position_value", "final")
@@ -47,7 +34,7 @@ MAX_RECORD_BYTES = 256 * 1024 * 1024
 
 
 def _js_num(x) -> str:
-    """Number.prototype.toString() -- a copy of _number_to_string in
+    """Number.prototype.toString(), a copy of _number_to_string in
     client/backtest/_js.py (the harness imports nothing from outside runner/;
     a test pins the two). Record lines are written exactly as JavaScript writes
     them, so the byte budget cuts both engines at the same row."""
@@ -120,24 +107,20 @@ _SCAN = json.JSONDecoder().scan_once
 
 
 def _LOADS(s):
-    """json.loads, with the C scanner as a fast path.
+    """Parse JSON with the C scanner as a fast path.
 
-    json.loads wraps the scanner in two whitespace regex matches and a decode
-    call per line -- ~13 s of a BTC market-day. A line the scanner consumes
-    WHOLE, from index 0, is exactly what json.loads would return for it (the
-    default decoder, nothing before it, nothing after it); anything else goes
-    through json.loads itself, so every error and edge case is still its.
-    """
+    json.loads whitespace matching and decoding cost about 13 s per BTC
+    market-day in profiling. Use scanner output only when it consumes the
+    whole line from index 0; otherwise fall back to json.loads for its errors
+    and whitespace handling."""
     try:
         obj, end = _SCAN(s, 0)
     except (StopIteration, ValueError):
         return _JSON_LOADS(s)
     return obj if end == len(s) else _JSON_LOADS(s)
 
-# Our own JSON writer — the mirror of `stringify` in harness.mjs, and for the
-# same reason: the harness shares a process with the submitted code, so anything
-# reached through a module attribute at call time is reachable by the strategy
-# too. Nothing below looks anything up.
+# Captured JSON writer helpers avoid strategy-rebound module attributes.
+# Keep in sync with stringify in harness.mjs.
 _ESCAPES = {
     '"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r",
     "\t": "\\t", "\b": "\\b", "\f": "\\f",
@@ -185,7 +168,7 @@ TRADE_FIELDS = (
     "opened_ms", "closed_ms", "how", "outcome",
 )
 # Generic markets add these; archive rows never carry a label.
-# MUST MATCH GENERIC_TRADE_FIELDS in runner/harness/node/harness.mjs.
+# Keep in sync with GENERIC_TRADE_FIELDS in runner/harness/node/harness.mjs.
 GENERIC_TRADE_FIELDS = TRADE_FIELDS + (
     "label", "mark_px", "marked_size", "marked_pnl", "mark_source",
     "mark_ts_ms", "mark_age_ms", "mark_missing",
@@ -232,13 +215,13 @@ _NO_RESTING = "resting (gtc) orders are not available for this run"
 
 
 def engine_policy(job: dict):
-    """MUST MATCH enginePolicy in runner/harness/node/harness.mjs."""
+    """Keep in sync with enginePolicy in runner/harness/node/harness.mjs."""
     e = job.get("engine")
     return e if isinstance(e, dict) else None
 
 
 def engine_fill_fields(engine) -> tuple:
-    """MUST MATCH engineFillFields in runner/harness/node/harness.mjs."""
+    """Keep in sync with engineFillFields in runner/harness/node/harness.mjs."""
     if not engine:
         return ()
     out = ()
@@ -251,7 +234,7 @@ def engine_fill_fields(engine) -> tuple:
 
 def resting_policy(job: dict) -> dict:
     """The run's resting-order policy as the writer decided it; anything
-    malformed is "not allowed". MUST MATCH restingPolicy in the Node harness."""
+    malformed is "not allowed". Keep in sync with restingPolicy in the Node harness."""
     r = job.get("resting")
     if not isinstance(r, dict):
         return {"allowed": False, "refusal": _NO_RESTING, "cancelLatencyMs": 0}
@@ -265,7 +248,7 @@ def resting_policy(job: dict) -> dict:
 
 
 def _log_prefix(market: dict) -> str:
-    # Opening time first, then a short id -- MUST MATCH the Node harness.
+    # Opening time first, then a short id, Keep in sync with the Node harness.
     sid = str(market.get("market_id") or "")[:10]
     opened = market.get("open_ts_ms")
     if opened is None:
@@ -285,8 +268,7 @@ class _Market:
         self.clock = clock if clock is not None else {"t": float("-inf")}
         self.replay = None
         self.seen = 0
-        # The book as the ENGINE sees it, advanced by the same class, for the
-        # opening quotes the worker prices baselines off.
+        # Reconstruct opening quotes with the engine's Book for worker baselines.
         self.book = _Book(entry["market"]["market_id"])
         self.open_quotes = None
         self.feed_rows: dict = {}
@@ -304,13 +286,11 @@ class _Market:
             row = {k: v for k, v in ev.items() if k not in ("kind", "name")}
             self.rows_for(ev.get("name")).append(row)
             return False
-        # A spot value is quiet -- not counted as an event seen (harness.mjs).
+        # A spot value is quiet, not counted as an event seen (harness.mjs).
         if kind != "spot":
             self.seen += 1
-        # This book exists only to find the opening quotes, so it stops being
-        # kept once they are known: the replay keeps its own, and applying
-        # every event to both was a second book's worth of work per event.
-        # MUST MATCH observe() in runner/harness/node/harness.mjs.
+        # Stop maintaining this book once opening quotes are known; replay has its
+        # own book. Keep in sync with observe() in runner/harness/node/harness.mjs.
         if kind == "book" and self.open_quotes is None:
             if ev.get("snapshot"):
                 self.book.snapshot(ev.get("ts_ms") or 0, ev.get("levels") or {})
@@ -361,9 +341,9 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
     def log(text):
         emit(CHANNEL_LOG, text.replace("\n", " ").rstrip())
 
-    # The recorder -- see emitRecord in harness.mjs.
+    # The recorder, see emitRecord in harness.mjs.
     record = {"rows": 0, "bytes": 0, "truncated": False, "instance": 0} if engine and engine.get("record_ms") else None
-    # Counted where samples are made -- see recordBudget in harness.mjs.
+    # Counted where samples are made, see recordBudget in harness.mjs.
     record_budget = {"rows": 0, "limit": MAX_RECORD_ROWS, "truncated": False} if record is not None else None
 
     def emit_record(entry, rows):
@@ -398,7 +378,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
     def flush(pf: Portfolio, before: dict, market_id) -> None:
         for row in pf.trades[before["trades"]:]:
             emit(CHANNEL_TRADE, _DUMPS(project_row(row, GENERIC_TRADE_FIELDS if "label" in row else TRADE_FIELDS)))
-        # A session drain holds back maker rows of markets still open -- see
+        # A session drain holds back maker rows of markets still open, see
         # flush in the Node harness.
         held = []
         for row in pf.fills[before["fills"]:]:
@@ -480,7 +460,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             t = result.setdefault("timers", {"created": 0, "fired": 0, "dropped": 0})
             for k in ("created", "fired", "dropped"):
                 t[k] += out["timers"].get(k, 0)
-        # The spot dataset -- see `finished` in harness.mjs.
+        # The spot dataset, see `finished` in harness.mjs.
         if job.get("spot") is True:
             s = result.setdefault("spot", {"markets": 0, "markets_without": 0})
             if out.get("spot_seen", 0) > 0:
@@ -503,9 +483,8 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             flush(m.replay.pf, m.before, entry["market"]["market_id"])
             result["fees_paid"] += m.replay.pf.fees_paid
         else:
-            # Session: drain what the shared portfolio has written so far --
-            # its positions and running fee total stay -- so a long session
-            # holds one market's worth of rows, not the whole run's.
+            # Drain session logs without changing positions or accumulated fees,
+            # keeping emitted-row memory bounded.
             flush(shared, {"trades": 0, "fills": 0}, True)
 
     def rejected(m: _Market | None, err: Exception) -> int:
@@ -555,7 +534,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
                 except json.JSONDecodeError:
                     continue
                 if is_global:
-                    # MUST MATCH the Node harness: feed rows at stamp + lag.
+                    # Keep in sync with the Node harness: feed rows at stamp + lag.
                     if ev.get("kind") in ("ref", "ext"):
                         lag = lags.get(ev.get("name"))
                         ok = isinstance(lag, (int, float)) and not isinstance(lag, bool) and lag == lag
@@ -597,7 +576,7 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
 
 
 def run_due(markets, t, inclusive) -> None:
-    """MUST MATCH runDue in runner/harness/node/harness.mjs."""
+    """Keep in sync with runDue in runner/harness/node/harness.mjs."""
     if not isinstance(t, (int, float)) or isinstance(t, bool) or t != t:
         return
     while True:
@@ -616,7 +595,7 @@ def run_due(markets, t, inclusive) -> None:
 
 
 def advance_clock(clock, t) -> None:
-    """The run has reached `t`. MUST MATCH advanceClock in harness.mjs."""
+    """The run has reached `t`. Keep in sync with advanceClock in harness.mjs."""
     if clock is None or not isinstance(t, (int, float)) or isinstance(t, bool) or t != t:
         return
     if isinstance(t, float) and t.is_integer():
@@ -625,7 +604,7 @@ def advance_clock(clock, t) -> None:
         clock["t"] = t
 
 def _session_global(msg, active, ending, start, finished, rejected, clock):
-    """One session line under the global scheduler -- MUST MATCH sessionGlobal."""
+    """One session line under the global scheduler, Keep in sync with sessionGlobal."""
     def everyone():
         return [(m, k) for k, m in active.items()] + [(m, k) for k, m in ending.items()]
 
@@ -695,15 +674,14 @@ def _run_session(next_line, start, finished, rejected, log, is_global=False):
     cleanly with every market closed.
     """
     active: dict = {}
-    # Generic markets past `end` and before `close` -- see runSession.
+    # Generic markets past `end` and before `close`, see runSession.
     ending: dict = {}
-    # Global scheduler: ONE clock for every market of the session.
+    # Global scheduler: one clock for every market of the session.
     clock = {"t": float("-inf")}
 
     def settle_earlier(except_, ts):
-        """Before ANY hook at instant `ts` -- an opening, an event, a closing --
-        every other open market settles what it had scheduled strictly earlier.
-        MUST MATCH settleEarlier in runner/harness/node/harness.mjs."""
+        """Drain strictly earlier work in other markets before a hook at ts.
+        Keep in sync with settleEarlier in runner/harness/node/harness.mjs."""
         if not isinstance(ts, (int, float)) or isinstance(ts, bool) or ts != ts or ts in (float("inf"), float("-inf")):
             return
         for other in active.values():
