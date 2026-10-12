@@ -450,6 +450,8 @@ export class MarketReplay {
     this.pf = portfolio ?? new Portfolio({ feeBps, engine });
     this.pf.setMarketFee(this.marketId, market.fee ?? null);
     if (this.generic) this.pf.setMarketLabels(this.marketId, market.labels);
+    // Own data is not thinned: book_age counts archive markets only.
+    if (this.generic) this.pf.excludeBookAge(this.marketId);
     this.engine = engine;
     if (engine?.order_rules) this.pf.setMarketRules(this.marketId, marketRules(engine.order_rules, market));
     if (engine?.mirror_depth === 'shared'

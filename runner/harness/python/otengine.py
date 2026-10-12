@@ -201,6 +201,8 @@ class Ladder:
     def take(self, size: float, bound: float | None):
         cap = None if bound is None else to_ticks(float(bound))
         fills: list[dict[str, float]] = []
+        # When each consumed level was last set, parallel to fills (book_age).
+        level_ts: list = []
         remaining = float(size)
         notional = 0.0
         while remaining > 0 and self.levels:
@@ -210,12 +212,13 @@ class Ladder:
             take = min(remaining, level[1])
             px = from_ticks(level[0])
             fills.append({"px": px, "size": take})
+            level_ts.append(level[2])
             notional += px * take
             remaining -= take
             level[1] -= take
             if level[1] <= 0:
                 self.levels.pop(0)
-        return fills, remaining, notional
+        return fills, remaining, notional, level_ts
 
 
 class Book:
@@ -327,7 +330,7 @@ def match_order(book: Book, order: dict) -> dict:
     reducing = bool(order.get("reduce_only"))
     side = order.get("side")
     blank = {
-        "fills": [], "filled": 0.0, "unfilled": max(0.0, size),
+        "fills": [], "level_ts": [], "filled": 0.0, "unfilled": max(0.0, size),
         "notional": 0.0, "avg_px": None, "worst_px": None,
         "quoted_px": None, "reduce_only": reducing,
     }
@@ -336,12 +339,13 @@ def match_order(book: Book, order: dict) -> dict:
 
     ladder = book.ladders[side]["bids" if reducing else "asks"]
     quoted = ladder.best()
-    fills, remaining, notional = ladder.take(size, order.get("limit"))
+    fills, remaining, notional, level_ts = ladder.take(size, order.get("limit"))
     # Sum quantities taken rather than subtracting remaining from requested.
     # At float precision, 1e308 - 1000 is still 1e308. Keep in sync with book.mjs.
     filled = sum(f["size"] for f in fills)
     return {
         "fills": fills,
+        "level_ts": level_ts,
         "filled": filled,
         "unfilled": remaining,
         "notional": notional,
@@ -367,6 +371,30 @@ def floor_cents(x: float) -> float:
 def new_order_stats() -> dict:
     """Keep in sync with newOrderStats in portfolio.mjs."""
     return {"rejected": {}, "rebates": 0}
+
+
+# book_age bucket upper bounds in ms. Keep in sync with BOOK_AGE_BOUNDS_MS in portfolio.mjs.
+BOOK_AGE_BOUNDS_MS = (1000, 5000, 30000)
+
+
+def new_book_age() -> dict:
+    """Keep in sync with newBookAge in portfolio.mjs."""
+    return {"fills": 0, "size_micro": 0, "by_age_micro": [0, 0, 0, 0], "max_age_ms": 0}
+
+
+def _count_book_age(s: dict, ts, res: dict) -> None:
+    """Keep in sync with countBookAge in portfolio.mjs."""
+    s["fills"] += 1
+    for f, level_ts in zip(res["fills"], res["level_ts"]):
+        micro = js_round(f["size"] * 1e6)
+        age = max(0, ts - level_ts)
+        b = 0
+        while b < len(BOOK_AGE_BOUNDS_MS) and age >= BOOK_AGE_BOUNDS_MS[b]:
+            b += 1
+        s["by_age_micro"][b] += micro
+        s["size_micro"] += micro
+        if age > s["max_age_ms"]:
+            s["max_age_ms"] = age
 
 
 def round_fee(x: float) -> float:
@@ -431,7 +459,8 @@ class Leg:
 
 
 class Portfolio:
-    def __init__(self, fee_bps: float = 0, fees: dict | None = None, engine=None, order_stats=None) -> None:
+    def __init__(self, fee_bps: float = 0, fees: dict | None = None, engine=None, order_stats=None,
+                 book_age=None) -> None:
         # `fees` is the run's policy; absent, the legacy flat `fee_bps` is.
         self.fee_policy = fees if fees is not None else {"mode": "bps", "bps": float(fee_bps or 0)}
         self.market_fees: dict[str, dict | None] = {}
@@ -455,6 +484,12 @@ class Portfolio:
         self.mirrored: set = set()
         self.order_stats = order_stats if order_stats is not None else (new_order_stats() if engine else None)
         self.rule_reject = None
+        # Shared with the harness (new_book_age), or None. See portfolio.mjs.
+        self.book_age = book_age
+        self.book_age_excluded: set = set()
+
+    def exclude_book_age(self, market_id) -> None:
+        self.book_age_excluded.add(market_id)
 
     def set_market_rules(self, market_id, rules) -> None:
         self.market_rules[market_id] = dict(rules)
@@ -689,6 +724,8 @@ class Portfolio:
         if res["filled"] <= 0:
             self.fills.append(self._fill_row(ts, market_id, order, res, tag, 0.0, 0.0, order_id))
             return res
+        if self.book_age is not None and market_id not in self.book_age_excluded:
+            _count_book_age(self.book_age, ts, res)
 
         fee = fee_for(self.fee_policy, self.market_fees.get(market_id), res)
         realised = self._apply(market_id, order["side"], bool(order.get("reduce_only")),

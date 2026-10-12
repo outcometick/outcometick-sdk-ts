@@ -404,6 +404,8 @@ class MarketReplay:
         self.pf.set_market_fee(self.market_id, market.get("fee"))
         if self.generic:
             self.pf.set_market_labels(self.market_id, market.get("labels"))
+            # Own data is not thinned: book_age counts archive markets only (replay.mjs).
+            self.pf.exclude_book_age(self.market_id)
         self.engine = engine
         if engine and engine.get("order_rules"):
             self.pf.set_market_rules(self.market_id, market_rules(engine["order_rules"], market))

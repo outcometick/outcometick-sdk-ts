@@ -125,6 +125,8 @@ class Ladder {
   take(size, bound) {
     const cap = bound == null ? null : toTicks(bound);
     const fills = [];
+    // When each consumed level was last set, parallel to fills (book_age).
+    const levelTs = [];
     let remaining = size;
     let notional = 0;
     while (remaining > 0 && this.levels.length > 0) {
@@ -133,12 +135,13 @@ class Ladder {
       const take = Math.min(remaining, level.size);
       const px = fromTicks(level.ticks);
       fills.push({ px, size: take });
+      levelTs.push(level.ts);
       notional += px * take;
       remaining -= take;
       level.size -= take;
       if (level.size <= 0) this.levels.shift();
     }
-    return { fills, remaining, notional };
+    return { fills, remaining, notional, levelTs };
   }
 }
 
@@ -247,20 +250,21 @@ export class Book {
  */
 export function matchOrder(book, order) {
   const size = Number(order.size);
-  const blank = { fills: [], filled: 0, unfilled: Math.max(0, size || 0), notional: 0, avgPx: null, worstPx: null, quotedPx: null, reduceOnly: Boolean(order.reduce_only) };
+  const blank = { fills: [], levelTs: [], filled: 0, unfilled: Math.max(0, size || 0), notional: 0, avgPx: null, worstPx: null, quotedPx: null, reduceOnly: Boolean(order.reduce_only) };
   if (!isSide(order.side) || !(size > 0)) return blank;
 
   const reducing = Boolean(order.reduce_only);
   const ladder = reducing ? book.ladders[order.side].bids : book.ladders[order.side].asks;
   const quotedPx = ladder.best();
 
-  const { fills, remaining, notional } = ladder.take(size, order.limit ?? null);
+  const { fills, remaining, notional, levelTs } = ladder.take(size, order.limit ?? null);
   // Sum consumed sizes: subtraction from huge requests loses small fills
   // to float precision (1e308 - 1000 == 1e308). Keep in sync with otengine.py.
   const filled = fills.reduce((a, f) => a + f.size, 0);
 
   return {
     fills,
+    levelTs,
     filled,
     unfilled: remaining,
     notional,

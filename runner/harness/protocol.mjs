@@ -231,6 +231,18 @@ function parseOrderStats(raw) {
   return { rejected, rebates: finite(raw.rebates) ? raw.rebates : 0 };
 }
 
+/**
+ * A harness's book_age counters (newBookAge in engine/portfolio.mjs): finite
+ * non-negative numbers and four buckets, or null.
+ */
+function parseBookAge(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const n = (v) => (finite(v) && v >= 0 ? v : 0);
+  const by = Array.isArray(raw.by_age_micro) && raw.by_age_micro.length === 4 ? raw.by_age_micro.map(n) : null;
+  if (!by) return null;
+  return { fills: n(raw.fills), size_micro: n(raw.size_micro), by_age_micro: by, max_age_ms: n(raw.max_age_ms) };
+}
+
 /** A harness's summed maker counters: finite non-negative numbers, or null. */
 function parseMakerStats(raw) {
   if (!raw || typeof raw !== 'object') return null;
@@ -281,6 +293,7 @@ export function parseResult(raw) {
     budget: r.budget && typeof r.budget === 'object' ? r.budget : null,
     maker: parseMakerStats(r.maker),
     orders: parseOrderStats(r.orders),
+    bookAge: parseBookAge(r.book_age),
     timers: r.timers && typeof r.timers === 'object'
       ? { created: finite(r.timers.created) ? r.timers.created : 0, fired: finite(r.timers.fired) ? r.timers.fired : 0, dropped: finite(r.timers.dropped) ? r.timers.dropped : 0 }
       : null,

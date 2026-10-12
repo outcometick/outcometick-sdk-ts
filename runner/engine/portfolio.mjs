@@ -44,6 +44,29 @@ export const floorCents = (x) => Math.floor(x * 100 + 1e-9) / 100;
 export function newOrderStats() { return { rejected: {}, rebates: 0 }; }
 
 /**
+ * book_age: taker size by the age of the book level it consumed (fill time
+ * minus when that level was last set by a snapshot or delta). Bucket upper
+ * bounds in ms; the last bucket is open. Sizes are counted in integer
+ * millionths of a share so sums do not depend on order (parallel replay).
+ * Keep in sync with BOOK_AGE_BOUNDS_MS / new_book_age in otengine.py.
+ */
+export const BOOK_AGE_BOUNDS_MS = Object.freeze([1000, 5000, 30000]);
+export function newBookAge() { return { fills: 0, size_micro: 0, by_age_micro: [0, 0, 0, 0], max_age_ms: 0 }; }
+
+function countBookAge(s, ts, res) {
+  s.fills += 1;
+  for (let i = 0; i < res.fills.length; i++) {
+    const micro = Math.round(res.fills[i].size * 1e6);
+    const age = Math.max(0, ts - res.levelTs[i]);
+    let b = 0;
+    while (b < BOOK_AGE_BOUNDS_MS.length && age >= BOOK_AGE_BOUNDS_MS[b]) b++;
+    s.by_age_micro[b] += micro;
+    s.size_micro += micro;
+    if (age > s.max_age_ms) s.max_age_ms = age;
+  }
+}
+
+/**
  * Fee under {mode:'venue'} or flat notional {mode:'bps', bps}.
  * marketFee is {model:FEE_MODEL_PM, rate}, {model:'none'} for known zero,
  * or null for unknown. Unknown schedules are charged zero and counted.
@@ -95,7 +118,7 @@ export class Portfolio {
    *   fees is the run's fee policy (see feeFor). feeBps is the legacy flat
    *   notional rate, used without a policy. Both are run settings.
    */
-  constructor({ feeBps = 0, fees = null, engine = null, orderStats = null } = {}) {
+  constructor({ feeBps = 0, fees = null, engine = null, orderStats = null, bookAge = null } = {}) {
     // Fall back to the legacy flat rate when no policy is supplied.
     this.feePolicy = fees ?? { mode: 'bps', bps: Number(feeBps) || 0 };
     /** @type {Map<string, object|null>} each market's normalised fee schedule */
@@ -133,7 +156,13 @@ export class Portfolio {
     this.orderStats = orderStats ?? (engine ? newOrderStats() : null);
     /** The rule a just-normalised order broke, for the caller that writes its row. */
     this.ruleReject = null;
+    /** Shared with the harness (newBookAge), or null. Own-data markets are not thinned, so not counted. */
+    this.bookAge = bookAge;
+    this.bookAgeExcluded = new Set();
   }
+
+  /** Keep in sync with exclude_book_age in otengine.py. */
+  excludeBookAge(marketId) { this.bookAgeExcluded.add(marketId); }
 
   /** Keep in sync with set_market_rules in otengine.py. */
   setMarketRules(marketId, rules) { this.marketRules.set(marketId, Object.freeze({ ...rules })); }
@@ -390,6 +419,7 @@ export class Portfolio {
       this.fills.push(this.#fillRow({ ts, marketId, order: eff, res, tag, realised: 0, fee: 0, orderId }));
       return res;
     }
+    if (this.bookAge && !this.bookAgeExcluded.has(marketId)) countBookAge(this.bookAge, ts, res);
 
     const fee = feeFor(this.feePolicy, this.marketFees.get(marketId) ?? null, res);
     const realised = this.#apply(marketId, eff.side, Boolean(eff.reduce_only), res.filled, res.notional, fee, ts, how);

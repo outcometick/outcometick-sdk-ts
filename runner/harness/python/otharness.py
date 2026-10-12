@@ -13,7 +13,7 @@ import datetime as _datetime
 import json
 import math
 
-from otengine import Book as _Book, BudgetMonitor, Portfolio, RunAbort, new_order_stats
+from otengine import Book as _Book, BudgetMonitor, Portfolio, RunAbort, new_book_age, new_order_stats
 from otfeed import build_feeds
 from otmaker import add_maker_stats, new_maker_stats, row_pending
 from otreplay import MarketReplay, make_log_budget, LOG_BYTES_PER_RUN, LOG_LINE_CHARS
@@ -322,6 +322,8 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
     resting = resting_policy(job)
     engine = engine_policy(job)
     order_stats = new_order_stats() if engine else None
+    # Taker size by the age of the level it took, see harness.mjs.
+    book_age = new_book_age()
     fill_extras = engine_fill_fields(engine)
     hooks = job.get("hooks") or {}
     session = job.get("mode") == "session"
@@ -372,6 +374,8 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
             result["record"] = {"rows": record["rows"], "bytes": record["bytes"], "truncated": record["truncated"] or record_budget["truncated"]}
         if order_stats is not None:
             result["orders"] = order_stats
+        if book_age["fills"] > 0:
+            result["book_age"] = book_age
         emit(CHANNEL_RESULT, _DUMPS(result))
         return code
 
@@ -398,14 +402,15 @@ def run_job(job: dict, load_class, next_line, emit) -> int:
         result["rejection"] = {"code": err.code, "detail": err.detail}
         return finish(EXIT_REJECTED)
 
-    shared = Portfolio(fees=fees, engine=engine, order_stats=order_stats) if session else None
+    shared = Portfolio(fees=fees, engine=engine, order_stats=order_stats, book_age=book_age) if session else None
     shared_instance = None
 
     def start(m: _Market) -> None:
         """Build the replay for a market and open it (on_market_open)."""
         nonlocal shared_instance
         entry = m.entry
-        pf = shared if shared is not None else Portfolio(fees=fees, engine=engine, order_stats=order_stats)
+        pf = shared if shared is not None else Portfolio(fees=fees, engine=engine, order_stats=order_stats,
+                                                         book_age=book_age)
         if shared is not None:
             if shared_instance is None:
                 shared_instance = klass()

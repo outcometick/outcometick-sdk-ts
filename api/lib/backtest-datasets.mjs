@@ -4,7 +4,7 @@ import { classifyPath } from './data-taxonomy.mjs';
 import {
   CAPTURE_WINDOWS, DERIVED_DATASETS, KNOWN_DATASETS, BacktestRejection,
   MARKET_INTERVALS, DEFAULT_INTERVALS, MAX_LATENCY_MS, OPT_IN_DATASETS,
-  DEGRADING_DATASETS,
+  DEGRADING_DATASETS, IMPLIED_DATASETS,
 } from './backtest-contract.mjs';
 
 /**
@@ -628,6 +628,11 @@ export function normalizeDatasets(list) {
         `unknown dataset ${JSON.stringify(ds)}; known: ${[...KNOWN_DATASETS, ...Object.keys(DERIVED_DATASETS)].join(', ')}`);
     }
     if (!out.includes(ds)) out.push(ds);
+  }
+  // Implied datasets go last, in contract order. Keep in sync with
+  // with_implied_datasets in client/backtest/datasets.py.
+  for (const [ds, by] of Object.entries(IMPLIED_DATASETS)) {
+    if (out.includes(by) && !out.includes(ds)) out.push(ds);
   }
   return out;
 }

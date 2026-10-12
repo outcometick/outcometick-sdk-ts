@@ -499,6 +499,7 @@ export async function cmdRun({ dir, flags }) {
         timers: enginePolicy?.timers ? base.result.timers : null,
         record: rec.block,
         spot: (manifest.datasets ?? []).includes('spot') ? base.result.spot : null,
+        bookAge: base.result.bookAge,
         marketSummaries: [...marketMeta.values()],
         marketMeta,
         feesPaid: base.result.feesPaid,

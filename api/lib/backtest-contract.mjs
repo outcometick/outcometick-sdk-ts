@@ -7,12 +7,13 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.12.3';
+export const SDK_VERSION = '2.13.0';
 
 /**
  * Sandbox image protocol version. Bump when engine, harness or result
  * protocol changes so the worker uses a compatible image.
  *
+ * 1.27.0: result line carries book_age counters (taker size by book-level age).
  * 1.26.2: no behaviour change.
  * 1.26.1: correct the assumed-tick caveat.
  * 1.26.0: add spot events and readers; preserve hook error codes.
@@ -34,7 +35,7 @@ export const SDK_VERSION = '2.12.3';
  * 1.6.0: acknowledge completed market-days.
  * 1.5.0: return results on stdout; Docker does not forward fd 3.
  */
-export const SANDBOX_IMAGE_TAG = '1.26.2';
+export const SANDBOX_IMAGE_TAG = '1.27.0';
 
 /**
  * Decoder semantics included in run identity, separate from the image tag.
@@ -128,7 +129,7 @@ export const DATASETS = Object.freeze({
   twap30s: 'TWAP over a 30-second lookback.',
   twap60s: 'TWAP over a 60-second lookback.',
   book: 'Order-book snapshots and deltas.',
-  bbo: 'Unthrottled top of book. Prices only, no sizes — it removes ladder levels the venue has since moved past, and never adds any.',
+  bbo: 'Unthrottled top of book. Prices only, no sizes: it removes ladder levels the venue has since moved past, and never adds any. On whenever book is declared.',
   spot: 'The 1 Hz Chainlink stream of each market\'s asset, fed to every market of that asset whatever it settles on. Quiet: it wakes no hook; ctx.spot() and ctx.twap_locked() read it.',
   trades: 'Every trade print on the venue.',
   markets: 'Per-market metadata, strike and settlement outcome.',
@@ -137,14 +138,19 @@ export const DATASETS = Object.freeze({
 export const KNOWN_DATASETS = Object.freeze(Object.keys(DATASETS));
 
 /**
- * Opt-in datasets excluded from the default manifest. bbo changes fillable
- * levels, so enabling it by default changes existing reports. Measured busy
- * series add 13–29% to a roughly 112 MB market-day at worker archive throughput
- * of 1.9–3.5 MB/s. See PREWARM_SHAPES for cached variants.
+ * Datasets declared along with another: declaring book declares bbo, so the
+ * book is refined wherever the archive has the stream (busy series add 13–29%
+ * to a ~112 MB market-day). Applied by normalizeDatasets and, through
+ * _contract.json, by client/backtest/__init__.py.
  */
-// spot adds about 86k rows per asset-day for ctx.spot() and ctx.twap_locked().
-// It is not degrading: requests outside capture raise E_COVERAGE.
-export const OPT_IN_DATASETS = Object.freeze(['bbo', 'spot']);
+export const IMPLIED_DATASETS = Object.freeze({ bbo: 'book' });
+
+/**
+ * Opt-in datasets excluded from the default manifest. spot adds about 86k rows
+ * per asset-day for ctx.spot() and ctx.twap_locked(). It is not degrading:
+ * requests outside capture raise E_COVERAGE.
+ */
+export const OPT_IN_DATASETS = Object.freeze(['spot']);
 
 /**
  * Datasets allowed to be missing without rejecting a run. bbo removes stale

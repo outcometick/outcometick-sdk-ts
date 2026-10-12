@@ -821,14 +821,34 @@ export function feeModelReport({ policy, markets }) {
 }
 
 /** Assemble the report, preserving archive stream coverage and gaps unchanged. */
+/**
+ * The book_age block from the harness counters (newBookAge in portfolio.mjs),
+ * or null when no taker fill took archive depth.
+ * Keep in sync with book_age_report in client/backtest/report.py.
+ */
+export function bookAgeReport(raw) {
+  if (!raw || !(raw.size_micro > 0)) return null;
+  const size = (micro) => r6(micro / 1e6);
+  const [a, b, c, d] = raw.by_age_micro;
+  return {
+    taker_fills: raw.fills,
+    taker_size: size(raw.size_micro),
+    size_by_level_age: { under_1s: size(a), '1s_to_5s': size(b), '5s_to_30s': size(c), over_30s: size(d) },
+    share_over_1s: r6((raw.size_micro - a) / raw.size_micro),
+    max_level_age_ms: raw.max_age_ms,
+    note: 'Taker size by the age of the book level it consumed: fill time minus when that level was last set by a snapshot or delta (archive markets only). The archive drops some deltas, so an older level is more likely to have left the venue already; bbo removes stale levels better than the best price, not deeper ones.',
+  };
+}
+
 export function buildReport({
   runId, submittedAt, manifest, scope, sourceSha256 = null,
   trades, fillStats: fillSummary, marketSummaries, marketMeta,
   feesPaid = 0, fillDelayMs = 0, feeModel = null, sweep = null, coverage = null,
   crosschecks = [], budget = null, seed = null, scanned = {}, maker = null, orders = null, timers = null,
-  fingerprint = null, record = null, spot = null,
+  fingerprint = null, record = null, spot = null, bookAge = null,
 }) {
   const closed = trades.filter((t) => Number.isFinite(t.pnl));
+  const bookAgeBlock = bookAgeReport(bookAge);
   const equity = equityCurve(closed);
   const matched = crosschecks.filter((c) => c.match).length;
 
@@ -893,6 +913,8 @@ export function buildReport({
     ...(record ? { record } : {}),
     // The spot dataset: how many markets had any spot value -- only when declared.
     ...(spot ? { spot } : {}),
+    // Taker size by the age of the level it took (archive markets).
+    ...(bookAgeBlock ? { book_age: bookAgeBlock } : {}),
     sweep,
     coverage,
     budget,

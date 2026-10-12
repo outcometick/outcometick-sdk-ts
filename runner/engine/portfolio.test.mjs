@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { Book } from './book.mjs';
-import { Portfolio, contractValue } from './portfolio.mjs';
+import { Portfolio, contractValue, newBookAge } from './portfolio.mjs';
+import { bookAgeReport } from './report.mjs';
 
 const near = (a, b, eps = 1e-9) => assert.ok(Math.abs(a - b) < eps, `${a} != ${b}`);
 
@@ -366,4 +369,59 @@ test('every shape of unusable sizing is rejected and counted', () => {
     assert.equal(pf.rejected, 1, `${what} was not counted as a rejection`);
     assert.equal(pf.fills.length, 0, `${what} produced a fill row`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// book_age: taker size by the age of the level it took
+// ---------------------------------------------------------------------------
+
+const PY_ENGINE = fileURLToPath(new URL('../harness/python/', import.meta.url));
+
+/** The same scenario in the Python engine, its counters as JSON. */
+function pyBookAge() {
+  const code = `
+import json, otengine as e
+b = e.Book("0xm")
+b.snapshot(1000, {"UP": {"asks": [[0.50, 100], [0.51, 200], [0.52, 300]], "bids": []}})
+b.delta(5000, "UP", "asks", 0.51, 150)
+s = e.new_book_age()
+p = e.Portfolio(book_age=s)
+p.execute(b, {"side": "UP", "size": 400, "limit": 0.55}, 7000, "0xm")
+p.execute(b, {"side": "UP", "size": 50, "limit": 0.55}, 40000, "0xm")
+g = e.Book("0xg")
+g.snapshot(0, {"UP": {"asks": [[0.5, 10]], "bids": []}})
+p.exclude_book_age("0xg")
+p.execute(g, {"side": "UP", "size": 10, "limit": 0.55}, 90000, "0xg")
+print(json.dumps(s))
+`;
+  return JSON.parse(execFileSync(process.env.OT_PYTHON || 'python3', ['-c', code], { cwd: PY_ENGINE, encoding: 'utf8' }));
+}
+
+test('book_age counts taker size by the age of each level taken, worked by hand', () => {
+  const b = new Book('0xm');
+  b.snapshot(1000, { UP: { asks: [[0.50, 100], [0.51, 200], [0.52, 300]], bids: [] } });
+  b.delta(5000, 'UP', 'asks', 0.51, 150);          // this level is newer
+  const s = newBookAge();
+  const p = new Portfolio({ bookAge: s });
+  // At 7000: 100 @0.50 (set 1000, age 6000), 150 @0.51 (set 5000, age 2000), 150 @0.52 (age 6000).
+  p.execute({ book: b, ts: 7000, marketId: '0xm', order: { side: 'UP', size: 400, limit: 0.55 } });
+  // At 40000: 50 @0.52, age 39000.
+  p.execute({ book: b, ts: 40000, marketId: '0xm', order: { side: 'UP', size: 50, limit: 0.55 } });
+  // Own-data markets are not thinned and are not counted.
+  const g = new Book('0xg');
+  g.snapshot(0, { UP: { asks: [[0.5, 10]], bids: [] } });
+  p.excludeBookAge('0xg');
+  p.execute({ book: g, ts: 90000, marketId: '0xg', order: { side: 'UP', size: 10, limit: 0.55 } });
+
+  assert.deepEqual(s, { fills: 2, size_micro: 450e6, by_age_micro: [0, 150e6, 250e6, 50e6], max_age_ms: 39000 });
+  assert.deepEqual(bookAgeReport(s), {
+    taker_fills: 2,
+    taker_size: 450,
+    size_by_level_age: { under_1s: 0, '1s_to_5s': 150, '5s_to_30s': 250, over_30s: 50 },
+    share_over_1s: 1,
+    max_level_age_ms: 39000,
+    note: bookAgeReport(s).note,
+  });
+  assert.equal(bookAgeReport(newBookAge()), null, 'no taker size: no block');
+  assert.deepEqual(pyBookAge(), s, 'the Python engine counts differently');
 });

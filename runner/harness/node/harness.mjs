@@ -12,7 +12,7 @@ import { pathToFileURL } from 'node:url';
 import { MarketReplay, makeLogBudget, BudgetMonitor, RunAbort } from '../../engine/replay.mjs';
 import { Book as BookCls } from '../../engine/book.mjs';
 import { buildFeeds } from '../../engine/feed.mjs';
-import { Portfolio, newOrderStats } from '../../engine/portfolio.mjs';
+import { Portfolio, newOrderStats, newBookAge } from '../../engine/portfolio.mjs';
 import { rowPending, newMakerStats, addMakerStats } from '../../engine/maker.mjs';
 import { CHANNEL, RESULT_FD, EXIT, RECORD_FIELDS, MAX_RECORD_ROWS, MAX_RECORD_BYTES, lineBytes } from '../protocol.mjs';
 
@@ -333,6 +333,8 @@ async function main() {
   // Execution options (job.engine) and the run-wide order counters they feed.
   const engine = enginePolicy(job);
   const orderStats = engine ? newOrderStats() : null;
+  // Taker size by the age of the level it took, reported when any was taken.
+  const bookAge = newBookAge();
   const fillExtras = engineFillFields(engine);
 
   const result = {
@@ -377,6 +379,7 @@ async function main() {
     result.budget = monitor.summary();
     if (record) result.record = { rows: record.rows, bytes: record.bytes, truncated: record.truncated || recordBudget.truncated };
     if (orderStats) result.orders = orderStats;
+    if (bookAge.fills > 0) result.book_age = bookAge;
     // Project results created after strategy execution to remove inherited hooks.
     emit(CHANNEL.result, stringify(projectResult(result)));
     return code;
@@ -407,7 +410,7 @@ async function main() {
   const resting = restingPolicy(job);
 
   const session = job.mode === 'session';
-  const shared = session ? new Portfolio({ fees, engine, orderStats }) : null;
+  const shared = session ? new Portfolio({ fees, engine, orderStats, bookAge }) : null;
   let sharedInstance = null;
   // Global scheduler: the run's clock (MarketReplay `clock`), one for the whole
   // session, one per market otherwise; advanced only by advanceClock.
@@ -472,7 +475,7 @@ async function main() {
   /** Build a market's replay and open it (on_market_open). */
   const start = (m) => {
     const { entry } = m;
-    const pf = shared ?? new Portfolio({ fees, engine, orderStats });
+    const pf = shared ?? new Portfolio({ fees, engine, orderStats, bookAge });
     let instance;
     if (shared) {
       sharedInstance ??= new Klass();
