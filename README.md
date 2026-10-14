@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 028962ea22b2d8c7eb793747a875c9a29824e3a7.
+  Generated from monorepo revision 07c933f18deeb1af2b93f56c870f9fb5ed07a60b.
 -->
 
 # outcometick
@@ -155,6 +155,42 @@ if (day) await smart.smartDownload(day, "top100", { saveTo: "top100.csv.zst" });
 
 What the lists are and what each column means:
 https://outcometick.com/polymarket-smart-money-data
+
+## MCP server
+
+`ot mcp` is a Model Context Protocol server over stdio, for coding assistants
+and agents. It reads, prices, validates and downloads; it never submits a
+backtest, because that spends credits. Needs Node 24 or newer.
+
+```json
+{
+  "mcpServers": {
+    "outcometick": {
+      "command": "npx",
+      "args": ["-y", "outcometick", "mcp"],
+      "env": {
+        "OT_KEY": "<data subscription key, optional>",
+        "OT_BACKTEST_KEY": "<backtest key, optional>"
+      }
+    }
+  }
+}
+```
+
+Claude Code: `claude mcp add outcometick -e OT_KEY=<data key> -- npx -y outcometick mcp`
+
+| Tool | Key | What it does |
+| --- | --- | --- |
+| `coverage` | none | What the archive holds per venue: assets, datasets, day range |
+| `plans` | none | Data subscription plans and their live prices |
+| `backtest_capacity` | none | Which days can be backtested now, and how busy the queue is |
+| `backtest_quote` | none | Price a backtest scope in credits without submitting it |
+| `check_strategy` | none | Validate a strategy directory with the queue's own validator, locally |
+| `meta` | `OT_KEY` | The date window and filter values the data key can reach |
+| `list_files` | `OT_KEY` | Search archive files the data key can download |
+| `download_file` | `OT_KEY` | Download one file and verify its sha256 |
+| `backtest_runs` | `OT_BACKTEST_KEY` | Recent runs under the backtest key, and the credit balance |
+| `backtest_status` | `OT_BACKTEST_KEY` | One run's status, credits and report summary |
 
 ---
 
