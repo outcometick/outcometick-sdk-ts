@@ -23,7 +23,7 @@ export const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
 const INSTRUCTIONS = `outcometick: historical tick data for Polymarket and Predict.fun crypto up/down markets, and a hosted backtester.
 Full documentation in one plain-text file: https://outcometick.com/llms-full.txt
-Data tools need OT_KEY (a data subscription key); backtest run tools need OT_BACKTEST_KEY. Public tools need neither.
+Data tools need OT_KEY (a data subscription key); smart_days and smart_download need OT_SMART_KEY (a smart-money key); backtest run tools need OT_BACKTEST_KEY. Public tools need none.
 This server cannot submit a backtest — that spends credits. Use \`ot submit\` yourself after the user agrees to the quote.`;
 
 /** Rows returned by list_files before truncating; the full count is always reported. */
@@ -246,6 +246,53 @@ export const TOOLS = [
     annotations: read,
     run: (a, ctx) => ctx.api('GET', `/v1/backtest/run/${encodeURIComponent(a.run_id)}`, null, true),
   },
+  {
+    name: 'smart_plans',
+    description: 'Smart-money plans (daily Polymarket wallet lists) and their live prices, and whether they are on sale. Public, no key.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: read,
+    run: (_a, ctx) => ctx.data(false).smartPlans(),
+  },
+  {
+    name: 'smart_coverage',
+    description: 'How many smart-money days are published: the first and newest day, and the count. Public, no key.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: read,
+    run: (_a, ctx) => ctx.data(false).smartCoverage(),
+  },
+  {
+    name: 'smart_days',
+    description: 'The days the configured smart-money key (OT_SMART_KEY) can download, newest first, with each list\'s status, rows, bytes and sha256. Call this before smart_download.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: read,
+    run: (_a, ctx) => ctx.smart().smartDays(),
+  },
+  {
+    name: 'smart_download',
+    description: 'Download one day\'s smart-money list (zstd-compressed CSV) into a local directory and verify its sha256. Never overwrites. Take day and list from smart_days.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        day: DAY,
+        list: { type: 'string', enum: ['top100', 'top1000'], description: 'top1000 needs the Top 1000 plan' },
+        dir: { type: 'string', description: 'Directory to save into (created if missing). Defaults to the current directory.' },
+      },
+      required: ['day', 'list'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: async (a, ctx) => {
+      // day and list become the file name on the user's disk: fixed shapes only.
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(a.day ?? ''))) throw new ToolError('day must be YYYY-MM-DD');
+      if (a.list !== 'top100' && a.list !== 'top1000') throw new ToolError('list must be top100 or top1000');
+      await mkdir(path.resolve(ctx.cwd, a.dir ?? '.'), { recursive: true });
+      const dir = await realpath(path.resolve(ctx.cwd, a.dir ?? '.'));
+      const target = path.join(dir, `smart-${a.list}-${a.day}.csv.zst`);
+      const { bytes, sha256 } = await ctx.smart().smartDownload(a.day, a.list);
+      await publishFile(target, bytes);
+      return { saved: target, bytes: bytes.length, sha256, verified: Boolean(sha256) };
+    },
+  },
 ];
 
 /** The per-session context the tools run in. Injected whole by tests. */
@@ -258,6 +305,12 @@ export function makeContext({ baseUrl = DEFAULT_BASE_URL, env = process.env, cwd
         throw new ToolError('OT_KEY is not set. Add your data subscription key to this MCP server\'s env (e.g. claude mcp add … -e OT_KEY=ck_…).');
       }
       return new DataClient({ key: env.OT_KEY ?? null, baseUrl: api, ...(fetchImpl ? { fetch: fetchImpl } : {}) });
+    },
+    smart() {
+      if (!env.OT_SMART_KEY) {
+        throw new ToolError('OT_SMART_KEY is not set. Add your smart-money key to this MCP server\'s env (e.g. claude mcp add … -e OT_SMART_KEY=ck_…).');
+      }
+      return new DataClient({ key: env.OT_SMART_KEY, baseUrl: api, ...(fetchImpl ? { fetch: fetchImpl } : {}) });
     },
     async api(method, p, body = null, needsKey = false) {
       const key = needsKey ? env.OT_BACKTEST_KEY : null;

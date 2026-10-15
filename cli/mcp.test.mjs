@@ -16,6 +16,7 @@ import { TOOLS, PROTOCOL_VERSIONS, MAX_FILE_ROWS, publishFile } from './mcp.mjs'
 const CLI = fileURLToPath(new URL('./ot.mjs', import.meta.url));
 const DATA_KEY = 'ck_test.data';
 const BT_KEY = 'bt_test.backtest';
+const SMART_KEY = 'ck_test.smart';
 const DAY = '2026-01-02';
 const BODY = Buffer.from('feed_ts_ms,value\n1,2\n');
 const SHA = createHash('sha256').update(BODY).digest('hex');
@@ -33,6 +34,7 @@ before(async () => {
     const json = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
     const dataAuthed = req.headers.authorization === `Bearer ${DATA_KEY}`;
     const btAuthed = req.headers.authorization === `Bearer ${BT_KEY}`;
+    const smartAuthed = req.headers.authorization === `Bearer ${SMART_KEY}`;
 
     if (u.pathname === '/v1/public/coverage') return json(200, { venues: { polymarket: { assets: ['BTC'] } } });
     if (u.pathname === '/v1/meta') return dataAuthed ? json(200, { firstDay: '2026-01-01', lastDay: DAY }) : json(401, { error: 'bad key' });
@@ -58,6 +60,14 @@ before(async () => {
       res.writeHead(200, { 'content-type': 'application/gzip' });
       return res.end(BODY);
     }
+    if (u.pathname === '/v1/public/smart-plans') return json(200, { onSale: true, plans: [{ planId: 'smart100' }] });
+    if (u.pathname === '/v1/public/smart-coverage') return json(200, { firstDay: '2026-01-01', lastDay: DAY, days: 2 });
+    if (u.pathname === '/v1/smart/days') return smartAuthed ? json(200, { plan: 'smart100', days: [{ day: DAY }] }) : json(403, { error: 'not a smart-money key' });
+    if (u.pathname === '/v1/smart/download') {
+      if (!smartAuthed) return json(403, { error: 'not a smart-money key' });
+      res.writeHead(302, { location: `${base}/object/smart.csv.zst`, 'x-outcometick-sha256': SHA });
+      return res.end();
+    }
     if (u.pathname === '/v1/backtest/capacity') return json(200, { venue: u.searchParams.get('venue'), last_day: DAY, backtest_window_days: 35 });
     if (u.pathname === '/v1/backtest/quote') {
       const b = JSON.parse(body || '{}');
@@ -82,7 +92,7 @@ after(() => server?.close());
  */
 function startServer({ env = {}, cwd = process.cwd() } = {}) {
   const child = spawn(process.execPath, ['--experimental-strip-types', CLI, 'mcp', '--api', base], {
-    cwd, env: { ...process.env, OT_KEY: '', OT_BACKTEST_KEY: '', ...env }, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd, env: { ...process.env, OT_KEY: '', OT_BACKTEST_KEY: '', OT_SMART_KEY: '', ...env }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const lines = [];
   const order = [];
@@ -427,4 +437,39 @@ test('without hard links it falls back to an exclusive copy that still never ove
     await rm(work, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
   }
+});
+
+test('smart-money tools: public ones need no key, the rest use OT_SMART_KEY only', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'ot-mcp-smart-'));
+  const s = startServer({ env: { OT_KEY: DATA_KEY, OT_SMART_KEY: SMART_KEY }, cwd: dir });
+  try {
+    await s.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } });
+    assert.equal((await s.call('smart_plans')).value.onSale, true);
+    assert.equal((await s.call('smart_coverage')).value.days, 2);
+    assert.equal((await s.call('smart_days')).value.plan, 'smart100');
+    const dl = await s.call('smart_download', { day: DAY, list: 'top100' });
+    assert.equal(dl.isError, false, JSON.stringify(dl.value));
+    assert.equal(dl.value.sha256, SHA);
+    assert.equal(dl.value.verified, true);
+    assert.equal(path.basename(dl.value.saved), `smart-top100-${DAY}.csv.zst`);
+    assert.deepEqual(await readFile(dl.value.saved), BODY);
+    // Never overwrites, and refuses shapes that could become another path.
+    assert.equal((await s.call('smart_download', { day: DAY, list: 'top100' })).isError, true);
+    assert.equal((await s.call('smart_download', { day: '../x', list: 'top100' })).isError, true);
+    assert.equal((await s.call('smart_download', { day: DAY, list: '../top100' })).isError, true);
+  } finally {
+    await s.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+  // Without OT_SMART_KEY the smart tools say so; the data key is never used for them.
+  const t = startServer({ env: { OT_KEY: DATA_KEY } });
+  try {
+    await t.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } });
+    const days = await t.call('smart_days');
+    assert.equal(days.isError, true);
+    assert.match(days.value.error, /OT_SMART_KEY is not set/);
+  } finally {
+    await t.stop();
+  }
+  assert.ok(!seen.some((r) => r.path.startsWith('/v1/smart/') && r.auth === `Bearer ${DATA_KEY}`));
 });

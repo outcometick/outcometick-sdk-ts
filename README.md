@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 0e4e4547c02e0764be1725f428a801748444fb2f.
+  Generated from monorepo revision 671f665dc608ba1445f3420f3e28751e66c5a2c4.
 -->
 
 # outcometick
@@ -170,6 +170,7 @@ backtest, because that spends credits. Needs Node 24 or newer.
       "args": ["-y", "outcometick", "mcp"],
       "env": {
         "OT_KEY": "<data subscription key, optional>",
+        "OT_SMART_KEY": "<smart-money key, optional>",
         "OT_BACKTEST_KEY": "<backtest key, optional>"
       }
     }
@@ -181,12 +182,12 @@ Claude Code: `claude mcp add outcometick -e OT_KEY=<data key> -- npx -y outcomet
 
 The same tools are also hosted, with nothing to install, over Streamable HTTP:
 
-- `https://outcometick.com/v1/mcp`: send `Authorization: Bearer <data key or backtest key>` (and `X-Backtest-Key` for both), or connect without a header and sign in with OAuth, pasting your key on the consent page (claude.ai and ChatGPT connectors).
+- `https://outcometick.com/v1/mcp`: send `Authorization: Bearer <key>` (data, smart-money or backtest key; add a second or third key as `X-Backtest-Key` / `X-Smart-Key`), or connect without a header and sign in with OAuth, pasting your keys on the consent page (claude.ai and ChatGPT connectors).
 - `https://outcometick.com/v1/mcp/public`: no key, public tools only.
 
 `claude mcp add --transport http outcometick https://outcometick.com/v1/mcp --header "Authorization: Bearer <data key>"`
 
-Hosted, `download_file` returns a signed URL and its sha256 instead of writing to disk, and `check_strategy` takes the file contents instead of a directory.
+Hosted, `download_file` and `smart_download` return a signed URL and its sha256 instead of writing to disk, and `check_strategy` takes the file contents instead of a directory.
 
 | Tool | Key | What it does |
 | --- | --- | --- |
@@ -200,6 +201,10 @@ Hosted, `download_file` returns a signed URL and its sha256 instead of writing t
 | `download_file` | `OT_KEY` | Download one file and verify its sha256 |
 | `backtest_runs` | `OT_BACKTEST_KEY` | Recent runs under the backtest key, and the credit balance |
 | `backtest_status` | `OT_BACKTEST_KEY` | One run's status, credits and report summary |
+| `smart_plans` | none | Smart-money plans (daily Polymarket wallet lists) and their live prices |
+| `smart_coverage` | none | Which smart-money days are published |
+| `smart_days` | `OT_SMART_KEY` | The days the smart-money key can download, with each list's status |
+| `smart_download` | `OT_SMART_KEY` | Download one day's list and verify its sha256 |
 
 ---
 
