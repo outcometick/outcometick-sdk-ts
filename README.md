@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 6980e339f1634c9141a0870f2c46b6b962e6a856.
+  Generated from monorepo revision 0e4e4547c02e0764be1725f428a801748444fb2f.
 -->
 
 # outcometick
@@ -178,6 +178,15 @@ backtest, because that spends credits. Needs Node 24 or newer.
 ```
 
 Claude Code: `claude mcp add outcometick -e OT_KEY=<data key> -- npx -y outcometick mcp`
+
+The same tools are also hosted, with nothing to install, over Streamable HTTP:
+
+- `https://outcometick.com/v1/mcp`: send `Authorization: Bearer <data key or backtest key>` (and `X-Backtest-Key` for both), or connect without a header and sign in with OAuth, pasting your key on the consent page (claude.ai and ChatGPT connectors).
+- `https://outcometick.com/v1/mcp/public`: no key, public tools only.
+
+`claude mcp add --transport http outcometick https://outcometick.com/v1/mcp --header "Authorization: Bearer <data key>"`
+
+Hosted, `download_file` returns a signed URL and its sha256 instead of writing to disk, and `check_strategy` takes the file contents instead of a directory.
 
 | Tool | Key | What it does |
 | --- | --- | --- |

@@ -7,7 +7,7 @@ import { FIRST_COMPLETE_DAY, BACKTEST_WINDOW_DAYS } from './coverage-window.mjs'
 export const SCHEMA_VERSION = 1;
 
 /** SDK version reported by the docs page and stamped into every report. */
-export const SDK_VERSION = '2.13.2';
+export const SDK_VERSION = '2.13.3';
 
 /**
  * Sandbox image protocol version. Bump when engine, harness or result
